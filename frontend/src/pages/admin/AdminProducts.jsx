@@ -36,7 +36,7 @@ export default function AdminProducts() {
       <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {products.map((p) => (
           <div key={p.id} className="rounded-2xl border border-[#E5DCC5] bg-white p-3 shadow-sm" data-testid={`admin-product-${p.slug}`}>
-            <div className="overflow-hidden rounded-xl"><ProductImage url={p.image_url} ratio="aspect-video" /></div>
+            <div className="overflow-hidden rounded-xl"><ProductImage url={p.display_image} ratio="aspect-video" /></div>
             <div className="p-2">
               <div className="flex items-center gap-2">
                 <span className="text-xs text-[#8B7355]">{CATEGORY_LABELS[p.category]}</span>
