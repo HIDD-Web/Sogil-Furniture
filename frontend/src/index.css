@@ -1,0 +1,63 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    margin: 0;
+    font-family: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #F9F6F0;
+    color: #2C1E16;
+}
+
+.font-heading {
+    font-family: 'Outfit', ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+    :root {
+        --background: 40 33% 96%;
+        --foreground: 26 33% 13%;
+        --card: 0 0% 100%;
+        --card-foreground: 26 33% 13%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 26 33% 13%;
+        --primary: 28 53% 36%;
+        --primary-foreground: 40 33% 97%;
+        --secondary: 43 36% 90%;
+        --secondary-foreground: 26 33% 20%;
+        --muted: 43 30% 92%;
+        --muted-foreground: 25 15% 40%;
+        --accent: 43 36% 88%;
+        --accent-foreground: 26 33% 20%;
+        --destructive: 9 72% 62%;
+        --destructive-foreground: 0 0% 98%;
+        --border: 43 36% 84%;
+        --input: 43 36% 84%;
+        --ring: 28 53% 36%;
+        --radius: 0.9rem;
+    }
+}
+
+@layer base {
+    * {
+        @apply border-border;
+    }
+    body {
+        @apply bg-background text-foreground;
+    }
+    h1, h2, h3, h4 {
+        font-family: 'Outfit', ui-sans-serif, system-ui, sans-serif;
+    }
+}
+
+/* Hide scrollbar utility for horizontal chip rows */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+@layer base {
+    [data-debug-wrapper="true"] { display: contents !important; }
+}

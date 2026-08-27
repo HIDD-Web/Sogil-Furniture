@@ -1,0 +1,1251 @@
+from dotenv import load_dotenv
+from pathlib import Path
+import os
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import Response as StarletteResponse
+from motor.motor_asyncio import AsyncIOMotorClient
+import logging
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import uuid
+import re
+import jwt
+import bcrypt
+import requests
+from datetime import datetime, timezone, timedelta
+from bson import ObjectId
+from bson.errors import InvalidId
+
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+JWT_ALGORITHM = "HS256"
+
+def get_jwt_secret() -> str:
+    return os.environ["JWT_SECRET"]
+
+def oid(v: str) -> ObjectId:
+    try:
+        return ObjectId(v)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=404, detail="Data tidak ditemukan")
+
+# --------------------------------------------------------------------------
+# Object storage
+# --------------------------------------------------------------------------
+STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
+APP_NAME = "sogil-furniture"
+storage_key = None
+MIME_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+
+def init_storage(force: bool = False):
+    global storage_key
+    if storage_key and not force:
+        return storage_key
+    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
+    resp.raise_for_status()
+    storage_key = resp.json()["storage_key"]
+    return storage_key
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    key = init_storage()
+    resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    if resp.status_code == 404:
+        key = init_storage(force=True)
+        resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_object(path: str):
+    key = init_storage()
+    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
+    if resp.status_code == 404:
+        key = init_storage(force=True)
+        resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
+    resp.raise_for_status()
+    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+
+# --------------------------------------------------------------------------
+# Auth & permissions
+# --------------------------------------------------------------------------
+ACCOUNT_TYPES = ["owner", "manager", "admin", "employee"]
+PERMISSION_KEYS = ["manage_orders", "modify_products", "manage_settings", "access_finance", "delete_data", "manage_admins"]
+
+def default_permissions(role: str) -> Dict[str, bool]:
+    if role == "owner":
+        return {k: True for k in PERMISSION_KEYS}
+    if role == "manager":
+        return {"manage_orders": True, "modify_products": True, "manage_settings": True, "access_finance": False, "delete_data": False, "manage_admins": False}
+    if role == "admin":
+        return {"manage_orders": True, "modify_products": False, "manage_settings": False, "access_finance": False, "delete_data": False, "manage_admins": False}
+    return {"manage_orders": True, "modify_products": False, "manage_settings": False, "access_finance": False, "delete_data": False, "manage_admins": False}
+
+def hash_password(p: str) -> str:
+    return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(p: str, h: str) -> bool:
+    try:
+        return bcrypt.checkpw(p.encode(), h.encode())
+    except Exception:
+        return False
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=12), "type": "access"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+async def get_current_admin(request: Request) -> dict:
+    token = request.cookies.get("access_token")
+    if not token:
+        h = request.headers.get("Authorization", "")
+        if h.startswith("Bearer "):
+            token = h[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail="Tidak terautentikasi")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Token tidak valid")
+        user = await db.admins.find_one({"_id": oid(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="Pengguna tidak ditemukan")
+        user["id"] = str(user.pop("_id"))
+        user.pop("password_hash", None)
+        if user.get("role") == "owner":
+            user["permissions"] = default_permissions("owner")
+        else:
+            user.setdefault("permissions", default_permissions(user.get("role", "admin")))
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Sesi berakhir, silakan login kembali")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token tidak valid")
+
+def require_perm(perm: str):
+    async def dep(admin: dict = Depends(get_current_admin)) -> dict:
+        if admin.get("role") == "owner" or admin.get("permissions", {}).get(perm):
+            return admin
+        raise HTTPException(status_code=403, detail="Anda tidak memiliki akses untuk tindakan ini")
+    return dep
+
+def require_owner():
+    async def dep(admin: dict = Depends(get_current_admin)) -> dict:
+        if admin.get("role") != "owner":
+            raise HTTPException(status_code=403, detail="Hanya Owner/CEO yang dapat melakukan ini")
+        return admin
+    return dep
+
+def audit_fields(admin: dict) -> dict:
+    return {"updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_by_id": admin.get("id"), "updated_by_name": admin.get("name", "Admin")}
+
+# --------------------------------------------------------------------------
+# Models
+# --------------------------------------------------------------------------
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
+class ChangePasswordInput(BaseModel):
+    current_password: str
+    new_password: str
+
+class ChangeEmailInput(BaseModel):
+    current_password: str
+    new_email: str
+
+class DeliveryZoneInput(BaseModel):
+    name: str
+    fee_le: float
+    active: bool = True
+
+class OrderItemInput(BaseModel):
+    product_id: str
+    config: Dict[str, Any] = {}
+    quantity: int = 1
+
+class OrderInput(BaseModel):
+    customer_name: str
+    customer_phone: str
+    customer_address: str
+    customer_maps_url: Optional[str] = ""
+    delivery_method: str
+    delivery_zone_id: Optional[str] = None
+    payment_method: str
+    notes: Optional[str] = ""
+    item: Optional[OrderItemInput] = None
+    items: Optional[List[OrderItemInput]] = None
+
+class OrderStatusUpdate(BaseModel):
+    order_status: Optional[str] = None
+    payment_status: Optional[str] = None
+    admin_note: Optional[str] = None
+
+class AdminCreateInput(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str = "admin"
+    permissions: Optional[Dict[str, bool]] = None
+
+class AdminUpdateInput(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    permissions: Optional[Dict[str, bool]] = None
+
+class FinanceTxnInput(BaseModel):
+    date: Optional[str] = None
+    type: str  # income | expense
+    category: str
+    amount: float
+    currency: str  # IDR | EGP
+    description: Optional[str] = ""
+
+class TransferInput(BaseModel):
+    date: Optional[str] = None
+    from_account: str
+    to_account: str
+    from_amount: float
+    to_amount: float
+    exchange_rate: Optional[float] = None
+    description: Optional[str] = ""
+
+# --------------------------------------------------------------------------
+# Pricing engine
+# --------------------------------------------------------------------------
+def _num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+def compute_item_price(product: dict, config: dict, quantity: int):
+    pricing = product.get("pricing", {}) or {}
+    category = product.get("category")
+    quantity = max(1, int(quantity or 1))
+    bd = {"base_price_le": 0.0, "adjustments_le": 0.0, "finishing_le": 0.0, "unit_price_le": 0.0,
+          "subtotal_le": 0.0, "lines": [], "requires_admin_confirmation": False, "label": product.get("name", "")}
+
+    if bool(config.get("custom_size")):
+        bd["requires_admin_confirmation"] = True
+        bd["lines"].append({"label": "Ukuran Custom", "value": 0.0, "note": "Akan dikonfirmasi admin"})
+        return bd
+
+    if category == "rak":
+        length = str(config.get("length", "")); level = str(config.get("level", ""))
+        rtype = config.get("type", "B"); finishing = config.get("finishing", "Natural")
+        base = _num((pricing.get("base_prices", {}) or {}).get(f"{length}_{level}"))
+        bd["base_price_le"] = base
+        bd["lines"].append({"label": f"Harga dasar ({length} cm, {level} tingkat)", "value": base})
+        type_adj = _num(((pricing.get("type_adjustments", {}) or {}).get(rtype, {}) or {}).get(length))
+        if type_adj:
+            bd["adjustments_le"] += type_adj
+            bd["lines"].append({"label": f"Tipe {rtype}", "value": type_adj})
+        fin = (pricing.get("finishing", {}) or {}).get(finishing, 0)
+        fin_cost = _num(fin.get(length)) * _num(level, 0) if isinstance(fin, dict) else _num(fin)
+        if fin_cost:
+            bd["finishing_le"] = fin_cost
+            bd["lines"].append({"label": f"Finishing {finishing}", "value": fin_cost})
+    elif category == "meja":
+        size = str(config.get("size", "")); height = str(config.get("height", "")); finishing = config.get("finishing", "Natural")
+        base = _num((pricing.get("base_prices", {}) or {}).get(f"{size}_{height}"))
+        bd["base_price_le"] = base
+        bd["lines"].append({"label": f"Harga dasar ({size} cm, tinggi {height} cm)", "value": base})
+        fin = (pricing.get("finishing", {}) or {}).get(finishing, 0)
+        fin_cost = _num(fin) if not isinstance(fin, dict) else 0.0
+        if fin_cost:
+            bd["finishing_le"] = fin_cost
+            bd["lines"].append({"label": f"Finishing {finishing}", "value": fin_cost})
+    elif category == "meja_rak":
+        variant = str(config.get("variant", "")); rtype = config.get("type", "B"); finishing = config.get("finishing", "Natural")
+        base = _num((pricing.get("base_prices", {}) or {}).get(variant))
+        bd["base_price_le"] = base
+        bd["lines"].append({"label": f"Harga dasar ({variant})", "value": base})
+        tam = (pricing.get("type_adjustments", {}) or {}).get(rtype, {}) or {}
+        type_adj = _num(tam.get(variant)) if isinstance(tam, dict) else 0.0
+        if type_adj:
+            bd["adjustments_le"] += type_adj
+            bd["lines"].append({"label": f"Tipe {rtype}", "value": type_adj})
+        fin = (pricing.get("finishing", {}) or {}).get(finishing, 0)
+        fin_cost = _num(fin) if not isinstance(fin, dict) else 0.0
+        if fin_cost:
+            bd["finishing_le"] = fin_cost
+            bd["lines"].append({"label": f"Finishing {finishing}", "value": fin_cost})
+    else:
+        bd["requires_admin_confirmation"] = True
+
+    unit = bd["base_price_le"] + bd["adjustments_le"] + bd["finishing_le"]
+    bd["unit_price_le"] = unit
+    bd["subtotal_le"] = unit * quantity
+    return bd
+
+# --------------------------------------------------------------------------
+# Photo weighted similarity
+# --------------------------------------------------------------------------
+DEFAULT_WEIGHTS = {
+    "rak": {"length": 0.45, "level": 0.35, "type": 0.10, "finishing": 0.10},
+    "meja": {"size": 0.5, "height": 0.3, "finishing": 0.2},
+    "meja_rak": {"variant": 0.6, "type": 0.2, "finishing": 0.2},
+}
+
+def _numeric_sim(a, b, scale):
+    try:
+        return max(0.0, 1.0 - abs(float(a) - float(b)) / scale)
+    except (TypeError, ValueError):
+        return 1.0 if str(a) == str(b) else 0.0
+
+def photo_similarity(category, weights, req, attr):
+    score = 0.0
+    for key, w in weights.items():
+        rv, av = req.get(key), attr.get(key)
+        if rv in (None, "") or av in (None, ""):
+            continue
+        if key in ("length", "level", "height"):
+            scale = {"length": 60.0, "level": 5.0, "height": 45.0}[key]
+            score += w * _numeric_sim(rv, av, scale)
+        else:
+            score += w * (1.0 if str(rv) == str(av) else 0.0)
+    return score
+
+def match_photo(product, config):
+    photos = product.get("photos", []) or []
+    if not photos:
+        return {"photo": None, "exact": False}
+    category = product.get("category")
+    weights = (product.get("photo_weights") or {}) or DEFAULT_WEIGHTS.get(category, {})
+    keys = list(weights.keys())
+    best, best_score, best_exact = None, -1.0, False
+    for ph in photos:
+        attr = ph.get("attributes", {}) or {}
+        exact = all(str(config.get(k, "")) == str(attr.get(k, "")) for k in keys if attr.get(k) not in (None, ""))
+        s = photo_similarity(category, weights, config, attr)
+        if exact:
+            s += 100
+        if s > best_score:
+            best, best_score, best_exact = ph, s, exact
+    return {"photo": best, "exact": best_exact}
+
+# --------------------------------------------------------------------------
+# Settings helpers
+# --------------------------------------------------------------------------
+async def get_setting(key, default=None):
+    doc = await db.settings.find_one({"key": key})
+    return doc["value"] if doc else default
+
+async def set_setting(key, value, admin=None):
+    upd = {"key": key, "value": value, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if admin:
+        upd["updated_by_name"] = admin.get("name", "Admin")
+    await db.settings.update_one({"key": key}, {"$set": upd}, upsert=True)
+
+def clean(doc):
+    if not doc:
+        return doc
+    doc = dict(doc)
+    if "_id" in doc:
+        doc["id"] = str(doc.pop("_id"))
+    doc.pop("password_hash", None)
+    return doc
+
+# --------------------------------------------------------------------------
+# Auth routes
+# --------------------------------------------------------------------------
+@api_router.post("/auth/login")
+async def login(data: LoginInput, response: Response):
+    email = data.email.strip().lower()
+    user = await db.admins.find_one({"email": email})
+    if not user or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email atau kata sandi salah")
+    token = create_access_token(str(user["_id"]), email)
+    response.set_cookie("access_token", token, httponly=True, secure=True, samesite="none", max_age=43200, path="/")
+    return {"id": str(user["_id"]), "email": email, "name": user.get("name", "Admin"),
+            "role": user.get("role", "admin"),
+            "permissions": default_permissions("owner") if user.get("role") == "owner" else user.get("permissions", default_permissions(user.get("role", "admin")))}
+
+@api_router.post("/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie("access_token", path="/")
+    return {"ok": True}
+
+@api_router.get("/auth/me")
+async def me(admin: dict = Depends(get_current_admin)):
+    return admin
+
+@api_router.post("/auth/change-password")
+async def change_password(data: ChangePasswordInput, admin: dict = Depends(get_current_admin)):
+    user = await db.admins.find_one({"_id": oid(admin["id"])})
+    if not verify_password(data.current_password, user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Kata sandi saat ini salah")
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Kata sandi baru minimal 6 karakter")
+    await db.admins.update_one({"_id": oid(admin["id"])}, {"$set": {"password_hash": hash_password(data.new_password)}})
+    return {"ok": True}
+
+@api_router.post("/auth/change-email")
+async def change_email(data: ChangeEmailInput, response: Response, admin: dict = Depends(get_current_admin)):
+    user = await db.admins.find_one({"_id": oid(admin["id"])})
+    if not verify_password(data.current_password, user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Kata sandi salah")
+    new_email = data.new_email.strip().lower()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", new_email):
+        raise HTTPException(status_code=400, detail="Format email tidak valid")
+    if await db.admins.find_one({"email": new_email, "_id": {"$ne": oid(admin["id"])}}):
+        raise HTTPException(status_code=400, detail="Email sudah digunakan")
+    await db.admins.update_one({"_id": oid(admin["id"])}, {"$set": {"email": new_email}})
+    token = create_access_token(admin["id"], new_email)
+    response.set_cookie("access_token", token, httponly=True, secure=True, samesite="none", max_age=43200, path="/")
+    return {"ok": True, "email": new_email}
+
+# --------------------------------------------------------------------------
+# Public product routes
+# --------------------------------------------------------------------------
+def resolve_display_photo(product):
+    photos = product.get("photos", []) or []
+    rep = product.get("representative_photo_id")
+    if rep and rep not in ("auto",):
+        for ph in photos:
+            if ph.get("id") == rep:
+                return ph.get("main_url") or ph.get("front_url") or ph.get("side_url")
+    if product.get("image_url"):
+        return product["image_url"]
+    if photos:
+        ph = photos[0]
+        return ph.get("main_url") or ph.get("front_url") or ph.get("side_url")
+    return ""
+
+@api_router.get("/products")
+async def list_products(admin_view: bool = False):
+    query = {} if admin_view else {"active": True}
+    products = await db.products.find(query).sort("sort_order", 1).to_list(200)
+    out = []
+    for p in products:
+        c = clean(p)
+        c["display_image"] = resolve_display_photo(c)
+        out.append(c)
+    return out
+
+@api_router.get("/products/{slug}")
+async def get_product(slug: str):
+    product = await db.products.find_one({"slug": slug})
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
+    c = clean(product)
+    c["display_image"] = resolve_display_photo(c)
+    return c
+
+@api_router.post("/calculate-price")
+async def calculate_price(data: OrderItemInput):
+    product = await db.products.find_one({"_id": oid(data.product_id)})
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
+    return compute_item_price(product, data.config, data.quantity)
+
+@api_router.post("/match-photo")
+async def match_photo_endpoint(data: OrderItemInput):
+    product = await db.products.find_one({"_id": oid(data.product_id)})
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
+    return match_photo(product, data.config)
+
+# --------------------------------------------------------------------------
+# Public settings & zones
+# --------------------------------------------------------------------------
+@api_router.get("/delivery-zones")
+async def list_zones(admin_view: bool = False):
+    query = {} if admin_view else {"active": True}
+    zones = await db.delivery_zones.find(query).sort("fee_le", 1).to_list(100)
+    return [clean(z) for z in zones]
+
+@api_router.get("/store-info")
+async def store_info():
+    return {
+        "store_name": await get_setting("store_name", "Sogil Furniture"),
+        "app_name": await get_setting("app_name", "Sogil Furniture — Furniture Ordering & Management"),
+        "tagline": await get_setting("tagline", "Kualitas Terbaik, Untuk Ruang Terbaik"),
+        "store_address": await get_setting("store_address", ""),
+        "store_maps_url": await get_setting("store_maps_url", ""),
+        "whatsapp_number": await get_setting("whatsapp_number", "628XXXXXXXXXX"),
+        "exchange_rate_idr_per_le": _num(await get_setting("exchange_rate_idr_per_le", 357), 357),
+        "bank_info": await get_setting("bank_info", ""),
+        "logo_url": await get_setting("logo_url", ""),
+    }
+
+# --------------------------------------------------------------------------
+# Orders
+# --------------------------------------------------------------------------
+def normalize_phone(raw: str) -> str:
+    s = re.sub(r"[\s\-().]", "", raw or "")
+    return s
+
+def valid_intl_phone(s: str) -> bool:
+    return bool(re.match(r"^\+\d{8,15}$", s))
+
+async def generate_order_number():
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    prefix = f"SGF-{today}-"
+    count = await db.orders.count_documents({"order_number": {"$regex": f"^{prefix}"}})
+    seq = count + 1
+    while await db.orders.find_one({"order_number": f"{prefix}{seq:03d}"}):
+        seq += 1
+    return f"{prefix}{seq:03d}"
+
+@api_router.post("/orders")
+async def create_order(data: OrderInput):
+    if not data.customer_name.strip():
+        raise HTTPException(status_code=400, detail="Nama tidak boleh kosong.")
+    phone = normalize_phone(data.customer_phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="No HP tidak boleh kosong.")
+    if not valid_intl_phone(phone):
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +201234567890")
+    if not data.customer_address.strip():
+        raise HTTPException(status_code=400, detail="Alamat tidak boleh kosong.")
+    if data.delivery_method not in ("delivery", "pickup"):
+        raise HTTPException(status_code=400, detail="Silakan pilih metode penerimaan barang.")
+    if data.payment_method not in ("cash", "transfer"):
+        raise HTTPException(status_code=400, detail="Silakan pilih metode pembayaran.")
+
+    items_input = data.items if data.items else ([data.item] if data.item else [])
+    if not items_input:
+        raise HTTPException(status_code=400, detail="Keranjang kosong.")
+
+    maps = (data.customer_maps_url or "").strip()
+    if maps and not re.match(r"^https?://", maps):
+        raise HTTPException(status_code=400, detail="Link Maps tidak valid.")
+
+    delivery_fee = 0.0; zone_name = None; zone_id = None
+    if data.delivery_method == "delivery":
+        if not data.delivery_zone_id:
+            raise HTTPException(status_code=400, detail="Silakan pilih zona pengiriman.")
+        zone = await db.delivery_zones.find_one({"_id": oid(data.delivery_zone_id)})
+        if not zone or not zone.get("active"):
+            raise HTTPException(status_code=400, detail="Zona pengiriman tidak valid.")
+        delivery_fee = _num(zone["fee_le"]); zone_name = zone["name"]; zone_id = str(zone["_id"])
+
+    items = []; subtotal_le = 0.0; requires_confirm = False
+    for it in items_input:
+        if it.quantity < 1:
+            raise HTTPException(status_code=400, detail="Jumlah minimal 1.")
+        product = await db.products.find_one({"_id": oid(it.product_id)})
+        if not product or not product.get("active"):
+            raise HTTPException(status_code=400, detail="Produk tidak tersedia.")
+        bd = compute_item_price(product, it.config, it.quantity)
+        subtotal_le += bd["subtotal_le"]
+        requires_confirm = requires_confirm or bd["requires_admin_confirmation"] or bool(it.config.get("custom_size"))
+        items.append({
+            "product_id": str(product["_id"]), "product_name_snapshot": product["name"], "category": product["category"],
+            "configuration_snapshot": it.config, "quantity": it.quantity,
+            "base_price_le": bd["base_price_le"], "adjustments_le": bd["adjustments_le"],
+            "finishing_le": bd["finishing_le"], "unit_price_le": bd["unit_price_le"],
+            "subtotal_le": bd["subtotal_le"], "lines": bd["lines"],
+        })
+
+    total_le = subtotal_le + delivery_fee
+    rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    now = datetime.now(timezone.utc).isoformat()
+
+    order_doc = {
+        "order_number": await generate_order_number(),
+        "customer_name": data.customer_name.strip(), "customer_phone": phone,
+        "customer_address": data.customer_address.strip(), "customer_maps_url": maps,
+        "delivery_method": data.delivery_method, "delivery_zone_id": zone_id, "delivery_zone_name": zone_name,
+        "delivery_fee_le": delivery_fee, "payment_method": data.payment_method,
+        "payment_status": "belum_dibayar", "order_status": "pesanan_masuk",
+        "notes": (data.notes or "").strip(), "admin_note": "",
+        "items": items, "item": items[0],
+        "subtotal_le": subtotal_le, "total_le": total_le,
+        "exchange_rate_idr_per_le": rate, "estimated_total_idr": round(total_le * rate),
+        "rate_timestamp": now, "requires_admin_confirmation": requires_confirm,
+        "created_at": now, "updated_at": now,
+    }
+    result = await db.orders.insert_one(order_doc)
+    order_doc["id"] = str(result.inserted_id); order_doc.pop("_id", None)
+    order_doc["whatsapp_message"] = build_whatsapp_message(order_doc)
+    order_doc["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+    return order_doc
+
+def fmt_le(v):
+    return f"{v:,.0f}".replace(",", ".")
+
+def fmt_idr(v):
+    return f"Rp{v:,.0f}".replace(",", ".")
+
+def config_summary(item):
+    cfg = item.get("configuration_snapshot", {}) or {}; cat = item.get("category"); parts = []
+    if cat == "rak":
+        if cfg.get("length"): parts.append(f"{cfg['length']} cm")
+        if cfg.get("level"): parts.append(f"{cfg['level']} Tingkat")
+        if cfg.get("type"): parts.append(f"Tipe {cfg['type']}")
+        if cfg.get("finishing"): parts.append(cfg["finishing"])
+    elif cat == "meja":
+        if cfg.get("size"): parts.append(f"{cfg['size']} cm")
+        if cfg.get("height"): parts.append(f"Tinggi {cfg['height']} cm")
+        if cfg.get("finishing"): parts.append(cfg["finishing"])
+    elif cat == "meja_rak":
+        if cfg.get("variant"): parts.append(cfg["variant"])
+        if cfg.get("type"): parts.append(f"Tipe {cfg['type']}")
+        if cfg.get("finishing"): parts.append(cfg["finishing"])
+    if cfg.get("custom_size"): parts.append("Ukuran Custom")
+    return ", ".join(parts)
+
+def build_whatsapp_message(order):
+    lines = ["Halo Sogil Furniture, saya ingin melakukan pemesanan.", "", f"No. Pesanan: {order['order_number']}", ""]
+    for idx, item in enumerate(order.get("items", [order.get("item")]), 1):
+        if not item:
+            continue
+        prefix = f"{idx}. " if len(order.get("items", [])) > 1 else ""
+        lines.append(f"{prefix}Produk: {item['product_name_snapshot']}")
+        cs = config_summary(item)
+        if cs:
+            lines.append(f"   Spesifikasi: {cs}")
+        lines.append(f"   Jumlah: {item['quantity']}")
+    lines.append("")
+    if order["delivery_method"] == "delivery":
+        lines.append("Pengiriman: Delivery")
+        lines.append(f"Zona: {order.get('delivery_zone_name', '-')}")
+    else:
+        lines.append("Pengiriman: Ambil di Toko")
+    lines += ["", "Estimasi total:", f"{fmt_le(order['total_le'])} LE (≈ {fmt_idr(order['estimated_total_idr'])})",
+              f"Rate: Rp{fmt_le(order['exchange_rate_idr_per_le'])}/LE", "",
+              f"Nama: {order['customer_name']}", f"No. HP: {order['customer_phone']}", f"Alamat: {order['customer_address']}"]
+    if order.get("customer_maps_url"):
+        lines.append(f"Maps: {order['customer_maps_url']}")
+    lines += ["", f"Pembayaran: {'Transfer' if order['payment_method'] == 'transfer' else 'Cash'}"]
+    if order.get("notes"):
+        lines += ["", f"Catatan: {order['notes']}"]
+    if order.get("requires_admin_confirmation"):
+        lines += ["", "(*Pesanan ini memerlukan konfirmasi admin)"]
+    return "\n".join(lines)
+
+@api_router.get("/orders/{order_id}")
+async def get_order_public(order_id: str):
+    order = await db.orders.find_one({"_id": oid(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    order = clean(order)
+    order["whatsapp_message"] = build_whatsapp_message(order)
+    order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+    return order
+
+# --------------------------------------------------------------------------
+# Admin: orders
+# --------------------------------------------------------------------------
+@api_router.get("/admin/orders")
+async def admin_list_orders(status: Optional[str] = None, payment_status: Optional[str] = None,
+                            admin: dict = Depends(require_perm("manage_orders"))):
+    query = {}
+    if status:
+        query["order_status"] = status
+    if payment_status:
+        query["payment_status"] = payment_status
+    orders = await db.orders.find(query).sort("created_at", -1).to_list(2000)
+    return [clean(o) for o in orders]
+
+@api_router.get("/admin/overview")
+async def admin_overview(admin: dict = Depends(require_perm("manage_orders"))):
+    orders = await db.orders.find({}).to_list(5000)
+    stats = {"total": len(orders), "pesanan_masuk": 0, "dikonfirmasi": 0, "diproses": 0, "siap": 0,
+             "selesai": 0, "dibatalkan": 0, "lunas": 0, "belum_dibayar": 0, "dp": 0, "estimated_revenue_le": 0.0}
+    for o in orders:
+        st = o.get("order_status")
+        if st in stats:
+            stats[st] += 1
+        ps = o.get("payment_status")
+        if ps in stats:
+            stats[ps] += 1
+        if st != "dibatalkan":
+            stats["estimated_revenue_le"] += _num(o.get("total_le"))
+    return stats
+
+@api_router.get("/admin/analytics/top-configs")
+async def admin_top_configs(category: Optional[str] = None, group_by: str = "full",
+                            admin: dict = Depends(require_perm("manage_orders"))):
+    orders = await db.orders.find({}).to_list(5000)
+    agg = {}
+    for o in orders:
+        if o.get("order_status") == "dibatalkan":
+            continue
+        for it in o.get("items", [o.get("item")]):
+            if not it:
+                continue
+            if category and it.get("category") != category:
+                continue
+            cfg = it.get("configuration_snapshot", {}) or {}
+            cat = it.get("category")
+            if group_by == "length":
+                key = f"{cat} — {cfg.get('length', '-')} cm"
+            elif group_by == "level":
+                key = f"{cat} — {cfg.get('level', '-')} tingkat"
+            elif group_by == "type":
+                key = f"{cat} — Tipe {cfg.get('type', '-')}"
+            elif group_by == "finishing":
+                key = f"{cat} — {cfg.get('finishing', '-')}"
+            else:
+                key = f"{it.get('product_name_snapshot')} — {config_summary(it) or '-'}"
+            e = agg.setdefault(key, {"key": key, "category": cat, "config": cfg, "orders": 0, "quantity": 0})
+            e["orders"] += 1
+            e["quantity"] += int(it.get("quantity", 1))
+    rows = sorted(agg.values(), key=lambda x: x["quantity"], reverse=True)
+    total_q = sum(r["quantity"] for r in rows) or 1
+    for r in rows:
+        r["share"] = round(r["quantity"] / total_q * 100, 1)
+    return rows[:50]
+
+@api_router.get("/admin/orders/{order_id}")
+async def admin_get_order(order_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    order = await db.orders.find_one({"_id": oid(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    order = clean(order)
+    order["whatsapp_message"] = build_whatsapp_message(order)
+    order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+    return order
+
+async def record_order_revenue(order):
+    if await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"}):
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    await db.finance_transactions.insert_one({
+        "date": now, "type": "order_revenue", "category": "Penjualan",
+        "amount": _num(order.get("total_le")), "currency": "EGP", "account": "EGP",
+        "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')}",
+        "related_order_id": str(order["_id"]), "created_by_name": "Sistem",
+        "created_at": now, "updated_at": now,
+    })
+
+@api_router.patch("/admin/orders/{order_id}")
+async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict = Depends(require_perm("manage_orders"))):
+    update = audit_fields(admin)
+    valid_status = {"pesanan_masuk", "dikonfirmasi", "diproses", "siap", "selesai", "dibatalkan"}
+    valid_pay = {"belum_dibayar", "dp", "lunas"}
+    if data.order_status is not None:
+        if data.order_status not in valid_status:
+            raise HTTPException(status_code=400, detail="Status tidak valid")
+        update["order_status"] = data.order_status
+    if data.payment_status is not None:
+        if data.payment_status not in valid_pay:
+            raise HTTPException(status_code=400, detail="Status pembayaran tidak valid")
+        update["payment_status"] = data.payment_status
+    if data.admin_note is not None:
+        update["admin_note"] = data.admin_note
+    await db.orders.update_one({"_id": oid(order_id)}, {"$set": update})
+    order = await db.orders.find_one({"_id": oid(order_id)})
+    if data.payment_status == "lunas":
+        await record_order_revenue(order)
+    elif data.payment_status in ("belum_dibayar", "dp"):
+        await db.finance_transactions.delete_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
+    return clean(order)
+
+@api_router.delete("/admin/orders/{order_id}")
+async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("delete_data"))):
+    await db.orders.delete_one({"_id": oid(order_id)})
+    return {"ok": True}
+
+# --------------------------------------------------------------------------
+# Admin: products
+# --------------------------------------------------------------------------
+def slugify(name):
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s or str(uuid.uuid4())[:8]
+
+@api_router.post("/admin/products")
+async def admin_create_product(payload: Dict[str, Any], admin: dict = Depends(require_perm("modify_products"))):
+    now = datetime.now(timezone.utc).isoformat()
+    name = payload.get("name", "Produk Baru")
+    slug = payload.get("slug") or slugify(name)
+    if await db.products.find_one({"slug": slug}):
+        slug = f"{slug}-{str(uuid.uuid4())[:4]}"
+    doc = {"name": name, "slug": slug, "category": payload.get("category", "custom"),
+           "description": payload.get("description", ""), "image_url": payload.get("image_url", ""),
+           "active": payload.get("active", True), "configurable": payload.get("configurable", False),
+           "starting_price_le": _num(payload.get("starting_price_le", 0)), "pricing": payload.get("pricing", {}),
+           "photos": payload.get("photos", []), "representative_photo_id": payload.get("representative_photo_id"),
+           "sort_order": payload.get("sort_order", 99), "created_at": now,
+           "updated_by_name": admin.get("name"), "updated_at": now}
+    result = await db.products.insert_one(doc)
+    return clean(await db.products.find_one({"_id": result.inserted_id}))
+
+@api_router.put("/admin/products/{product_id}")
+async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("modify_products"))):
+    allowed = ["name", "category", "description", "image_url", "active", "configurable",
+               "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug"]
+    upd = {k: payload[k] for k in allowed if k in payload}
+    upd.update(audit_fields(admin))
+    if "starting_price_le" in upd:
+        upd["starting_price_le"] = _num(upd["starting_price_le"])
+    await db.products.update_one({"_id": oid(product_id)}, {"$set": upd})
+    return clean(await db.products.find_one({"_id": oid(product_id)}))
+
+@api_router.delete("/admin/products/{product_id}")
+async def admin_delete_product(product_id: str, admin: dict = Depends(require_perm("delete_data"))):
+    await db.products.delete_one({"_id": oid(product_id)})
+    return {"ok": True}
+
+# --------------------------------------------------------------------------
+# Uploads
+# --------------------------------------------------------------------------
+@api_router.post("/admin/upload")
+async def admin_upload(file: UploadFile = File(...), admin: dict = Depends(get_current_admin)):
+    ext = (file.filename.rsplit(".", 1)[-1] if "." in file.filename else "bin").lower()
+    if ext not in MIME_TYPES:
+        raise HTTPException(status_code=400, detail="Format gambar tidak didukung (jpg, png, webp)")
+    path = f"{APP_NAME}/uploads/{uuid.uuid4()}.{ext}"
+    data = await file.read()
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Ukuran gambar maksimal 8MB")
+    result = put_object(path, data, MIME_TYPES[ext])
+    await db.files.insert_one({"storage_path": result["path"], "original_filename": file.filename,
+                               "content_type": MIME_TYPES[ext], "size": result.get("size", len(data)),
+                               "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()})
+    return {"path": result["path"], "url": f"/api/files/{result['path']}"}
+
+@api_router.get("/files/{path:path}")
+async def download_file(path: str):
+    record = await db.files.find_one({"storage_path": path, "is_deleted": False})
+    if not record:
+        raise HTTPException(status_code=404, detail="File tidak ditemukan")
+    data, content_type = get_object(path)
+    return StarletteResponse(content=data, media_type=record.get("content_type", content_type),
+                             headers={"Cache-Control": "public, max-age=86400"})
+
+# --------------------------------------------------------------------------
+# Admin: delivery zones
+# --------------------------------------------------------------------------
+@api_router.post("/admin/delivery-zones")
+async def admin_create_zone(data: DeliveryZoneInput, admin: dict = Depends(require_perm("manage_settings"))):
+    doc = {"name": data.name, "fee_le": _num(data.fee_le), "active": data.active, "created_at": datetime.now(timezone.utc).isoformat()}
+    result = await db.delivery_zones.insert_one(doc)
+    return clean(await db.delivery_zones.find_one({"_id": result.inserted_id}))
+
+@api_router.put("/admin/delivery-zones/{zone_id}")
+async def admin_update_zone(zone_id: str, data: DeliveryZoneInput, admin: dict = Depends(require_perm("manage_settings"))):
+    await db.delivery_zones.update_one({"_id": oid(zone_id)}, {"$set": {"name": data.name, "fee_le": _num(data.fee_le), "active": data.active}})
+    return clean(await db.delivery_zones.find_one({"_id": oid(zone_id)}))
+
+@api_router.delete("/admin/delivery-zones/{zone_id}")
+async def admin_delete_zone(zone_id: str, admin: dict = Depends(require_perm("manage_settings"))):
+    await db.delivery_zones.delete_one({"_id": oid(zone_id)})
+    return {"ok": True}
+
+# --------------------------------------------------------------------------
+# Admin: settings
+# --------------------------------------------------------------------------
+@api_router.get("/admin/settings")
+async def admin_get_settings(admin: dict = Depends(require_perm("manage_settings"))):
+    info = await store_info()
+    meta = {}
+    for k in ["store_name", "whatsapp_number", "exchange_rate_idr_per_le", "logo_url"]:
+        doc = await db.settings.find_one({"key": k})
+        if doc and doc.get("updated_by_name"):
+            meta[k] = {"updated_by_name": doc.get("updated_by_name"), "updated_at": doc.get("updated_at")}
+    info["_audit"] = meta
+    return info
+
+@api_router.put("/admin/settings")
+async def admin_update_settings(payload: Dict[str, Any], admin: dict = Depends(require_perm("manage_settings"))):
+    allowed = ["store_name", "app_name", "tagline", "store_address", "store_maps_url",
+               "whatsapp_number", "exchange_rate_idr_per_le", "bank_info", "logo_url"]
+    for key in allowed:
+        if key in payload:
+            val = payload[key]
+            if key == "exchange_rate_idr_per_le":
+                val = _num(val, 357)
+            await set_setting(key, val, admin)
+    return await store_info()
+
+# --------------------------------------------------------------------------
+# Admin: manage admins (owner / manage_admins)
+# --------------------------------------------------------------------------
+@api_router.get("/admin/admins")
+async def list_admins(admin: dict = Depends(require_perm("manage_admins"))):
+    admins = await db.admins.find({}).to_list(200)
+    out = []
+    for a in admins:
+        a = clean(a)
+        if a.get("role") == "owner":
+            a["permissions"] = default_permissions("owner")
+        else:
+            a.setdefault("permissions", default_permissions(a.get("role", "admin")))
+        out.append(a)
+    return out
+
+@api_router.post("/admin/admins")
+async def create_admin(data: AdminCreateInput, admin: dict = Depends(require_owner())):
+    email = data.email.strip().lower()
+    if data.role not in ACCOUNT_TYPES:
+        raise HTTPException(status_code=400, detail="Tipe akun tidak valid")
+    if data.role == "owner":
+        raise HTTPException(status_code=400, detail="Tidak dapat membuat akun Owner tambahan")
+    if await db.admins.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email sudah digunakan")
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter")
+    perms = default_permissions(data.role)
+    if data.permissions:
+        for k in PERMISSION_KEYS:
+            if k in data.permissions:
+                perms[k] = bool(data.permissions[k])
+    perms["manage_admins"] = False  # only owner
+    doc = {"name": data.name.strip(), "email": email, "password_hash": hash_password(data.password),
+           "role": data.role, "permissions": perms, "created_at": datetime.now(timezone.utc).isoformat(),
+           "created_by_name": admin.get("name")}
+    result = await db.admins.insert_one(doc)
+    return clean(await db.admins.find_one({"_id": result.inserted_id}))
+
+@api_router.put("/admin/admins/{admin_id}")
+async def update_admin(admin_id: str, data: AdminUpdateInput, admin: dict = Depends(require_owner())):
+    target = await db.admins.find_one({"_id": oid(admin_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="Akun tidak ditemukan")
+    if target.get("role") == "owner":
+        raise HTTPException(status_code=400, detail="Akun Owner tidak dapat diubah dari sini")
+    upd = {}
+    if data.name is not None:
+        upd["name"] = data.name.strip()
+    if data.email is not None:
+        new_email = data.email.strip().lower()
+        if await db.admins.find_one({"email": new_email, "_id": {"$ne": oid(admin_id)}}):
+            raise HTTPException(status_code=400, detail="Email sudah digunakan")
+        upd["email"] = new_email
+    if data.password:
+        if len(data.password) < 6:
+            raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter")
+        upd["password_hash"] = hash_password(data.password)
+    if data.role is not None:
+        if data.role not in ACCOUNT_TYPES or data.role == "owner":
+            raise HTTPException(status_code=400, detail="Tipe akun tidak valid")
+        upd["role"] = data.role
+    if data.permissions is not None:
+        perms = target.get("permissions", default_permissions(target.get("role", "admin")))
+        for k in PERMISSION_KEYS:
+            if k in data.permissions:
+                perms[k] = bool(data.permissions[k])
+        perms["manage_admins"] = False
+        upd["permissions"] = perms
+    await db.admins.update_one({"_id": oid(admin_id)}, {"$set": upd})
+    return clean(await db.admins.find_one({"_id": oid(admin_id)}))
+
+@api_router.delete("/admin/admins/{admin_id}")
+async def delete_admin(admin_id: str, admin: dict = Depends(require_owner())):
+    target = await db.admins.find_one({"_id": oid(admin_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="Akun tidak ditemukan")
+    if target.get("role") == "owner":
+        raise HTTPException(status_code=400, detail="Akun Owner tidak dapat dihapus")
+    await db.admins.delete_one({"_id": oid(admin_id)})
+    return {"ok": True}
+
+# --------------------------------------------------------------------------
+# Finance
+# --------------------------------------------------------------------------
+DEFAULT_FINANCE_CATEGORIES = {
+    "income": ["Penjualan", "Pendapatan Lain", "Penyesuaian"],
+    "expense": ["Pembelian Bahan", "Biaya Kayu/Material", "Upah Pekerja", "Biaya Pengiriman",
+                "Operasional", "Peralatan/Perkakas", "Marketing", "Pengeluaran Lain", "Penyesuaian"],
+}
+
+@api_router.get("/admin/finance/categories")
+async def finance_categories(admin: dict = Depends(require_perm("access_finance"))):
+    return DEFAULT_FINANCE_CATEGORIES
+
+async def _compute_balances():
+    bal = {"IDR": 0.0, "EGP": 0.0}
+    async for t in db.finance_transactions.find({}):
+        typ = t.get("type"); cur = t.get("currency", "EGP"); amt = _num(t.get("amount"))
+        if typ in ("income", "order_revenue"):
+            bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) + amt
+        elif typ == "expense":
+            bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) - amt
+        elif typ == "transfer":
+            bal[t.get("from_account", "IDR")] = bal.get(t.get("from_account", "IDR"), 0) - _num(t.get("from_amount"))
+            bal[t.get("to_account", "EGP")] = bal.get(t.get("to_account", "EGP"), 0) + _num(t.get("to_amount"))
+    return bal
+
+@api_router.get("/admin/finance/accounts")
+async def finance_accounts(admin: dict = Depends(require_perm("access_finance"))):
+    return {"balances": await _compute_balances()}
+
+@api_router.get("/admin/finance/transactions")
+async def finance_list(currency: Optional[str] = None, type: Optional[str] = None,
+                       start: Optional[str] = None, end: Optional[str] = None,
+                       admin: dict = Depends(require_perm("access_finance"))):
+    q = {}
+    if currency:
+        q["$or"] = [{"currency": currency}, {"from_account": currency}, {"to_account": currency}]
+    if type:
+        q["type"] = type
+    if start or end:
+        q["date"] = {}
+        if start:
+            q["date"]["$gte"] = start
+        if end:
+            q["date"]["$lte"] = end + "T23:59:59"
+    txns = await db.finance_transactions.find(q).sort("date", -1).to_list(2000)
+    return [clean(t) for t in txns]
+
+@api_router.post("/admin/finance/transactions")
+async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_perm("access_finance"))):
+    if data.type not in ("income", "expense"):
+        raise HTTPException(status_code=400, detail="Tipe transaksi tidak valid")
+    if data.currency not in ("IDR", "EGP"):
+        raise HTTPException(status_code=400, detail="Mata uang tidak valid")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {"date": data.date or now, "type": data.type, "category": data.category,
+           "amount": _num(data.amount), "currency": data.currency, "account": data.currency,
+           "description": data.description or "", "related_order_id": None,
+           "created_by_id": admin.get("id"), "created_by_name": admin.get("name"),
+           "updated_by_name": admin.get("name"), "created_at": now, "updated_at": now}
+    result = await db.finance_transactions.insert_one(doc)
+    return clean(await db.finance_transactions.find_one({"_id": result.inserted_id}))
+
+@api_router.put("/admin/finance/transactions/{txn_id}")
+async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depends(require_perm("access_finance"))):
+    t = await db.finance_transactions.find_one({"_id": oid(txn_id)})
+    if not t:
+        raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
+    if t.get("type") == "order_revenue":
+        raise HTTPException(status_code=400, detail="Pendapatan otomatis pesanan tidak dapat diubah manual")
+    upd = {"date": data.date or t.get("date"), "type": data.type, "category": data.category,
+           "amount": _num(data.amount), "currency": data.currency, "account": data.currency,
+           "description": data.description or "", "updated_by_name": admin.get("name"),
+           "updated_at": datetime.now(timezone.utc).isoformat()}
+    await db.finance_transactions.update_one({"_id": oid(txn_id)}, {"$set": upd})
+    return clean(await db.finance_transactions.find_one({"_id": oid(txn_id)}))
+
+@api_router.delete("/admin/finance/transactions/{txn_id}")
+async def finance_delete(txn_id: str, admin: dict = Depends(require_perm("access_finance"))):
+    await db.finance_transactions.delete_one({"_id": oid(txn_id)})
+    return {"ok": True}
+
+@api_router.post("/admin/finance/transfer")
+async def finance_transfer(data: TransferInput, admin: dict = Depends(require_perm("access_finance"))):
+    if data.from_account not in ("IDR", "EGP") or data.to_account not in ("IDR", "EGP") or data.from_account == data.to_account:
+        raise HTTPException(status_code=400, detail="Akun transfer tidak valid")
+    if _num(data.from_amount) <= 0 or _num(data.to_amount) <= 0:
+        raise HTTPException(status_code=400, detail="Jumlah transfer harus lebih dari 0")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {"date": data.date or now, "type": "transfer", "category": "Transfer/Konversi",
+           "from_account": data.from_account, "to_account": data.to_account,
+           "from_amount": _num(data.from_amount), "to_amount": _num(data.to_amount),
+           "exchange_rate": _num(data.exchange_rate) if data.exchange_rate else None,
+           "description": data.description or "", "created_by_name": admin.get("name"),
+           "updated_by_name": admin.get("name"), "created_at": now, "updated_at": now}
+    result = await db.finance_transactions.insert_one(doc)
+    return clean(await db.finance_transactions.find_one({"_id": result.inserted_id}))
+
+def _period_range(period, start, end):
+    now = datetime.now(timezone.utc)
+    if period == "custom" and start and end:
+        return start, end + "T23:59:59", None, None
+    if period == "this_month":
+        s = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        ps = (s - timedelta(days=1)).replace(day=1)
+        return s.isoformat(), now.isoformat(), ps.isoformat(), s.isoformat()
+    if period == "last_month":
+        first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_end = first - timedelta(seconds=1)
+        s = last_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        pend = s - timedelta(seconds=1); ps = pend.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return s.isoformat(), last_end.isoformat(), ps.isoformat(), s.isoformat()
+    if period == "this_year":
+        s = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        ps = s.replace(year=s.year - 1)
+        return s.isoformat(), now.isoformat(), ps.isoformat(), s.isoformat()
+    if period == "last_year":
+        s = now.replace(year=now.year - 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        e = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
+        ps = s.replace(year=s.year - 1)
+        return s.isoformat(), e.isoformat(), ps.isoformat(), s.isoformat()
+    return None, None, None, None
+
+async def _stats_for(s, e):
+    q = {}
+    if s or e:
+        q["date"] = {}
+        if s:
+            q["date"]["$gte"] = s
+        if e:
+            q["date"]["$lte"] = e
+    res = {"IDR": {"revenue": 0.0, "cost": 0.0}, "EGP": {"revenue": 0.0, "cost": 0.0}}
+    async for t in db.finance_transactions.find(q):
+        cur = t.get("currency", "EGP"); typ = t.get("type"); amt = _num(t.get("amount"))
+        if cur not in res:
+            continue
+        if typ in ("income", "order_revenue"):
+            res[cur]["revenue"] += amt
+        elif typ == "expense":
+            res[cur]["cost"] += amt
+    for cur in res:
+        r = res[cur]
+        r["operating_profit"] = r["revenue"] - r["cost"]
+        r["cash_flow"] = r["revenue"] - r["cost"]
+    return res
+
+@api_router.get("/admin/finance/stats")
+async def finance_stats(period: str = "this_month", start: Optional[str] = None, end: Optional[str] = None,
+                        admin: dict = Depends(require_perm("access_finance"))):
+    s, e, ps, pe = _period_range(period, start, end)
+    current = await _stats_for(s, e)
+    balances = await _compute_balances()
+    comparison = None
+    if ps and pe:
+        prev = await _stats_for(ps, pe)
+        comparison = {}
+        for cur in ("IDR", "EGP"):
+            comparison[cur] = {}
+            for metric in ("revenue", "cost", "operating_profit"):
+                cv = current[cur][metric]; pv = prev[cur][metric]
+                pct = ((cv - pv) / abs(pv) * 100) if pv else (100.0 if cv else 0.0)
+                comparison[cur][metric] = round(pct, 1)
+    return {"period": period, "range": {"start": s, "end": e}, "current": current,
+            "comparison": comparison, "balances": balances}
+
+# --------------------------------------------------------------------------
+# Seed & migrations
+# --------------------------------------------------------------------------
+RAK_TYPE_B_PRICES = {
+    "60_2": 565, "60_3": 755, "60_4": 985, "60_5": 1270, "60_6": 1335, "60_7": 1505,
+    "80_2": 635, "80_3": 860, "80_4": 1125, "80_5": 1335, "80_6": 1545, "80_7": 1750,
+    "120_2": 830, "120_3": 1180, "120_4": 1530, "120_5": 1875, "120_6": 2255, "120_7": 2570,
+}
+
+async def seed():
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@sogil.com").lower()
+    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
+    existing = await db.admins.find_one({"email": admin_email})
+    if not existing:
+        await db.admins.insert_one({"email": admin_email, "password_hash": hash_password(admin_password),
+                                    "name": "Owner Sogil", "role": "owner", "permissions": default_permissions("owner"),
+                                    "created_at": datetime.now(timezone.utc).isoformat()})
+    else:
+        upd = {}
+        if not verify_password(admin_password, existing["password_hash"]):
+            upd["password_hash"] = hash_password(admin_password)
+        if existing.get("role") != "owner":
+            upd["role"] = "owner"; upd["permissions"] = default_permissions("owner")
+        if upd:
+            await db.admins.update_one({"_id": existing["_id"]}, {"$set": upd})
+
+    await db.admins.create_index("email", unique=True)
+    await db.products.create_index("slug", unique=True)
+
+    defaults = {
+        "store_name": "Sogil Furniture",
+        "app_name": "Sogil Furniture — Furniture Ordering & Management",
+        "tagline": "Kualitas Terbaik, Untuk Ruang Terbaik",
+        "store_address": "11 El-Refaey Ln, El-Darb El-Ahmar, Al-Darb Al-Ahmar, Cairo Governorate 4293042",
+        "store_maps_url": "https://maps.google.com/?q=30.041889,31.262636",
+        "whatsapp_number": "628XXXXXXXXXX", "exchange_rate_idr_per_le": 357,
+        "bank_info": "PLACEHOLDER — Isi informasi rekening/bank melalui dashboard admin.", "logo_url": "",
+    }
+    for k, v in defaults.items():
+        if await db.settings.find_one({"key": k}) is None:
+            await set_setting(k, v)
+
+    if await db.delivery_zones.count_documents({}) == 0:
+        for name, fee in [("Darasah", 150), ("Gamaliyah", 200), ("Buuts", 250), ("Hay Sadis", 500),
+                          ("Hay Sabi", 500), ("Hay Tsamin", 500), ("Hay Asyir", 600)]:
+            await db.delivery_zones.insert_one({"name": name, "fee_le": float(fee), "active": True,
+                                                "created_at": datetime.now(timezone.utc).isoformat()})
+
+    if await db.products.count_documents({}) == 0:
+        now = datetime.now(timezone.utc).isoformat()
+        rak_pricing = {
+            "lengths": ["60", "80", "120"], "levels": ["2", "3", "4", "5", "6", "7"],
+            "base_prices": dict(RAK_TYPE_B_PRICES),
+            "types": ["B", "A", "B+", "A+"],
+            "type_adjustments": {"B": {"60": 0, "80": 0, "120": 0}, "A": {"60": 60, "80": 80, "120": 120},
+                                 "B+": {"60": 120, "80": 120, "120": 120}, "A+": {"60": 180, "80": 200, "120": 240}},
+            "finishings": ["Natural", "Pernis", "Cat Warna"],
+            "finishing": {"Natural": 0, "Pernis": {"60": 15, "80": 20, "120": 30}, "Cat Warna": {"60": 20, "80": 25, "120": 35}},
+        }
+        meja_pricing = {"sizes": ["40x80", "50x80"], "heights": ["30", "75"],
+                        "base_prices": {"40x80_30": 700, "40x80_75": 800, "50x80_30": 800, "50x80_75": 900},
+                        "finishings": ["Natural", "Pernis", "Cat Warna"], "finishing": {"Natural": 0, "Pernis": 40, "Cat Warna": 50}}
+        mrv = ["Meja 40x80 + Rak 3 Tingkat", "Meja 50x80 + Rak 3 Tingkat"]
+        mr_pricing = {"variants": mrv, "base_prices": {mrv[0]: 2200, mrv[1]: 2400}, "types": ["B", "A", "B+", "A+"],
+                      "type_adjustments": {"B": {mrv[0]: 0, mrv[1]: 0}, "A": {mrv[0]: 80, mrv[1]: 80},
+                                           "B+": {mrv[0]: 120, mrv[1]: 120}, "A+": {mrv[0]: 200, mrv[1]: 200}},
+                      "finishings": ["Natural", "Pernis", "Cat Warna"], "finishing": {"Natural": 0, "Pernis": 60, "Cat Warna": 75}}
+        products = [
+            {"name": "Rak Kayu", "slug": "rak-kayu", "category": "rak", "configurable": True,
+             "description": "Rak serbaguna, pilih panjang, jumlah tingkat, tipe, dan finishing sesuai kebutuhanmu.",
+             "starting_price_le": RAK_TYPE_B_PRICES["60_2"], "pricing": rak_pricing, "sort_order": 1},
+            {"name": "Meja", "slug": "meja", "category": "meja", "configurable": True,
+             "description": "Meja praktis untuk belajar atau kerja. Pilih ukuran, tinggi, dan finishing.",
+             "starting_price_le": 700, "pricing": meja_pricing, "sort_order": 2},
+            {"name": "Meja Rak", "slug": "meja-rak", "category": "meja_rak", "configurable": True,
+             "description": "Kombinasi meja dengan rak di atasnya. Hemat ruang, multifungsi.",
+             "starting_price_le": 2200, "pricing": mr_pricing, "sort_order": 3},
+            {"name": "Papan Tulis", "slug": "papan-tulis", "category": "papan_tulis", "configurable": False,
+             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 4},
+            {"name": "Blockboard", "slug": "blockboard", "category": "blockboard", "configurable": False,
+             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 5},
+            {"name": "Rak Tempel", "slug": "rak-tempel", "category": "rak_tempel", "configurable": False,
+             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 6},
+            {"name": "Rak Gantung", "slug": "rak-gantung", "category": "rak_gantung", "configurable": False,
+             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 7},
+            {"name": "Gantungan Baju", "slug": "gantungan-baju", "category": "gantungan_baju", "configurable": False,
+             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 8},
+            {"name": "Pesanan Custom", "slug": "pesanan-custom", "category": "custom", "configurable": False,
+             "description": "Punya kebutuhan khusus? Ukuran custom dapat dikonsultasikan dengan admin.", "starting_price_le": 0, "pricing": {}, "sort_order": 9},
+        ]
+        for p in products:
+            p.update({"image_url": "", "active": True, "photos": [], "representative_photo_id": None, "created_at": now, "updated_at": now})
+            await db.products.insert_one(p)
+
+    # Migration: Rak Type B base prices (idempotent via flag)
+    if await db.settings.find_one({"key": "migration_rak_typeB_v2"}) is None:
+        rak = await db.products.find_one({"category": "rak"})
+        if rak:
+            pricing = rak.get("pricing", {}) or {}
+            pricing["base_prices"] = dict(RAK_TYPE_B_PRICES)
+            await db.products.update_one({"_id": rak["_id"]}, {"$set": {"pricing": pricing, "starting_price_le": RAK_TYPE_B_PRICES["60_2"]}})
+        await set_setting("migration_rak_typeB_v2", True)
+
+    # Ensure photos field exists on all products
+    await db.products.update_many({"photos": {"$exists": False}}, {"$set": {"photos": [], "representative_photo_id": None}})
+
+@app.on_event("startup")
+async def startup():
+    try:
+        init_storage()
+        logger.info("Storage initialized")
+    except Exception as e:
+        logger.error(f"Storage init failed: {e}")
+    await seed()
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
+
+app.include_router(api_router)
+
+_frontend = os.environ.get("FRONTEND_URL")
+_origins = [o for o in os.environ.get('CORS_ORIGINS', '').split(',') if o and o != "*"]
+if _frontend and _frontend not in _origins:
+    _origins.append(_frontend)
+if not _origins:
+    _origins = ["http://localhost:3000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)

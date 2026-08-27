@@ -1,0 +1,45 @@
+{
+  "summary": "V2 backend + frontend testing completed. Created /app/backend/tests/test_v2_features.py with 32 pytest cases covering new V2 functionality (Rak Type B pricing, phone validation, multi-item cart orders, weighted photo match, analytics, finance auto-revenue dedupe, multi-admin permissions, admin email/password change, security 401/404, overview filters). All 32 tests pass. Playwright verified the customer flow (configure Rak Kayu 565 LE base, dynamic pricing to 1515 LE, add-to-cart with cart count increment, cart qty +/- updates subtotal, checkout with intl phone validation, order confirmation with SGF number) and the admin flow (language switch ID/EN/AR with RTL toggle on documentElement, admin login, overview stat cards clickable and navigate to filtered /admin/orders?status=pesanan_masuk, analytics/finance/admins/settings pages render with all expected testids).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/admin/products/{id} PUT", "issue": "Accepts arbitrary payload dict; no Pydantic validation for product update body (allowlist enforced only on settings endpoint)."},
+      {"endpoint": "/api/admin/finance/transfer", "issue": "No validation that from_amount>0 and to_amount>0; a zero/negative transfer would be accepted."},
+      {"endpoint": "seed()", "issue": "Older backend_test.py::TestPricing::test_rak_80_5_A_pernis still hard-codes pre-migration base 2100 for 80_5. After V2 Rak Type B migration real base is 1335 (unit 1515). Legacy pricing test in backend_test.py would fail; kept as-is per scope but should be updated by main agent."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Admin overview stats", "issues": ["Data-testids exposed: stat-total, stat-pesanan_masuk, stat-diproses, stat-siap, stat-selesai, stat-dibatalkan, stat-lunas, stat-belum_dibayar, stat-revenue. Missing stat-dikonfirmasi and stat-dp cards (spec listed them). Low priority — could be intentional grouping."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v2_features.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/v2_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Update legacy backend_test.py::TestPricing::test_rak_80_5_A_pernis to new Type B base (1335 -> unit 1515) so the older regression file stays green.",
+    "(Optional) Add stat-dikonfirmasi and stat-dp cards on Admin overview to match spec.",
+    "(Optional) Validate positive amounts on POST /admin/finance/transfer."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 1246 lines — approaching the 700-line guideline; consider splitting routers (auth, orders, finance, admin_products, admins) into modules.",
+    "admin_update_product accepts raw Dict[str, Any] without an allowlist; malicious keys could inject fields into the products doc.",
+    "record_order_revenue key uses str(order['_id']); dedupe correct. However there's no reverse action if payment_status is changed from lunas -> belum_dibayar (orphan revenue remains). Consider deleting the auto-revenue when unlunas.",
+    "compute_item_price: finishing for 'meja' expects scalar (fin_cost when not dict) but the code sets fin_cost=0 when it is a dict — fine for current data but silently zeros invalid config. Add validation.",
+    "photo_similarity: exact-match bonus (+100) is applied but requires that all weight keys present in attributes match; if any attribute is missing/empty it's skipped from exact check — potential false exacts when photo has partial attributes.",
+    "CORS: allow_origins strictly from env — good. samesite=none + secure=true cookie requires HTTPS in dev too — OK for the preview domain."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v2_features.py (new)"
+  ],
+  "success_rate": {"backend": "100% (32/32)", "frontend": "100% of tested critical flows"},
+  "test_credentials": "Owner: syahid.mujahid02@gmail.com / 0LFOCWU9_V3k (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Test orders created via API during tests (TEST_ prefixed names). Sub-admin test_manager_v2@example.com created then deleted. All V2 seed products already in DB with post-migration Type B base prices.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "V2 features are all functional. New test file at /app/backend/tests/test_v2_features.py covers Type B pricing, multi-item orders, phone +countrycode, photo match, analytics, finance auto-revenue dedupe, multi-admin perms, security. Legacy /app/backend/tests/backend_test.py still has one stale assertion (test_rak_80_5_A_pernis expects pre-migration base 2100) — will fail against current DB. Owner login works; sub-admin creation forces manage_admins=false server side; sub-admin gets 403 on /admin/finance/* and /admin/admins. Data-testids on frontend match the spec. Admin overview stat cards missing stat-dikonfirmasi and stat-dp variants."
+}

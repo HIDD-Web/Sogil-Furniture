@@ -1,0 +1,78 @@
+{
+  "theme": "light",
+  "typography": {
+    "heading_font": "Outfit",
+    "body_font": "DM Sans",
+    "rules": [
+      "Use tracking-tight for all headings > 32px",
+      "Line height: leading-none for headers, leading-relaxed for body",
+      "Do NOT use Inter for any headings",
+      "Ensure text contrasts meet APCA standards against backgrounds",
+      "Use typography to create a warm, approachable, but structured hierarchy"
+    ]
+  },
+  "colors": {
+    "primary": "#8B5A2B",
+    "primary_hover": "#6B4423",
+    "background_base": "#F9F6F0",
+    "background_card": "#FFFFFF",
+    "text_main": "#2C1E16",
+    "text_muted": "#5C4A3D",
+    "border_subtle": "#E5DCC5",
+    "accent_success": "#738678",
+    "accent_warning": "#E2725B",
+    "whatsapp_green": "#25D366",
+    "rules": [
+      "Use Warm beige and Cream for backgrounds",
+      "Avoid excessive gradients and neon colors",
+      "No luxury black/gold. Keep it natural, organic, and accessible",
+      "Color exists to guide action and build a 'furniture workshop' familiarity"
+    ]
+  },
+  "visual_enhancers": {
+    "borders": "Minimal borders, 1px solid #E5DCC5",
+    "corners": "Soft rounded corners, rounded-2xl for major cards, rounded-xl for inputs",
+    "shadows": "Subtle ambient shadows only, e.g., shadow-sm on hover. No harsh or overly large shadows.",
+    "textures": "Subtle noise or wood grain overlay (max 3-5% opacity) if needed for warmth, though keep it extremely subtle so it stays modern."
+  },
+  "layouts": {
+    "mobile": "Mobile-first approach. Large touch targets (min 48px height) for all interactable elements.",
+    "spacing": "Generous whitespace. Use p-4 to p-6 inside cards. gap-6 to gap-8 between sections.",
+    "sticky_elements": "Sticky bottom price summary on mobile detail pages. Sticky 'Pesan Sekarang' CTA."
+  },
+  "components": {
+    "product_card": "Placeholder image (bg-stone-100 flex items-center justify-center) with text 'Foto produk segera tersedia'. Followed by simple, clean text hierarchy below.",
+    "forms": "Use Shadcn components but style with warm beige backgrounds and border_subtle.",
+    "price_summary": "Fixed at bottom on mobile (`fixed bottom-0 left-0 w-full z-50 p-4 bg-white/90 backdrop-blur-md border-t border-stone-200 shadow-[0_-4px_16px_rgba(0,0,0,0.05)]`).",
+    "buttons": "Pill-shaped (rounded-full) or soft rounded (rounded-xl) with solid primary color for main CTA. Large size for mobile to ensure ease of tapping."
+  },
+  "image_urls": {
+    "hero_texture": {
+      "url": "https://images.unsplash.com/photo-1644931551533-02906718127f?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2MjJ8MHwxfHNlYXJjaHwzfHx3b29kJTIwdGV4dHVyZSUyMGxpZ2h0fGVufDB8fHx8MTc4NzgwNjM4Nnww&ixlib=rb-4.1.0&q=85",
+      "description": "Subtle wood texture for optional low-opacity background usage."
+    }
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "Simple, clean, minimal stroke width (1.5 or 2). Avoid overly complex icons."
+  },
+  "instructions_to_main_agent": [
+    "CRITICAL: DO NOT generate fake product photography. Use neutral beige/gray placeholder boxes with the text 'Foto produk segera tersedia'.",
+    "Ensure all interactive elements have `data-testid` attributes (kebab-case, role-based).",
+    "Implement a fixed/sticky bottom bar for mobile containing the total price and checkout CTA on product configuration pages.",
+    "Build the UI primarily in Bahasa Indonesia as requested.",
+    "Do NOT use complete transparent backgrounds in headers or overlays if content scrolls underneath.",
+    "Focus heavily on the 'Product detail + guided configuration form'. Use large, easy-to-tap selector buttons/cards for sizes, levels, and finishing, rather than small native dropdowns on mobile.",
+    "Admin dashboard should follow the same warm but clean design logic, maintaining high usability.",
+    "Include the standard placeholder logo space ('Sogil Furniture') in the header as an icon+text combo."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "You tend to converge toward generic outputs. Make creative, distinctive frontends that feel warm and human.",
+    "Don't make generic centered layouts. Use optical alignment.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Every interaction needs micro-animations - hover states, transitions. Static = dead.",
+    "Never use AI assistant Emoji characters for icons.",
+    "For toast notifications, use sonner.",
+    "Ensure the application strictly follows the mobile-first CSS architecture since many customers arrive via WhatsApp."
+  ]
+}
