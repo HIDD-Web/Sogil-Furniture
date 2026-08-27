@@ -38,6 +38,15 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 ## Testing
 - Backend: /app/backend/tests/test_v2_features.py (32/32 pass). Frontend flows verified via Playwright.
 
+### v3 — done (2026-08-27)
+- Image system fix: category cover image (manual + auto-from-orders modes) separated from per-configuration photos; removed confusing "make category image" star; weighted config-photo matching (length & levels dominant) with graceful closest-match fallback; cover never used as per-config fallback.
+- Delete order: permission-gated (delete_data), removes auto order_revenue, 404 on missing; excluded from stats/finance.
+- Store contacts (WhatsApp/address/Instagram/Facebook/TikTok/Email) editable in Settings; clickable in customer footer (only shown when configured).
+- Discount codes: admin CRUD + server-side validation (dates/claims/cap, % clamped 0-100) + checkout apply + immutable order snapshot (code/percentage/discount_le).
+- Custom finance transaction categories (CRUD, merged into transaction dropdown).
+- Manual finance balance adjustment ("Set Saldo Saat Ini") recorded as balance_adjustment (affects balance, not revenue).
+- Tests: /app/backend/tests/test_v3_features.py (17/17 pass).
+
 ## Backlog (not built)
-- P1: Auto representative image from order frequency (currently manual override + display resolver in place).
-- P2: Customer accounts/login, discounts/promos, inventory, automatic custom-size pricing, payment gateway, automatic FX API.
+- P1: Customer accounts + login (guest checkout preserved), referral codes + points (award on paid, dedupe, reverse on delete), customer order-history area — DEFERRED to next phase (large subsystem).
+- P2: split server.py into routers; automatic FX; payment gateway; inventory.

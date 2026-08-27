@@ -29,6 +29,7 @@ import AdminSettings from "./pages/admin/AdminSettings";
 import AdminAnalytics from "./pages/admin/AdminAnalytics";
 import AdminFinance from "./pages/admin/AdminFinance";
 import AdminAdmins from "./pages/admin/AdminAdmins";
+import AdminDiscounts from "./pages/admin/AdminDiscounts";
 
 function CustomerShell({ children }) {
   const [store, setStore] = useState(null);
@@ -57,6 +58,7 @@ function Layout() {
           <Route path="products/:id" element={<AdminProductEdit />} />
           <Route path="analytics" element={<AdminAnalytics />} />
           <Route path="finance" element={<AdminFinance />} />
+          <Route path="discounts" element={<AdminDiscounts />} />
           <Route path="admins" element={<AdminAdmins />} />
           <Route path="settings" element={<AdminSettings />} />
         </Route>

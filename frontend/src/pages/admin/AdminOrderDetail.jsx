@@ -70,6 +70,7 @@ export default function AdminOrderDetail() {
 
         <Block title="Rincian Harga">
           <Row k="Subtotal Produk" v={`${fmtLE(order.subtotal_le)} LE`} />
+          {order.discount_le > 0 && <Row k={`Diskon${order.discount_code ? ` (${order.discount_code})` : ""}`} v={`-${fmtLE(order.discount_le)} LE`} />}
           <Row k="Ongkir" v={`${fmtLE(order.delivery_fee_le)} LE`} />
           <div className="my-1 border-t border-dashed border-[#E5DCC5]" />
           <Row k="Total LE" v={<span className="font-bold text-[#8B5A2B]">{fmtLE(order.total_le)} LE</span>} />

@@ -20,6 +20,8 @@ export default function AdminFinance() {
   const [range, setRange] = useState({ start: "", end: "" });
   const [form, setForm] = useState({ type: "expense", category: "", amount: "", currency: "EGP", description: "", date: "" });
   const [xfer, setXfer] = useState({ from_account: "IDR", to_account: "EGP", from_amount: "", to_amount: "", exchange_rate: "", description: "", date: "" });
+  const [adj, setAdj] = useState({ account: "EGP", new_balance: "", description: "" });
+  const [newCat, setNewCat] = useState({ name: "", type: "expense" });
 
   const loadStats = () => {
     const p = { period };
@@ -41,6 +43,16 @@ export default function AdminFinance() {
     catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
   };
   const del = async (id) => { if (!window.confirm("Hapus transaksi?")) return; await api.delete(`/admin/finance/transactions/${id}`); loadTxns(); loadStats(); };
+  const setBalance = async () => {
+    if (adj.new_balance === "") return toast.error("Isi saldo baru");
+    try { await api.post("/admin/finance/balance-adjust", { ...adj, new_balance: Number(adj.new_balance) }); toast.success("Saldo disesuaikan"); setAdj({ ...adj, new_balance: "", description: "" }); loadStats(); loadTxns(); }
+    catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
+  };
+  const addCat = async () => {
+    if (!newCat.name) return toast.error("Isi nama kategori");
+    try { await api.post("/admin/finance/custom-categories", newCat); toast.success("Kategori ditambahkan"); setNewCat({ name: "", type: "expense" }); api.get("/admin/finance/categories").then((r) => setCats(r.data)); }
+    catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
+  };
 
   const Cmp = ({ v }) => v == null ? null : (
     <span className={`ml-2 inline-flex items-center text-xs font-medium ${v >= 0 ? "text-green-600" : "text-red-600"}`}>{v >= 0 ? <TrendingUp size={12} /> : <TrendingDown size={12} />} {v >= 0 ? "+" : ""}{v}%</span>
@@ -112,6 +124,28 @@ export default function AdminFinance() {
           <Input type="number" placeholder="Jumlah diterima" value={xfer.to_amount} onChange={(e) => setXfer({ ...xfer, to_amount: e.target.value })} data-testid="xfer-to-amount" className="mt-2 bg-white" />
           <Input type="number" placeholder="Rate (opsional)" value={xfer.exchange_rate} onChange={(e) => setXfer({ ...xfer, exchange_rate: e.target.value })} className="mt-2 bg-white" />
           <Button onClick={addXfer} data-testid="xfer-save" className="mt-2 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Catat Transfer</Button>
+        </div>
+      </div>
+
+      {/* Balance adjust + custom category */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm">
+          <div className="mb-3 font-heading font-bold text-[#2C1E16]">Set Saldo Saat Ini</div>
+          <p className="mb-2 text-xs text-[#8B7355]">Tetapkan saldo awal/saat ini tanpa membuat transaksi historis palsu.</p>
+          <div className="grid grid-cols-2 gap-2">
+            <Select value={adj.account} onValueChange={(v) => setAdj({ ...adj, account: v })}><SelectTrigger data-testid="adj-account" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="EGP">EGP</SelectItem><SelectItem value="IDR">IDR</SelectItem></SelectContent></Select>
+            <Input type="number" placeholder="Saldo baru" value={adj.new_balance} onChange={(e) => setAdj({ ...adj, new_balance: e.target.value })} data-testid="adj-balance" className="bg-white" />
+          </div>
+          <Input placeholder="Catatan/alasan" value={adj.description} onChange={(e) => setAdj({ ...adj, description: e.target.value })} className="mt-2 bg-white" />
+          <Button onClick={setBalance} data-testid="adj-save" className="mt-2 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Simpan Saldo</Button>
+        </div>
+        <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm">
+          <div className="mb-3 font-heading font-bold text-[#2C1E16]">Kategori Transaksi Kustom</div>
+          <div className="grid grid-cols-2 gap-2">
+            <Input placeholder="Nama kategori" value={newCat.name} onChange={(e) => setNewCat({ ...newCat, name: e.target.value })} data-testid="cat-name" className="bg-white" />
+            <Select value={newCat.type} onValueChange={(v) => setNewCat({ ...newCat, type: v })}><SelectTrigger data-testid="cat-type" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="expense">Pengeluaran</SelectItem><SelectItem value="income">Pemasukan</SelectItem></SelectContent></Select>
+          </div>
+          <Button onClick={addCat} data-testid="cat-save" className="mt-2 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Tambah Kategori</Button>
         </div>
       </div>
 

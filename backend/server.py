@@ -187,6 +187,7 @@ class OrderInput(BaseModel):
     notes: Optional[str] = ""
     item: Optional[OrderItemInput] = None
     items: Optional[List[OrderItemInput]] = None
+    discount_code: Optional[str] = None
 
 class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
@@ -413,19 +414,34 @@ async def change_email(data: ChangeEmailInput, response: Response, admin: dict =
 # --------------------------------------------------------------------------
 # Public product routes
 # --------------------------------------------------------------------------
-def resolve_display_photo(product):
-    photos = product.get("photos", []) or []
-    rep = product.get("representative_photo_id")
-    if rep and rep not in ("auto",):
-        for ph in photos:
-            if ph.get("id") == rep:
-                return ph.get("main_url") or ph.get("front_url") or ph.get("side_url")
-    if product.get("image_url"):
-        return product["image_url"]
-    if photos:
-        ph = photos[0]
-        return ph.get("main_url") or ph.get("front_url") or ph.get("side_url")
+async def auto_category_cover(product):
+    """Most frequently ordered valid configuration's photo for this category."""
+    category = product.get("category")
+    agg = {}
+    async for o in db.orders.find({"order_status": {"$ne": "dibatalkan"}}):
+        for it in o.get("items", [o.get("item")]):
+            if not it or it.get("category") != category:
+                continue
+            cfg = it.get("configuration_snapshot", {}) or {}
+            key = tuple(sorted((k, str(v)) for k, v in cfg.items() if k != "custom_note"))
+            agg[key] = agg.get(key, {"count": 0, "cfg": cfg})
+            agg[key]["count"] += int(it.get("quantity", 1))
+    for _, e in sorted(agg.items(), key=lambda x: x[1]["count"], reverse=True):
+        m = match_photo(product, e["cfg"])
+        if m.get("photo"):
+            ph = m["photo"]
+            url = ph.get("main_url") or ph.get("front_url") or ph.get("side_url")
+            if url:
+                return url
     return ""
+
+async def resolve_display_photo(product):
+    """Category COVER image only. Never falls back to a specific config photo (except in auto mode)."""
+    if product.get("cover_mode") == "auto":
+        auto = await auto_category_cover(product)
+        if auto:
+            return auto
+    return product.get("category_cover_image") or product.get("image_url") or ""
 
 @api_router.get("/products")
 async def list_products(admin_view: bool = False):
@@ -434,7 +450,7 @@ async def list_products(admin_view: bool = False):
     out = []
     for p in products:
         c = clean(p)
-        c["display_image"] = resolve_display_photo(c)
+        c["display_image"] = await resolve_display_photo(c)
         out.append(c)
     return out
 
@@ -444,7 +460,7 @@ async def get_product(slug: str):
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
     c = clean(product)
-    c["display_image"] = resolve_display_photo(c)
+    c["display_image"] = await resolve_display_photo(c)
     return c
 
 @api_router.post("/calculate-price")
@@ -482,6 +498,10 @@ async def store_info():
         "exchange_rate_idr_per_le": _num(await get_setting("exchange_rate_idr_per_le", 357), 357),
         "bank_info": await get_setting("bank_info", ""),
         "logo_url": await get_setting("logo_url", ""),
+        "instagram": await get_setting("instagram", ""),
+        "facebook": await get_setting("facebook", ""),
+        "tiktok": await get_setting("tiktok", ""),
+        "email": await get_setting("email", ""),
     }
 
 # --------------------------------------------------------------------------
@@ -555,6 +575,10 @@ async def create_order(data: OrderInput):
         })
 
     total_le = subtotal_le + delivery_fee
+    discount_le, disc_doc, disc_err = await validate_discount(data.discount_code, subtotal_le)
+    if data.discount_code and disc_err:
+        raise HTTPException(status_code=400, detail=disc_err)
+    total_le = subtotal_le - discount_le + delivery_fee
     rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -567,12 +591,16 @@ async def create_order(data: OrderInput):
         "payment_status": "belum_dibayar", "order_status": "pesanan_masuk",
         "notes": (data.notes or "").strip(), "admin_note": "",
         "items": items, "item": items[0],
-        "subtotal_le": subtotal_le, "total_le": total_le,
+        "subtotal_le": subtotal_le, "discount_code": (disc_doc.get("code") if disc_doc else None),
+        "discount_percentage": (_num(disc_doc.get("percentage")) if disc_doc else 0), "discount_le": discount_le,
+        "total_le": total_le,
         "exchange_rate_idr_per_le": rate, "estimated_total_idr": round(total_le * rate),
         "rate_timestamp": now, "requires_admin_confirmation": requires_confirm,
         "created_at": now, "updated_at": now,
     }
     result = await db.orders.insert_one(order_doc)
+    if disc_doc:
+        await db.discounts.update_one({"_id": disc_doc["_id"]}, {"$inc": {"claims": 1}})
     order_doc["id"] = str(result.inserted_id); order_doc.pop("_id", None)
     order_doc["whatsapp_message"] = build_whatsapp_message(order_doc)
     order_doc["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
@@ -752,7 +780,10 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
 
 @api_router.delete("/admin/orders/{order_id}")
 async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("delete_data"))):
-    await db.orders.delete_one({"_id": oid(order_id)})
+    res = await db.orders.delete_one({"_id": oid(order_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    await db.finance_transactions.delete_many({"related_order_id": order_id, "type": "order_revenue"})
     return {"ok": True}
 
 # --------------------------------------------------------------------------
@@ -774,6 +805,7 @@ async def admin_create_product(payload: Dict[str, Any], admin: dict = Depends(re
            "active": payload.get("active", True), "configurable": payload.get("configurable", False),
            "starting_price_le": _num(payload.get("starting_price_le", 0)), "pricing": payload.get("pricing", {}),
            "photos": payload.get("photos", []), "representative_photo_id": payload.get("representative_photo_id"),
+           "category_cover_image": payload.get("category_cover_image", ""), "cover_mode": payload.get("cover_mode", "manual"),
            "sort_order": payload.get("sort_order", 99), "created_at": now,
            "updated_by_name": admin.get("name"), "updated_at": now}
     result = await db.products.insert_one(doc)
@@ -782,7 +814,8 @@ async def admin_create_product(payload: Dict[str, Any], admin: dict = Depends(re
 @api_router.put("/admin/products/{product_id}")
 async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("modify_products"))):
     allowed = ["name", "category", "description", "image_url", "active", "configurable",
-               "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug"]
+               "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug",
+               "category_cover_image", "cover_mode"]
     upd = {k: payload[k] for k in allowed if k in payload}
     upd.update(audit_fields(admin))
     if "starting_price_le" in upd:
@@ -858,7 +891,8 @@ async def admin_get_settings(admin: dict = Depends(require_perm("manage_settings
 @api_router.put("/admin/settings")
 async def admin_update_settings(payload: Dict[str, Any], admin: dict = Depends(require_perm("manage_settings"))):
     allowed = ["store_name", "app_name", "tagline", "store_address", "store_maps_url",
-               "whatsapp_number", "exchange_rate_idr_per_le", "bank_info", "logo_url"]
+               "whatsapp_number", "exchange_rate_idr_per_le", "bank_info", "logo_url",
+               "instagram", "facebook", "tiktok", "email"]
     for key in allowed:
         if key in payload:
             val = payload[key]
@@ -960,7 +994,13 @@ DEFAULT_FINANCE_CATEGORIES = {
 
 @api_router.get("/admin/finance/categories")
 async def finance_categories(admin: dict = Depends(require_perm("access_finance"))):
-    return DEFAULT_FINANCE_CATEGORIES
+    custom = await db.finance_categories.find({"status": "active"}).to_list(200)
+    out = {"income": list(DEFAULT_FINANCE_CATEGORIES["income"]), "expense": list(DEFAULT_FINANCE_CATEGORIES["expense"])}
+    for c in custom:
+        typ = c.get("type", "expense")
+        if typ in out and c["name"] not in out[typ]:
+            out[typ].append(c["name"])
+    return out
 
 async def _compute_balances():
     bal = {"IDR": 0.0, "EGP": 0.0}
@@ -973,6 +1013,8 @@ async def _compute_balances():
         elif typ == "transfer":
             bal[t.get("from_account", "IDR")] = bal.get(t.get("from_account", "IDR"), 0) - _num(t.get("from_amount"))
             bal[t.get("to_account", "EGP")] = bal.get(t.get("to_account", "EGP"), 0) + _num(t.get("to_amount"))
+        elif typ == "balance_adjustment":
+            bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) + _num(t.get("amount"))
     return bal
 
 @api_router.get("/admin/finance/accounts")
@@ -1114,6 +1156,110 @@ async def finance_stats(period: str = "this_month", start: Optional[str] = None,
     return {"period": period, "range": {"start": s, "end": e}, "current": current,
             "comparison": comparison, "balances": balances}
 
+async def validate_discount(code, subtotal):
+    if not code:
+        return 0.0, None, None
+    d = await db.discounts.find_one({"code": code.strip().upper()})
+    if not d:
+        return 0.0, None, "Kode diskon tidak ditemukan"
+    now = datetime.now(timezone.utc).isoformat()
+    if d.get("status") != "active":
+        return 0.0, None, "Kode diskon tidak aktif"
+    if d.get("start_date") and now < d["start_date"]:
+        return 0.0, None, "Kode diskon belum berlaku"
+    if d.get("end_date") and now > (d["end_date"] + "T23:59:59"):
+        return 0.0, None, "Kode diskon sudah kedaluwarsa"
+    if d.get("max_claims") and _num(d.get("claims", 0)) >= _num(d["max_claims"]):
+        return 0.0, None, "Kuota kode diskon habis"
+    disc = subtotal * _num(d.get("percentage")) / 100.0
+    mx = _num(d.get("max_amount"))
+    if mx > 0:
+        disc = min(disc, mx)
+    return round(disc, 2), d, None
+
+@api_router.post("/discounts/validate")
+async def discount_validate(payload: Dict[str, Any]):
+    disc, d, err = await validate_discount(payload.get("code"), _num(payload.get("subtotal")))
+    if err:
+        return {"valid": False, "message": err, "discount_amount": 0}
+    return {"valid": True, "discount_amount": disc, "percentage": _num(d.get("percentage")), "code": d.get("code")}
+
+@api_router.get("/admin/discounts")
+async def list_discounts(admin: dict = Depends(require_perm("manage_settings"))):
+    return [clean(d) for d in await db.discounts.find({}).sort("created_at", -1).to_list(500)]
+
+@api_router.post("/admin/discounts")
+async def create_discount(payload: Dict[str, Any], admin: dict = Depends(require_perm("manage_settings"))):
+    code = (payload.get("code") or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="Kode diskon wajib diisi")
+    if await db.discounts.find_one({"code": code}):
+        raise HTTPException(status_code=400, detail="Kode diskon sudah ada")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {"code": code, "name": payload.get("name", ""), "percentage": max(0.0, min(100.0, _num(payload.get("percentage")))),
+           "max_amount": _num(payload.get("max_amount")), "max_claims": int(_num(payload.get("max_claims"))),
+           "claims": 0, "start_date": payload.get("start_date") or None, "end_date": payload.get("end_date") or None,
+           "status": payload.get("status", "active"), "created_at": now, "updated_by_name": admin.get("name")}
+    r = await db.discounts.insert_one(doc)
+    return clean(await db.discounts.find_one({"_id": r.inserted_id}))
+
+@api_router.put("/admin/discounts/{did}")
+async def update_discount(did: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("manage_settings"))):
+    upd = {}
+    for k in ["name", "percentage", "max_amount", "max_claims", "start_date", "end_date", "status"]:
+        if k in payload:
+            upd[k] = payload[k]
+    for k in ["percentage", "max_amount", "max_claims"]:
+        if k in upd:
+            upd[k] = _num(upd[k])
+    if "percentage" in upd:
+        upd["percentage"] = max(0.0, min(100.0, upd["percentage"]))
+    upd["updated_by_name"] = admin.get("name")
+    await db.discounts.update_one({"_id": oid(did)}, {"$set": upd})
+    return clean(await db.discounts.find_one({"_id": oid(did)}))
+
+@api_router.delete("/admin/discounts/{did}")
+async def delete_discount(did: str, admin: dict = Depends(require_perm("manage_settings"))):
+    await db.discounts.delete_one({"_id": oid(did)})
+    return {"ok": True}
+
+@api_router.get("/admin/finance/custom-categories")
+async def list_custom_categories(admin: dict = Depends(require_perm("access_finance"))):
+    return [clean(c) for c in await db.finance_categories.find({}).to_list(200)]
+
+@api_router.post("/admin/finance/custom-categories")
+async def create_custom_category(payload: Dict[str, Any], admin: dict = Depends(require_perm("access_finance"))):
+    name = (payload.get("name") or "").strip()
+    typ = payload.get("type", "expense")
+    if not name or typ not in ("income", "expense"):
+        raise HTTPException(status_code=400, detail="Nama & tipe kategori wajib benar")
+    doc = {"name": name, "type": typ, "status": payload.get("status", "active"),
+           "created_at": datetime.now(timezone.utc).isoformat(), "created_by_name": admin.get("name")}
+    r = await db.finance_categories.insert_one(doc)
+    return clean(await db.finance_categories.find_one({"_id": r.inserted_id}))
+
+@api_router.delete("/admin/finance/custom-categories/{cid}")
+async def delete_custom_category(cid: str, admin: dict = Depends(require_perm("access_finance"))):
+    await db.finance_categories.delete_one({"_id": oid(cid)})
+    return {"ok": True}
+
+@api_router.post("/admin/finance/balance-adjust")
+async def balance_adjust(payload: Dict[str, Any], admin: dict = Depends(require_perm("access_finance"))):
+    account = payload.get("account")
+    if account not in ("IDR", "EGP"):
+        raise HTTPException(status_code=400, detail="Akun tidak valid")
+    balances = await _compute_balances()
+    prev = balances.get(account, 0.0)
+    new_balance = _num(payload.get("new_balance"))
+    delta = new_balance - prev
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {"date": payload.get("date") or now, "type": "balance_adjustment", "category": "Penyesuaian Saldo",
+           "amount": delta, "currency": account, "account": account, "previous_balance": prev, "new_balance": new_balance,
+           "description": payload.get("description", ""), "created_by_name": admin.get("name"),
+           "created_at": now, "updated_at": now}
+    await db.finance_transactions.insert_one(doc)
+    return {"ok": True, "account": account, "previous_balance": prev, "new_balance": new_balance, "adjustment": delta}
+
 # --------------------------------------------------------------------------
 # Seed & migrations
 # --------------------------------------------------------------------------
@@ -1151,6 +1297,7 @@ async def seed():
         "store_maps_url": "https://maps.google.com/?q=30.041889,31.262636",
         "whatsapp_number": "628XXXXXXXXXX", "exchange_rate_idr_per_le": 357,
         "bank_info": "PLACEHOLDER — Isi informasi rekening/bank melalui dashboard admin.", "logo_url": "",
+        "instagram": "", "facebook": "", "tiktok": "", "email": "",
     }
     for k, v in defaults.items():
         if await db.settings.find_one({"key": k}) is None:

@@ -25,6 +25,7 @@ export default function AdminProductEdit() {
   const [p, setP] = useState(null);
   const [pricingText, setPricingText] = useState("{}");
   const fileRef = useRef();
+  const coverRef = useRef();
   const photoRefs = useRef({});
 
   useEffect(() => {
@@ -54,7 +55,8 @@ export default function AdminProductEdit() {
     try {
       await api.put(`/admin/products/${id}`, { name: p.name, category: p.category, description: p.description, image_url: p.image_url,
         active: p.active, configurable: p.configurable, starting_price_le: p.starting_price_le, pricing,
-        photos: p.photos, representative_photo_id: p.representative_photo_id });
+        photos: p.photos, representative_photo_id: p.representative_photo_id,
+        category_cover_image: p.category_cover_image || "", cover_mode: p.cover_mode || "manual" });
       toast.success("Produk disimpan"); navigate("/admin/products");
     } catch { toast.error("Gagal menyimpan"); }
   };
@@ -91,6 +93,26 @@ export default function AdminProductEdit() {
           <label className="flex items-center gap-2 text-sm"><Switch checked={p.configurable} onCheckedChange={(v) => setField("configurable", v)} data-testid="product-configurable" /> Bisa dikonfigurasi</label>
         </div>
 
+        <div className="border-t border-[#F1EBE0] pt-4">
+          <Label className="font-heading text-sm font-semibold">Gambar Cover Kategori</Label>
+          <p className="mt-1 text-xs text-[#8B7355]">Gambar untuk halaman katalog. Terpisah dari foto konfigurasi — tidak dipakai sebagai foto tiap konfigurasi.</p>
+          <div className="mt-2 flex items-center gap-3">
+            <div className="h-20 w-20 overflow-hidden rounded-xl border border-[#E5DCC5] bg-white">
+              {p.category_cover_image ? <img src={imgUrl(p.category_cover_image)} alt="" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-[10px] text-[#8B7355]">Cover</div>}
+            </div>
+            <input ref={coverRef} type="file" accept="image/*" hidden onChange={(e) => e.target.files[0] && uploadTo(e.target.files[0], (u) => setField("category_cover_image", u))} data-testid="cover-input" />
+            <Button variant="outline" onClick={() => coverRef.current?.click()} data-testid="cover-upload" className="rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B]"><Upload size={14} className="mr-1" /> Unggah Cover</Button>
+            {p.category_cover_image && <Button variant="ghost" onClick={() => setField("category_cover_image", "")} className="text-xs text-red-500">Hapus</Button>}
+          </div>
+          <div className="mt-3">
+            <Label className="mb-1 block text-xs text-[#8B7355]">Mode Cover</Label>
+            <Select value={p.cover_mode || "manual"} onValueChange={(v) => setField("cover_mode", v)}>
+              <SelectTrigger className="w-56 bg-white" data-testid="cover-mode"><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="manual">Manual (gambar di atas)</SelectItem><SelectItem value="auto">Otomatis (konfigurasi terlaris)</SelectItem></SelectContent>
+            </Select>
+          </div>
+        </div>
+
         {/* Photo manager */}
         <div className="border-t border-[#F1EBE0] pt-4">
           <div className="flex items-center justify-between">
@@ -111,8 +133,6 @@ export default function AdminProductEdit() {
                     ))}
                   </div>
                   <div className="flex items-center gap-1">
-                    <button onClick={() => setField("representative_photo_id", ph.id)} data-testid={`set-rep-${ph.id}`} title="Jadikan gambar kategori"
-                      className={`p-1.5 ${p.representative_photo_id === ph.id ? "text-amber-500" : "text-[#8B7355]"}`}><Star size={16} fill={p.representative_photo_id === ph.id ? "currentColor" : "none"} /></button>
                     <button onClick={() => delPhoto(ph.id)} className="p-1.5 text-red-500"><Trash2 size={16} /></button>
                   </div>
                 </div>

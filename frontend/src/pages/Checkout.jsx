@@ -27,6 +27,16 @@ export default function Checkout() {
   const [submitting, setSubmitting] = useState(false);
   const [delivery, setDelivery] = useState({ method: "", zone_id: "" });
   const [cust, setCust] = useState({ name: "", phone: "", address: "", maps: "", payment: "", notes: "" });
+  const [disc, setDisc] = useState({ code: "", amount: 0, applied: false });
+
+  const applyDiscount = async () => {
+    if (!disc.code.trim()) return;
+    try {
+      const { data } = await api.post("/discounts/validate", { code: disc.code, subtotal: productSubtotal });
+      if (data.valid) { setDisc((d) => ({ ...d, amount: data.discount_amount, applied: true })); toast.success(t("sum.discount_ok")); }
+      else { setDisc((d) => ({ ...d, amount: 0, applied: false })); toast.error(data.message || t("sum.discount_bad")); }
+    } catch { toast.error(t("sum.discount_bad")); }
+  };
 
   useEffect(() => {
     api.get("/delivery-zones").then((r) => setZones(r.data));
@@ -39,7 +49,7 @@ export default function Checkout() {
     const z = zones.find((z) => z.id === delivery.zone_id);
     return z ? Number(z.fee_le) : 0;
   }, [delivery, zones]);
-  const totalLE = productSubtotal + deliveryFee;
+  const totalLE = productSubtotal - (disc.applied ? disc.amount : 0) + deliveryFee;
 
   if (!items.length) {
     return (
@@ -68,6 +78,7 @@ export default function Checkout() {
         customer_maps_url: cust.maps, delivery_method: delivery.method,
         delivery_zone_id: delivery.method === "delivery" ? delivery.zone_id : null,
         payment_method: cust.payment, notes,
+        discount_code: disc.applied ? disc.code : null,
         items: items.map((i) => ({ product_id: i.product.id, config: i.config, quantity: i.quantity })),
       });
       clear();
@@ -132,7 +143,12 @@ export default function Checkout() {
                 </div>
               ))}
               <div className="flex justify-between border-t border-dashed border-[#E5DCC5] pt-2 text-sm"><span className="text-[#5C4A3D]">{t("sum.subtotal")}</span><span className="font-medium">{fmtLE(productSubtotal)} LE</span></div>
+              {disc.applied && <div className="flex justify-between text-sm text-[#738678]"><span>{t("sum.discount_line")} ({disc.code})</span><span className="font-medium">-{fmtLE(disc.amount)} LE</span></div>}
               <div className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{t("sum.pengiriman")}</span><span className="font-medium">{fmtLE(deliveryFee)} LE</span></div>
+            </div>
+            <div className="mt-3 flex gap-2">
+              <Input value={disc.code} onChange={(e) => setDisc({ ...disc, code: e.target.value, applied: false })} placeholder={t("sum.discount_ph")} data-testid="discount-code" className="h-10 bg-white" />
+              <Button onClick={applyDiscount} data-testid="apply-discount" variant="outline" className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]">{t("sum.discount_apply")}</Button>
             </div>
             <div className="mt-4 rounded-xl bg-[#EFE6D5] p-4">
               <div className="text-xs font-medium text-[#8B6B45]">{t("sum.estimasi_total")}</div>

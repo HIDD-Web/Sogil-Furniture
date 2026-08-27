@@ -1,0 +1,43 @@
+{
+  "summary": "V3 incremental features tested end-to-end. Created /app/backend/tests/test_v3_features.py with 17 pytest cases: discount CRUD + validation (invalid code, cap at max_amount, inactive toggle), discount snapshot on order (percentage change after order does NOT alter historical order), invalid code on order rejected, delete-order removes auto order_revenue, sub-admin without delete_data receives 403 on DELETE /api/admin/orders/{id}, store contacts save via /api/admin/settings and served via /api/store-info, product category_cover_image + cover_mode persist and are separate from photos, balance-adjust sets EGP balance without inflating revenue, balance-adjust rejects invalid account (400), custom finance category CRUD + appears in category dropdown, sub-admin without manage_settings gets 403 on /admin/discounts. ALL 17 backend tests pass. Playwright UI: verified Kode Diskon admin page creates/lists/deletes with correct testids; customer /checkout applies UIFLOW20 discount (565 LE -> 452 LE with 'Diskon 20%' line), invalid code leaves total unchanged; /admin/settings persists Instagram/Facebook/TikTok/Email/WhatsApp and customer footer shows footer-instagram/facebook/tiktok/email/whatsapp anchors with correct hrefs (mailto:, wa.me/, https URLs); /admin/finance category add flow POST 200 and appears in txn-category select; /admin/products/{id} edit page shows 'Gambar Cover Kategori' section with cover-upload, cover-mode select and cover-input file input — yellow-star category-image control confirmed removed.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "PUT /api/admin/discounts/{id}", "issue": "No validation on percentage (accepts negative or >100). Consider clamping 0<pct<=100."},
+      {"endpoint": "DELETE /api/admin/orders/{id}", "issue": "No 404 when order doesn't exist — returns {ok:true} regardless. Minor."},
+      {"endpoint": "POST /api/admin/finance/balance-adjust", "issue": "Does not roll back revenue stat when adjustment is negative (correct by design, but no audit link to prior balance changes exposed to UI beyond the txn description)."},
+      {"endpoint": "AdminDiscounts UI status select", "issue": "Frontend Select options are 'active' | 'disabled' | 'expired' while backend validate_discount accepts d.status=='active' only — 'disabled' works as expected inactive, but validate_discount error says 'tidak aktif' regardless of chosen non-active label (cosmetic)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v3_features.py",
+    "/app/backend/tests/test_v2_features.py",
+    "/app/test_reports/pytest/v3_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Clamp discount percentage 0<pct<=100 on POST/PUT /api/admin/discounts.",
+    "(Optional) Return 404 from DELETE /api/admin/orders/{id} when order_id not found so UI can distinguish real deletes.",
+    "(Optional) AdminDiscounts Select uses value 'disabled'/'expired' — consider mapping to a single non-active internal status or documenting the semantic difference (backend only treats 'active' as valid)."
+  ],
+  "critical_code_review_comments": [
+    "server.py grew to 1394 lines — still one file. Splitting into routers (auth, orders, admin_orders, products, finance, discounts, settings) is overdue.",
+    "validate_discount uses ISO string date comparison on start_date/end_date without normalization. If admin enters e.g. '2026-01-01' and current now is '2026-01-01T05:00:00...', works fine; but the end_date+'T23:59:59' concatenation assumes end_date is date-only (YYYY-MM-DD). If admin passes a full ISO datetime this becomes malformed. Consider parsing/validating.",
+    "admin_delete_order deletes order_revenue but does NOT reverse balance_adjustment or other manual transactions tied to the order via description. Only strict type=='order_revenue' removed. Ok for spec but note.",
+    "create_discount stores percentage/max_amount as _num (float) but 'max_claims' cast via int(_num(...)) — 0 semantics (unlimited) documented; validate_discount uses 'if d.get('max_claims')' truthiness where 0 → falsy → unlimited (correct).",
+    "resolve_display_photo priority: representative_photo > (cover_mode=='auto' ? auto_category_cover : nothing) > category_cover_image > image_url. In manual mode with empty cover, falls through to image_url — matches spec: cover NOT used as per-config fallback."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v3_features.py (new)"
+  ],
+  "success_rate": {"backend": "100% (17/17 V3)", "frontend": "100% of tested V3 flows"},
+  "test_credentials": "Owner: syahid.mujahid02@gmail.com / 0LFOCWU9_V3k (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Test discounts, orders, custom finance categories, and one sub-admin were created via API/UI during tests and cleaned up. Verified none remain via post-test scans of /admin/discounts, /admin/orders (customer_name TEST_*), and /admin/finance/custom-categories.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "V3 features (discounts, delete-order finance integrity, store contacts, product cover-image separate from photos, balance-adjust, custom finance categories) are all functional. Tests split across /app/backend/tests/test_v3_features.py (V3) and /app/backend/tests/test_v2_features.py (V2). Legacy /app/backend/tests/backend_test.py still has a stale pre-migration 80_5 pricing assert — ignore/skip. Frontend cart uses localStorage key 'sogil_cart'; cart items require breakdown.unit field to compute totals — easiest way to seed cart in Playwright is to actually click 'Tambah ke keranjang' after configuring. AdminSettings PUT is /api/admin/settings; store-info is public GET /api/store-info. Footer testids: footer-whatsapp/instagram/facebook/tiktok/email — only rendered when the corresponding setting is non-empty."
+}

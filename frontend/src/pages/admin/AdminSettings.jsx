@@ -77,6 +77,12 @@ export default function AdminSettings() {
           <F label="Nomor WhatsApp Admin"><Input value={s.whatsapp_number || ""} onChange={(e) => setField("whatsapp_number", e.target.value)} data-testid="set-whatsapp" className="bg-white" placeholder="628XXXXXXXXXX" /></F>
           <F label="Rate IDR per 1 LE"><Input type="number" value={s.exchange_rate_idr_per_le || 0} onChange={(e) => setField("exchange_rate_idr_per_le", e.target.value)} data-testid="set-rate" className="bg-white" /></F>
           <F label="Informasi Bank/Pembayaran"><Textarea value={s.bank_info || ""} onChange={(e) => setField("bank_info", e.target.value)} className="bg-white" /></F>
+          <div className="grid gap-3 border-t border-[#F1EBE0] pt-3 sm:grid-cols-2">
+            <F label="Instagram (URL)"><Input value={s.instagram || ""} onChange={(e) => setField("instagram", e.target.value)} data-testid="set-instagram" className="bg-white" placeholder="https://instagram.com/..." /></F>
+            <F label="Facebook (URL)"><Input value={s.facebook || ""} onChange={(e) => setField("facebook", e.target.value)} data-testid="set-facebook" className="bg-white" placeholder="https://facebook.com/..." /></F>
+            <F label="TikTok (URL)"><Input value={s.tiktok || ""} onChange={(e) => setField("tiktok", e.target.value)} data-testid="set-tiktok" className="bg-white" placeholder="https://tiktok.com/@..." /></F>
+            <F label="Email"><Input value={s.email || ""} onChange={(e) => setField("email", e.target.value)} data-testid="set-email" className="bg-white" placeholder="halo@sogil.com" /></F>
+          </div>
           <Button onClick={saveSettings} data-testid="save-settings" className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Simpan Pengaturan</Button>
         </Card>
       )}
