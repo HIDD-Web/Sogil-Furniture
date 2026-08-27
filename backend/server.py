@@ -1571,6 +1571,48 @@ async def customer_points(c: dict = Depends(get_current_customer)):
             "redeemed": _num(c.get("points_redeemed")), "referral_code": c.get("referral_code"),
             "referral": clean(ref) if ref else None, "transactions": [clean(t) for t in txns]}
 
+def _guest_track_view(order):
+    """Limited, non-sensitive order view for guest tracking (no address/maps/customer identifiers)."""
+    items = [{"product_name_snapshot": it.get("product_name_snapshot"), "category": it.get("category"),
+              "configuration_snapshot": it.get("configuration_snapshot"), "quantity": it.get("quantity"),
+              "subtotal_le": it.get("subtotal_le")} for it in (order.get("items") or [order.get("item")]) if it]
+    return {"order_number": order.get("order_number"), "customer_name": order.get("customer_name"),
+            "items": items, "order_status": order.get("order_status"), "payment_status": order.get("payment_status"),
+            "delivery_method": order.get("delivery_method"), "delivery_zone_name": order.get("delivery_zone_name"),
+            "subtotal_le": order.get("subtotal_le"), "discount_le": order.get("discount_le"),
+            "referral_discount_le": order.get("referral_discount_le"), "points_redeemed_le": order.get("points_redeemed_le"),
+            "delivery_fee_le": order.get("delivery_fee_le"), "total_le": order.get("total_le"),
+            "estimated_total_idr": order.get("estimated_total_idr"), "exchange_rate_idr_per_le": order.get("exchange_rate_idr_per_le"),
+            "created_at": order.get("created_at"), "claimed": order.get("customer_id") is not None}
+
+@api_router.post("/orders/track")
+async def track_order(payload: Dict[str, Any]):
+    number = (payload.get("order_number") or "").strip().upper()
+    phone = normalize_phone(payload.get("phone") or "")
+    if not number or not phone:
+        raise HTTPException(status_code=400, detail="Nomor pesanan & No HP wajib diisi")
+    order = await db.orders.find_one({"order_number": number})
+    if not order or normalize_phone(order.get("customer_phone", "")) != phone:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan atau No HP tidak cocok")
+    return _guest_track_view(order)
+
+@api_router.post("/customer/claim-order")
+async def claim_order(payload: Dict[str, Any], c: dict = Depends(get_current_customer)):
+    number = (payload.get("order_number") or "").strip().upper()
+    phone = normalize_phone(payload.get("phone") or "")
+    if not number or not phone:
+        raise HTTPException(status_code=400, detail="Nomor pesanan & No HP wajib diisi")
+    order = await db.orders.find_one({"order_number": number})
+    if not order or normalize_phone(order.get("customer_phone", "")) != phone:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan atau No HP tidak cocok")
+    if order.get("customer_id"):
+        if str(order["customer_id"]) == str(c["_id"]):
+            raise HTTPException(status_code=400, detail="Pesanan ini sudah ada di akun kamu")
+        raise HTTPException(status_code=409, detail="Pesanan sudah terhubung ke akun lain")
+    # Attach account link ONLY — all historical snapshots (price/discount/referral/points/payment) stay untouched.
+    await db.orders.update_one({"_id": order["_id"]}, {"$set": {"customer_id": str(c["_id"]), "customer_username": c.get("username")}})
+    return {"ok": True, "order_number": order.get("order_number")}
+
 # ---- Referral apply (public preview, requires login for real use) ----
 async def validate_referral(code, subtotal, buyer_id):
     if not code:

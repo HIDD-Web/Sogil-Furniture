@@ -19,6 +19,7 @@ import OrderConfirmation from "./pages/OrderConfirmation";
 import CaraPesan from "./pages/CaraPesan";
 import Kontak from "./pages/Kontak";
 import CustomerAccount from "./pages/CustomerAccount";
+import GuestTrackOrder from "./pages/GuestTrackOrder";
 
 import AdminLogin from "./pages/admin/AdminLogin";
 import AdminLayout from "./pages/admin/AdminLayout";
@@ -83,6 +84,7 @@ function Layout() {
         <Route path="/cara-pesan" element={<CaraPesan />} />
         <Route path="/kontak" element={<Kontak />} />
         <Route path="/akun" element={<CustomerAccount />} />
+        <Route path="/lacak" element={<GuestTrackOrder />} />
       </Routes>
     </CustomerShell>
   );

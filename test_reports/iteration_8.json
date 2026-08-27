@@ -1,0 +1,38 @@
+{
+  "summary": "V7 targeted maintenance pass: guest order tracking, guest order claim, and config/photo ordering persistence. All 12 backend pytest cases pass; UI verified for /lacak (track form + no address leak + footer link), admin product edit (3 config-up + 3 config-down + 9 photo-slot-left + 9 photo-slot-right + product-save), and CustomerAccount claim card (claim-order-card / claim-order-number / claim-phone / claim-submit).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "scenarios": {
+    "config_image_integrity_get": "PASS - /api/products/rak-kayu returns photos with main/front/side slots.",
+    "guest_track_success_limited_view": "PASS - SGF-20260827-001 + +2012345678 returns limited payload; customer_address/customer_maps_url/customer_id/customer_phone all absent.",
+    "guest_track_wrong_phone_404": "PASS",
+    "guest_track_blank_phone_400": "PASS",
+    "guest_track_unknown_number_404": "PASS",
+    "guest_claim_success_appears_in_customer_orders": "PASS - snapshot fields (total_le, discount_le, referral_discount_le, points_redeemed_le, payment_status, subtotal_le) preserved; only customer_id/customer_username set.",
+    "guest_claim_wrong_phone_404": "PASS",
+    "guest_claim_already_claimed_by_other_409": "PASS - existing SGF-20260827-001 returns 409 for a different customer.",
+    "guest_claim_requires_login": "PASS - anonymous call returns 401/403.",
+    "config_record_reorder_persist": "PASS - PUT with swapped photos array persists; per-id attributes (main/front/side/length/level/type/finishing) unchanged.",
+    "photo_slot_reorder_within_config_persist": "PASS - swapping main_url<->front_url persists; other photo records untouched.",
+    "ui_lacak_form_and_footer_link": "PASS - /lacak inputs render, submit shows track-result, wrong phone shows error, footer-track-order present on home.",
+    "ui_admin_reorder_controls_present": "PASS - config-up/down + photo-slot-left/right + product-save all present on /admin/products/6a8fc3c6d7ae98fcf9f4590a.",
+    "ui_customer_claim_card_present": "PASS - claim-order-card + claim-order-number + claim-phone + claim-submit render on /akun after login."
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v7_features.py",
+    "/app/test_reports/pytest/v7_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is ~1884 lines and continues to grow; consider splitting into routers (orders/customers/products/admin) for maintainability.",
+    "_guest_track_view correctly omits customer_address/maps_url/id/phone/username - good hardening.",
+    "claim_order returns 409 when another customer already owns the order but 400 when self-owns; consider 200 idempotent or clearer distinction — minor UX polish only."
+  ],
+  "updated_files": ["/app/backend/tests/test_v7_features.py", "/app/test_reports/pytest/v7_results.xml"],
+  "success_rate": {"backend": "100% (12/12)", "frontend": "100% (all reorder + claim + track UI testids present and functional)"},
+  "test_credentials": "owner admin: syahid.mujahid02@gmail.com / 0LFOCWU9_V3k; existing guest-tracked order: SGF-20260827-001 / +2012345678 (already claimed).",
+  "seed_data_creation": "Ephemeral TEST customers/orders created and cleaned up (see cleanup class + fixture).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Use /app/backend/tests/test_v7_features.py for V7 regression. Existing order SGF-20260827-001 is claimed by another customer so it is the fixed 409 target - do not re-claim. New guest orders use UNIQUE/PHONE_STAMP with TEST_ prefix and are cleaned up in TestZzzCleanup."
+}

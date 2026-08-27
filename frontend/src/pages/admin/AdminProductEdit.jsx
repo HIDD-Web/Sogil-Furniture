@@ -11,7 +11,7 @@ import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Switch } from "../../components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, Upload, Trash2, Plus, Star } from "lucide-react";
+import { ChevronLeft, Upload, Trash2, Plus, Star, ArrowUp, ArrowDown, ArrowLeft, ArrowRight } from "lucide-react";
 import { toast } from "sonner";
 
 const PHOTO_ATTRS = {
@@ -55,6 +55,10 @@ export default function AdminProductEdit() {
   const updPhoto = (pid, patch) => setP((prev) => ({ ...prev, photos: prev.photos.map((ph) => (ph.id === pid ? { ...ph, ...patch } : ph)) }));
   const updPhotoAttr = (pid, key, val) => setP((prev) => ({ ...prev, photos: prev.photos.map((ph) => (ph.id === pid ? { ...ph, attributes: { ...ph.attributes, [key]: val } } : ph)) }));
   const delPhoto = (pid) => setP((prev) => ({ ...prev, photos: prev.photos.filter((ph) => ph.id !== pid), representative_photo_id: prev.representative_photo_id === pid ? null : prev.representative_photo_id }));
+  // Configuration-record order: swap position of a photo-set within the photos array (persists as array order on save).
+  const movePhotoSet = (idx, dir) => setP((prev) => { const a = [...prev.photos]; const j = idx + dir; if (j < 0 || j >= a.length) return prev; [a[idx], a[j]] = [a[j], a[idx]]; return { ...prev, photos: a }; });
+  // Photo order within a configuration: swap adjacent slot values (Foto 1 = primary). Only ordering metadata changes.
+  const moveSlot = (pid, from, dir) => setP((prev) => ({ ...prev, photos: prev.photos.map((ph) => { if (ph.id !== pid) return ph; const slots = ["main_url", "front_url", "side_url"]; const to = from + dir; if (to < 0 || to >= slots.length) return ph; const c = { ...ph }; const tmp = c[slots[from]] || ""; c[slots[from]] = c[slots[to]] || ""; c[slots[to]] = tmp; return c; }) }));
 
   const save = async () => {
     let pricing = p.pricing;
@@ -145,9 +149,9 @@ export default function AdminProductEdit() {
             <Label className="font-heading text-sm font-semibold">Foto Konfigurasi</Label>
             <Button variant="outline" onClick={addPhoto} data-testid="add-photo" className="rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B]"><Plus size={14} className="mr-1" /> Tambah Foto</Button>
           </div>
-          <p className="mt-1 text-xs text-[#8B7355]">Tentukan atribut & 3 foto (utama, depan, samping). Sistem otomatis memilih foto terdekat untuk konfigurasi customer.</p>
+          <p className="mt-1 text-xs text-[#8B7355]">Tentukan atribut & foto per konfigurasi. Gunakan panah untuk mengatur urutan konfigurasi (↑↓) dan urutan foto di dalamnya (←→). Foto 1 = foto utama.</p>
           <div className="mt-3 space-y-3">
-            {(p.photos || []).map((ph) => (
+            {(p.photos || []).map((ph, idx) => (
               <div key={ph.id} className="rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] p-3" data-testid={`photo-set-${ph.id}`}>
                 <div className="flex items-center justify-between">
                   <div className="flex flex-wrap gap-2">
@@ -159,17 +163,23 @@ export default function AdminProductEdit() {
                     ))}
                   </div>
                   <div className="flex items-center gap-1">
+                    <button onClick={() => movePhotoSet(idx, -1)} disabled={idx === 0} data-testid={`config-up-${ph.id}`} className="rounded border border-[#E5DCC5] p-1 text-[#8B5A2B] disabled:opacity-30"><ArrowUp size={14} /></button>
+                    <button onClick={() => movePhotoSet(idx, 1)} disabled={idx === (p.photos.length - 1)} data-testid={`config-down-${ph.id}`} className="rounded border border-[#E5DCC5] p-1 text-[#8B5A2B] disabled:opacity-30"><ArrowDown size={14} /></button>
                     <button onClick={() => delPhoto(ph.id)} className="p-1.5 text-red-500"><Trash2 size={16} /></button>
                   </div>
                 </div>
                 <div className="mt-2 grid grid-cols-3 gap-2">
-                  {["main_url", "front_url", "side_url"].map((slot) => (
-                    <div key={slot}>
+                  {["main_url", "front_url", "side_url"].map((slot, si) => (
+                    <div key={slot} data-testid={`photo-slot-${ph.id}-${si}`}>
                       <div className="aspect-square overflow-hidden rounded-lg border border-[#E5DCC5] bg-white">
-                        {ph[slot] ? <img src={imgUrl(ph[slot])} alt="" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-[10px] text-[#8B7355]">{slot === "main_url" ? "Utama" : slot === "front_url" ? "Depan" : "Samping"}</div>}
+                        {ph[slot] ? <img src={imgUrl(ph[slot])} alt="" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-[10px] text-[#8B7355]">{si === 0 ? "Foto 1 (Utama)" : `Foto ${si + 1}`}</div>}
                       </div>
                       <input type="file" accept="image/*" hidden ref={(el) => (photoRefs.current[ph.id + slot] = el)} onChange={(e) => e.target.files[0] && uploadTo(e.target.files[0], (u) => updPhoto(ph.id, { [slot]: u }))} />
-                      <button onClick={() => photoRefs.current[ph.id + slot]?.click()} data-testid={`photo-upload-${ph.id}-${slot}`} className="mt-1 w-full rounded-lg border border-[#8B5A2B] py-1 text-[10px] text-[#8B5A2B]">Unggah</button>
+                      <div className="mt-1 flex items-center gap-1">
+                        <button onClick={() => photoRefs.current[ph.id + slot]?.click()} data-testid={`photo-upload-${ph.id}-${slot}`} className="flex-1 rounded-lg border border-[#8B5A2B] py-1 text-[10px] text-[#8B5A2B]">Unggah</button>
+                        <button onClick={() => moveSlot(ph.id, si, -1)} disabled={si === 0} data-testid={`photo-slot-left-${ph.id}-${si}`} className="rounded border border-[#E5DCC5] px-1 py-1 text-[#8B5A2B] disabled:opacity-30"><ArrowLeft size={12} /></button>
+                        <button onClick={() => moveSlot(ph.id, si, 1)} disabled={si === 2} data-testid={`photo-slot-right-${ph.id}-${si}`} className="rounded border border-[#E5DCC5] px-1 py-1 text-[#8B5A2B] disabled:opacity-30"><ArrowRight size={12} /></button>
+                      </div>
                     </div>
                   ))}
                 </div>

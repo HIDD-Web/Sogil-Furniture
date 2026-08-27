@@ -75,5 +75,14 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - Decision: customer login stays username/phone/password + optional email; username serves as display name; guest checkout preserved (no breaking required-field change).
 - Tests: /app/backend/tests/test_v6_features.py 13/13 + combined V5+V6 29/29 PASS (iteration_7.json). Production readiness: GREEN.
 
+### v7 — targeted maintenance (2026-06)
+- Config-photo regression investigation: NO data loss and NO display bug found — all config photo records intact in DB and rendering on the customer configure page (main + thumbnails + match label). Weighted similarity matching (length/level highest weight) left unchanged. Category cover stays separate and is never a per-config fallback.
+- Config-record ordering (admin): move up/down controls per configuration set in AdminProductEdit (config-up/config-down); persists via the photos array on Save; survives refresh. Does not alter attributes or photos of any set.
+- Photo ordering within a configuration (admin): move left/right controls on the 3 slots (relabeled Foto 1/2/3; Foto 1 = primary/main_url); persists on Save. Independent from config-record order.
+- Guest order tracking: POST /api/orders/track + /lacak page. Requires order_number + matching phone (wrong phone -> 404). Limited view only — NO address/maps/customer_id/phone exposed. Footer 'Lacak Pesanan' link added.
+- Guest order claim: POST /api/customer/claim-order (auth). Verifies phone; blocks double-claim (409 if owned by another, 400 if already own); attaches only customer_id+username, preserving all historical snapshots. Claim UI in CustomerAccount. Guest checkout unchanged.
+- NO schema migration; array order is the persisted ordering. Referral/points and order-privacy rules verified intact.
+- Tests: /app/backend/tests/test_v7_features.py 12/12 PASS (iteration_8.json). Scenarios A-T all PASS.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

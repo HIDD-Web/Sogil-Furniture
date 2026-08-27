@@ -18,6 +18,7 @@ export default function CustomerAccount() {
   const [f, setF] = useState({ username: "", phone: "", password: "", identifier: "" });
   const [orders, setOrders] = useState([]);
   const [points, setPoints] = useState(null);
+  const [claim, setClaim] = useState({ order_number: "", phone: "" });
 
   useEffect(() => {
     if (customer) {
@@ -25,6 +26,16 @@ export default function CustomerAccount() {
       api.get("/customer/points").then((r) => setPoints(r.data)).catch(() => {});
     }
   }, [customer]);
+
+  const claimOrder = async () => {
+    if (!claim.order_number || !claim.phone) return toast.error("Isi nomor pesanan & No HP");
+    try {
+      await api.post("/customer/claim-order", claim);
+      toast.success("Pesanan berhasil diklaim");
+      setClaim({ order_number: "", phone: "" });
+      api.get("/customer/orders").then((r) => setOrders(r.data)).catch(() => {});
+    } catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
+  };
 
   if (!checked) return <div className="py-20 text-center text-[#8B7355]">Memuat...</div>;
 
@@ -85,6 +96,16 @@ export default function CustomerAccount() {
           <Button variant="outline" onClick={() => { navigator.clipboard.writeText(customer.referral_code); toast.success("Kode disalin"); }} className="rounded-xl border-[#8B5A2B] text-[#8B5A2B]"><Copy size={14} /></Button>
         </div>
         <p className="mt-2 text-xs text-[#8B7355]">Bagikan kode ini — kamu dapat poin saat pesanan referral dibayar.</p>
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="claim-order-card">
+        <div className="font-heading font-bold text-[#2C1E16]">Klaim Pesanan Sebelumnya</div>
+        <p className="mt-1 text-xs text-[#8B7355]">Pernah pesan sebagai tamu? Klaim pesanan ke akun ini dengan nomor pesanan & No HP yang dipakai saat memesan.</p>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <Input value={claim.order_number} onChange={(e) => setClaim({ ...claim, order_number: e.target.value })} placeholder="SGF-20260827-001" data-testid="claim-order-number" className="bg-white" />
+          <Input value={claim.phone} onChange={(e) => setClaim({ ...claim, phone: e.target.value })} placeholder="+201234567890" data-testid="claim-phone" className="bg-white" />
+        </div>
+        <Button onClick={claimOrder} data-testid="claim-submit" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Klaim Pesanan</Button>
       </div>
 
       <h2 className="mt-8 font-heading text-lg font-bold text-[#2C1E16]">Riwayat Pesanan</h2>

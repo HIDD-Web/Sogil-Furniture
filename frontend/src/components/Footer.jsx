@@ -28,6 +28,7 @@ export const Footer = ({ storeInfo }) => {
             <div className="flex flex-col gap-1.5">
               <Link to="/produk" className="hover:text-[#8B5A2B]">Produk</Link>
               <Link to="/cara-pesan" className="hover:text-[#8B5A2B]">Cara Pesan</Link>
+              <Link to="/lacak" className="hover:text-[#8B5A2B]" data-testid="footer-track-order">Lacak Pesanan</Link>
               <Link to="/kontak" className="hover:text-[#8B5A2B]">Kontak</Link>
             </div>
           </div>
