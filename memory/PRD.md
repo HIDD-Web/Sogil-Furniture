@@ -47,6 +47,15 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - Manual finance balance adjustment ("Set Saldo Saat Ini") recorded as balance_adjustment (affects balance, not revenue).
 - Tests: /app/backend/tests/test_v3_features.py (17/17 pass).
 
+### v4 — done (2026-08-27)
+- Fixed the missing "Hapus Pesanan" action: now visible on Order Detail and Order List (gated by delete_data/owner); server-enforced 403/404; deleting a paid order reverses its auto-revenue AND any referral points; deleted orders excluded from stats/finance/auto-cover.
+- Product image upload optimization: server resizes/compresses uploads to web-friendly WebP (max ~1600px, thumbnail generated), lazy loading + browser caching. Category cover stays separate from config photos; weighted similarity unchanged.
+- Finance charts (recharts): monthly Revenue & Profit bars per currency/year via /admin/finance/monthly.
+- Customer accounts: register (username/phone+/password, email optional), login/logout (JWT customer cookie), profile, order history, points dashboard, referral code. Guest checkout preserved.
+- Referral system: auto code per customer; admin Referrals page (discount %, max LE, points/order, limits, dates, status, global ON/OFF); apply at checkout (login required); self-referral blocked; one code per order; snapshot on order.
+- Points: 1 pt = 1 LE; awarded to owner only when referred order is Paid (idempotent), reversed on delete/un-pay; redemption capped at point_redeem_max_pct (default 50%) of subtotal; never negative; discount+referral are mutually exclusive; totals clamped >= 0.
+- Admin Customers page (search, detail, order/point history, owner-only manual point adjustment with audit).
+- Tests: /app/backend/tests/test_v4_features.py — 21/21 pass (executed 2026-06, iteration_5.json). Frontend Playwright verified: owner sees delete-order button (list+detail), sub-admin without delete_data has it hidden AND gets 403 server-side; finance recharts render (empty-data safe); customer register/login/history; checkout referral+points. NO regressions found. QA COMPLETE — safe for final production testing.
+
 ## Backlog (not built)
-- P1: Customer accounts + login (guest checkout preserved), referral codes + points (award on paid, dedupe, reverse on delete), customer order-history area — DEFERRED to next phase (large subsystem).
-- P2: split server.py into routers; automatic FX; payment gateway; inventory.
+- P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

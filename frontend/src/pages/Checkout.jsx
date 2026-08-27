@@ -6,6 +6,7 @@ import { config_summary_client } from "../lib/summary";
 import { normalizePhone, validIntlPhone } from "../lib/photoMatch";
 import { useCart } from "../context/CartContext";
 import { useLang } from "../context/LanguageContext";
+import { useCustomer } from "../context/CustomerContext";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
@@ -21,6 +22,7 @@ const Chip = ({ active, onClick, children, testid }) => (
 export default function Checkout() {
   const { items, productSubtotal, clear } = useCart();
   const { t } = useLang();
+  const { customer } = useCustomer();
   const navigate = useNavigate();
   const [zones, setZones] = useState([]);
   const [store, setStore] = useState(null);
@@ -28,6 +30,20 @@ export default function Checkout() {
   const [delivery, setDelivery] = useState({ method: "", zone_id: "" });
   const [cust, setCust] = useState({ name: "", phone: "", address: "", maps: "", payment: "", notes: "" });
   const [disc, setDisc] = useState({ code: "", amount: 0, applied: false });
+  const [ref, setRef] = useState({ code: "", amount: 0, applied: false });
+  const [pts, setPts] = useState(0);
+
+  const applyReferral = async () => {
+    if (!ref.code.trim()) return;
+    if (!customer) return toast.error("Login sebagai pelanggan untuk memakai referral");
+    try {
+      const { data } = await api.post("/referral/validate", { code: ref.code, subtotal: productSubtotal });
+      if (data.valid) { setRef((r) => ({ ...r, amount: data.discount_amount, applied: true })); toast.success("Referral diterapkan"); }
+      else { setRef((r) => ({ ...r, amount: 0, applied: false })); toast.error(data.message); }
+    } catch { toast.error("Kode referral tidak valid"); }
+  };
+  const maxPts = customer ? Math.min(customer.points_available || 0, productSubtotal * ((store?.point_redeem_max_pct || 50) / 100)) : 0;
+  const usedPts = Math.max(0, Math.min(Number(pts) || 0, maxPts));
 
   const applyDiscount = async () => {
     if (!disc.code.trim()) return;
@@ -49,7 +65,7 @@ export default function Checkout() {
     const z = zones.find((z) => z.id === delivery.zone_id);
     return z ? Number(z.fee_le) : 0;
   }, [delivery, zones]);
-  const totalLE = productSubtotal - (disc.applied ? disc.amount : 0) + deliveryFee;
+  const totalLE = Math.max(0, productSubtotal - (ref.applied ? ref.amount : (disc.applied ? disc.amount : 0)) - usedPts + deliveryFee);
 
   if (!items.length) {
     return (
@@ -78,7 +94,9 @@ export default function Checkout() {
         customer_maps_url: cust.maps, delivery_method: delivery.method,
         delivery_zone_id: delivery.method === "delivery" ? delivery.zone_id : null,
         payment_method: cust.payment, notes,
-        discount_code: disc.applied ? disc.code : null,
+        discount_code: !ref.applied && disc.applied ? disc.code : null,
+        referral_code: ref.applied ? ref.code : null,
+        redeem_points: usedPts,
         items: items.map((i) => ({ product_id: i.product.id, config: i.config, quantity: i.quantity })),
       });
       clear();
@@ -150,6 +168,19 @@ export default function Checkout() {
               <Input value={disc.code} onChange={(e) => setDisc({ ...disc, code: e.target.value, applied: false })} placeholder={t("sum.discount_ph")} data-testid="discount-code" className="h-10 bg-white" />
               <Button onClick={applyDiscount} data-testid="apply-discount" variant="outline" className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]">{t("sum.discount_apply")}</Button>
             </div>
+            {customer && (<>
+              {ref.applied && <div className="mt-2 flex justify-between text-sm text-[#738678]"><span>Referral ({ref.code})</span><span className="font-medium">-{fmtLE(ref.amount)} LE</span></div>}
+              <div className="mt-2 flex gap-2">
+                <Input value={ref.code} onChange={(e) => setRef({ ...ref, code: e.target.value, applied: false })} placeholder="Kode referral" data-testid="referral-code" className="h-10 bg-white" />
+                <Button onClick={applyReferral} data-testid="apply-referral" variant="outline" className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]">Pakai</Button>
+              </div>
+              {maxPts > 0 && (
+                <div className="mt-2">
+                  <div className="mb-1 flex justify-between text-xs text-[#8B7355]"><span>Tukar Poin (maks {fmtLE(maxPts)})</span>{usedPts > 0 && <span className="text-[#738678]">-{fmtLE(usedPts)} LE</span>}</div>
+                  <Input type="number" value={pts} onChange={(e) => setPts(e.target.value)} placeholder="0" data-testid="redeem-points" className="h-10 bg-white" />
+                </div>
+              )}
+            </>)}
             <div className="mt-4 rounded-xl bg-[#EFE6D5] p-4">
               <div className="text-xs font-medium text-[#8B6B45]">{t("sum.estimasi_total")}</div>
               <div className="font-heading text-2xl font-bold text-[#8B5A2B]" data-testid="checkout-total-le">{fmtLE(totalLE)} LE</div>

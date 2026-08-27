@@ -8,12 +8,15 @@ import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { useAuth } from "../../context/AuthContext";
 
 export default function AdminOrderDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
   const [order, setOrder] = useState(null);
   const [note, setNote] = useState("");
 
@@ -28,6 +31,13 @@ export default function AdminOrderDetail() {
   const items = order.items || [order.item];
   const phoneNum = (order.customer_phone || "").replace(/[^0-9]/g, "");
   const copySummary = () => { navigator.clipboard.writeText(order.whatsapp_message || ""); toast.success("Ringkasan disalin"); };
+  const doDelete = async () => {
+    const paid = order.payment_status === "lunas";
+    const msg = paid ? "Pesanan ini sudah LUNAS. Menghapus akan menghapus/membalik pendapatan otomatis terkait dan tidak dapat dibatalkan. Lanjutkan?" : "Apakah Anda yakin ingin menghapus pesanan ini? Tindakan ini tidak dapat dibatalkan.";
+    if (!window.confirm(msg)) return;
+    try { await api.delete(`/admin/orders/${id}`); toast.success("Pesanan dihapus"); navigate("/admin/orders"); }
+    catch (e) { toast.error(e.response?.data?.detail || "Gagal menghapus"); }
+  };
 
   return (
     <div className="max-w-4xl">
@@ -52,6 +62,7 @@ export default function AdminOrderDetail() {
             <a href={`https://wa.me/${phoneNum}`} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#25D366] text-[#25D366]"><MessageCircle size={16} className="mr-1" /> WhatsApp</Button></a>
             {order.customer_maps_url && <a href={order.customer_maps_url} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><MapPin size={16} className="mr-1" /> Maps</Button></a>}
             <Button variant="outline" onClick={copySummary} data-testid="admin-copy-summary" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><Copy size={16} className="mr-1" /> Salin Ringkasan</Button>
+            {canDelete && <Button variant="outline" onClick={doDelete} data-testid="delete-order" className="rounded-xl border-red-300 text-red-600 hover:bg-red-50"><Trash2 size={16} className="mr-1" /> Hapus Pesanan</Button>}
           </div>
         </div>
 

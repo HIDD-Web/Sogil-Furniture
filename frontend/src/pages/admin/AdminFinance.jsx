@@ -7,6 +7,7 @@ import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
 import { Trash2, ArrowRightLeft, TrendingUp, TrendingDown } from "lucide-react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { toast } from "sonner";
 
 const money = (v, cur) => (cur === "IDR" ? "Rp" : "") + Math.round(Number(v) || 0).toLocaleString("de-DE") + (cur === "EGP" ? " LE" : "");
@@ -22,6 +23,7 @@ export default function AdminFinance() {
   const [xfer, setXfer] = useState({ from_account: "IDR", to_account: "EGP", from_amount: "", to_amount: "", exchange_rate: "", description: "", date: "" });
   const [adj, setAdj] = useState({ account: "EGP", new_balance: "", description: "" });
   const [newCat, setNewCat] = useState({ name: "", type: "expense" });
+  const [chart, setChart] = useState({ currency: "EGP", year: new Date().getFullYear(), data: [] });
 
   const loadStats = () => {
     const p = { period };
@@ -31,6 +33,10 @@ export default function AdminFinance() {
   const loadTxns = () => api.get("/admin/finance/transactions").then((r) => setTxns(r.data));
   useEffect(() => { api.get("/admin/finance/categories").then((r) => setCats(r.data)); loadTxns(); }, []);
   useEffect(() => { loadStats(); }, [period, range.start, range.end]);
+  useEffect(() => {
+    api.get("/admin/finance/monthly", { params: { year: chart.year, currency: chart.currency } })
+      .then((r) => setChart((c) => ({ ...c, data: r.data.months.map((m) => ({ name: m.label.slice(5), Revenue: Math.round(m.revenue), Profit: Math.round(m.profit) })) })));
+  }, [chart.currency, chart.year]);
 
   const addTxn = async () => {
     if (!form.category || !form.amount) return toast.error("Lengkapi kategori & jumlah");
@@ -124,6 +130,29 @@ export default function AdminFinance() {
           <Input type="number" placeholder="Jumlah diterima" value={xfer.to_amount} onChange={(e) => setXfer({ ...xfer, to_amount: e.target.value })} data-testid="xfer-to-amount" className="mt-2 bg-white" />
           <Input type="number" placeholder="Rate (opsional)" value={xfer.exchange_rate} onChange={(e) => setXfer({ ...xfer, exchange_rate: e.target.value })} className="mt-2 bg-white" />
           <Button onClick={addXfer} data-testid="xfer-save" className="mt-2 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Catat Transfer</Button>
+        </div>
+      </div>
+
+      {/* Monthly charts */}
+      <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="finance-chart">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="font-heading font-bold text-[#2C1E16]">Pendapatan & Laba Bulanan</div>
+          <div className="flex gap-2">
+            <Select value={chart.currency} onValueChange={(v) => setChart({ ...chart, currency: v })}><SelectTrigger data-testid="chart-currency" className="w-24 bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="EGP">EGP</SelectItem><SelectItem value="IDR">IDR</SelectItem></SelectContent></Select>
+            <Select value={String(chart.year)} onValueChange={(v) => setChart({ ...chart, year: Number(v) })}><SelectTrigger data-testid="chart-year" className="w-28 bg-white"><SelectValue /></SelectTrigger><SelectContent>{[0, 1, 2].map((d) => { const y = new Date().getFullYear() - d; return <SelectItem key={y} value={String(y)}>{y}</SelectItem>; })}</SelectContent></Select>
+          </div>
+        </div>
+        <div style={{ width: "100%", height: 260 }}>
+          <ResponsiveContainer>
+            <BarChart data={chart.data} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
+              <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#8B7355" }} />
+              <YAxis tick={{ fontSize: 11, fill: "#8B7355" }} width={48} />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="Revenue" fill="#8B5A2B" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="Profit" fill="#C9A86A" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
         </div>
       </div>
 

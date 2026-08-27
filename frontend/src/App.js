@@ -6,6 +6,7 @@ import api from "./lib/api";
 import { AuthProvider } from "./context/AuthContext";
 import { LanguageProvider } from "./context/LanguageContext";
 import { CartProvider } from "./context/CartContext";
+import { CustomerProvider } from "./context/CustomerContext";
 import { Header } from "./components/Header";
 import { Footer } from "./components/Footer";
 
@@ -17,6 +18,7 @@ import Checkout from "./pages/Checkout";
 import OrderConfirmation from "./pages/OrderConfirmation";
 import CaraPesan from "./pages/CaraPesan";
 import Kontak from "./pages/Kontak";
+import CustomerAccount from "./pages/CustomerAccount";
 
 import AdminLogin from "./pages/admin/AdminLogin";
 import AdminLayout from "./pages/admin/AdminLayout";
@@ -30,6 +32,8 @@ import AdminAnalytics from "./pages/admin/AdminAnalytics";
 import AdminFinance from "./pages/admin/AdminFinance";
 import AdminAdmins from "./pages/admin/AdminAdmins";
 import AdminDiscounts from "./pages/admin/AdminDiscounts";
+import AdminReferrals from "./pages/admin/AdminReferrals";
+import AdminCustomers from "./pages/admin/AdminCustomers";
 
 function CustomerShell({ children }) {
   const [store, setStore] = useState(null);
@@ -59,6 +63,8 @@ function Layout() {
           <Route path="analytics" element={<AdminAnalytics />} />
           <Route path="finance" element={<AdminFinance />} />
           <Route path="discounts" element={<AdminDiscounts />} />
+          <Route path="referrals" element={<AdminReferrals />} />
+          <Route path="customers" element={<AdminCustomers />} />
           <Route path="admins" element={<AdminAdmins />} />
           <Route path="settings" element={<AdminSettings />} />
         </Route>
@@ -76,6 +82,7 @@ function Layout() {
         <Route path="/pesanan/:id" element={<OrderConfirmation />} />
         <Route path="/cara-pesan" element={<CaraPesan />} />
         <Route path="/kontak" element={<Kontak />} />
+        <Route path="/akun" element={<CustomerAccount />} />
       </Routes>
     </CustomerShell>
   );
@@ -87,10 +94,12 @@ function App() {
       <LanguageProvider>
         <AuthProvider>
           <CartProvider>
-            <BrowserRouter>
-              <Layout />
-              <Toaster position="top-center" richColors />
-            </BrowserRouter>
+            <CustomerProvider>
+              <BrowserRouter>
+                <Layout />
+                <Toaster position="top-center" richColors />
+              </BrowserRouter>
+            </CustomerProvider>
           </CartProvider>
         </AuthProvider>
       </LanguageProvider>

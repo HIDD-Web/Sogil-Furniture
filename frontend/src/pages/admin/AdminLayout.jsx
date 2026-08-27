@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, Package, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, Package, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound } from "lucide-react";
 import { Button } from "../../components/ui/button";
 
 export default function AdminLayout() {
@@ -22,6 +22,8 @@ export default function AdminLayout() {
     { to: "/admin/products", label: "Produk", icon: Package, show: perms.modify_products || isOwner },
     { to: "/admin/finance", label: "Keuangan", icon: Wallet, show: perms.access_finance || isOwner },
     { to: "/admin/discounts", label: "Diskon", icon: Ticket, show: perms.manage_settings || isOwner },
+    { to: "/admin/referrals", label: "Referral", icon: Gift, show: perms.manage_settings || isOwner },
+    { to: "/admin/customers", label: "Pelanggan", icon: UserRound, show: perms.manage_orders || isOwner },
     { to: "/admin/admins", label: "Akun Admin", icon: Users, show: isOwner },
     { to: "/admin/settings", label: "Pengaturan", icon: Settings, show: perms.manage_settings || isOwner },
   ].filter((l) => l.show);

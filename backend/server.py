@@ -147,6 +147,33 @@ def require_owner():
         return admin
     return dep
 
+def create_customer_token(cid: str) -> str:
+    payload = {"sub": cid, "exp": datetime.now(timezone.utc) + timedelta(days=30), "type": "customer"}
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+async def get_optional_customer(request: Request):
+    token = request.cookies.get("customer_token")
+    if not token:
+        h = request.headers.get("X-Customer-Authorization", "")
+        if h.startswith("Bearer "):
+            token = h[7:]
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "customer":
+            return None
+        c = await db.customers.find_one({"_id": oid(payload["sub"])})
+        return c
+    except jwt.InvalidTokenError:
+        return None
+
+async def get_current_customer(request: Request):
+    c = await get_optional_customer(request)
+    if not c:
+        raise HTTPException(status_code=401, detail="Silakan login sebagai pelanggan")
+    return c
+
 def audit_fields(admin: dict) -> dict:
     return {"updated_at": datetime.now(timezone.utc).isoformat(),
             "updated_by_id": admin.get("id"), "updated_by_name": admin.get("name", "Admin")}
@@ -188,6 +215,8 @@ class OrderInput(BaseModel):
     item: Optional[OrderItemInput] = None
     items: Optional[List[OrderItemInput]] = None
     discount_code: Optional[str] = None
+    referral_code: Optional[str] = None
+    redeem_points: Optional[float] = 0
 
 class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
@@ -224,6 +253,33 @@ class TransferInput(BaseModel):
     to_amount: float
     exchange_rate: Optional[float] = None
     description: Optional[str] = ""
+
+class CustomerRegister(BaseModel):
+    username: str
+    phone: str
+    password: str
+    email: Optional[str] = ""
+
+class CustomerLogin(BaseModel):
+    identifier: str  # phone or username
+    password: str
+
+class ReferralInput(BaseModel):
+    customer_id: str
+    code: str
+    status: str = "active"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    discount_percentage: float = 0
+    max_discount_le: float = 0
+    max_claim_orders: int = 0
+    max_reward_orders: int = 0
+    max_total_points: int = 0
+    points_per_order: float = 0
+
+class PointAdjustInput(BaseModel):
+    amount: float
+    reason: str
 
 # --------------------------------------------------------------------------
 # Pricing engine
@@ -498,6 +554,8 @@ async def store_info():
         "exchange_rate_idr_per_le": _num(await get_setting("exchange_rate_idr_per_le", 357), 357),
         "bank_info": await get_setting("bank_info", ""),
         "logo_url": await get_setting("logo_url", ""),
+        "referral_program_enabled": await get_setting("referral_program_enabled", True),
+        "point_redeem_max_pct": _num(await get_setting("point_redeem_max_pct", 50), 50),
         "instagram": await get_setting("instagram", ""),
         "facebook": await get_setting("facebook", ""),
         "tiktok": await get_setting("tiktok", ""),
@@ -524,7 +582,7 @@ async def generate_order_number():
     return f"{prefix}{seq:03d}"
 
 @api_router.post("/orders")
-async def create_order(data: OrderInput):
+async def create_order(request: Request, data: OrderInput):
     if not data.customer_name.strip():
         raise HTTPException(status_code=400, detail="Nama tidak boleh kosong.")
     phone = normalize_phone(data.customer_phone)
@@ -575,10 +633,39 @@ async def create_order(data: OrderInput):
         })
 
     total_le = subtotal_le + delivery_fee
-    discount_le, disc_doc, disc_err = await validate_discount(data.discount_code, subtotal_le)
-    if data.discount_code and disc_err:
-        raise HTTPException(status_code=400, detail=disc_err)
-    total_le = subtotal_le - discount_le + delivery_fee
+    buyer = await get_optional_customer(request)
+    buyer_id = str(buyer["_id"]) if buyer else None
+    # Referral OR promo discount (exclusive to protect margin)
+    referral_snap = None
+    discount_le = 0.0
+    disc_doc = None
+    if data.referral_code:
+        if not buyer:
+            raise HTTPException(status_code=401, detail="Login sebagai pelanggan untuk memakai kode referral")
+        rdisc, rdoc, rerr = await validate_referral(data.referral_code, subtotal_le, buyer_id)
+        if rerr:
+            raise HTTPException(status_code=400, detail=rerr)
+        discount_le = rdisc
+        owner = await db.customers.find_one({"_id": oid(rdoc["customer_id"])})
+        referral_snap = {"code": rdoc.get("code"), "owner_id": str(rdoc["customer_id"]),
+                         "owner_name": owner.get("username") if owner else "", "percentage": _num(rdoc.get("discount_percentage")),
+                         "discount_le": rdisc, "points_per_order": _num(rdoc.get("points_per_order"))}
+    else:
+        discount_le, disc_doc, disc_err = await validate_discount(data.discount_code, subtotal_le)
+        if data.discount_code and disc_err:
+            raise HTTPException(status_code=400, detail=disc_err)
+    # Points redemption (logged-in only, max % of subtotal)
+    points_redeemed = 0.0
+    redeem_req = _num(data.redeem_points)
+    if redeem_req > 0:
+        if not buyer:
+            raise HTTPException(status_code=401, detail="Login untuk menukar poin")
+        max_pct = _num(await get_setting("point_redeem_max_pct", 50), 50)
+        cap = min(subtotal_le * max_pct / 100.0, _num(buyer.get("points_available")))
+        points_redeemed = round(min(redeem_req, cap), 2)
+        if points_redeemed < 0:
+            points_redeemed = 0.0
+    total_le = max(0.0, subtotal_le - discount_le - points_redeemed + delivery_fee)
     rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -592,7 +679,10 @@ async def create_order(data: OrderInput):
         "notes": (data.notes or "").strip(), "admin_note": "",
         "items": items, "item": items[0],
         "subtotal_le": subtotal_le, "discount_code": (disc_doc.get("code") if disc_doc else None),
-        "discount_percentage": (_num(disc_doc.get("percentage")) if disc_doc else 0), "discount_le": discount_le,
+        "discount_percentage": (_num(disc_doc.get("percentage")) if disc_doc else 0), "discount_le": (discount_le if not referral_snap else 0),
+        "referral": referral_snap, "referral_discount_le": (discount_le if referral_snap else 0),
+        "points_redeemed_le": points_redeemed, "customer_id": buyer_id,
+        "customer_username": (buyer.get("username") if buyer else None),
         "total_le": total_le,
         "exchange_rate_idr_per_le": rate, "estimated_total_idr": round(total_le * rate),
         "rate_timestamp": now, "requires_admin_confirmation": requires_confirm,
@@ -601,6 +691,14 @@ async def create_order(data: OrderInput):
     result = await db.orders.insert_one(order_doc)
     if disc_doc:
         await db.discounts.update_one({"_id": disc_doc["_id"]}, {"$inc": {"claims": 1}})
+    if referral_snap:
+        await db.referrals.update_one({"code": referral_snap["code"]}, {"$inc": {"claims": 1}})
+    if points_redeemed > 0 and buyer_id:
+        newb = _num(buyer.get("points_available")) - points_redeemed
+        await db.customers.update_one({"_id": oid(buyer_id)}, {"$inc": {"points_available": -points_redeemed, "points_redeemed": points_redeemed}})
+        await db.point_transactions.insert_one({"customer_id": buyer_id, "type": "redeem", "amount": -points_redeemed,
+            "order_id": str(result.inserted_id), "reason": "Penukaran poin", "balance_after": newb,
+            "created_at": datetime.now(timezone.utc).isoformat()})
     order_doc["id"] = str(result.inserted_id); order_doc.pop("_id", None)
     order_doc["whatsapp_message"] = build_whatsapp_message(order_doc)
     order_doc["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
@@ -774,15 +872,19 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
     order = await db.orders.find_one({"_id": oid(order_id)})
     if data.payment_status == "lunas":
         await record_order_revenue(order)
+        await award_referral_points(order)
     elif data.payment_status in ("belum_dibayar", "dp"):
         await db.finance_transactions.delete_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
+        await reverse_referral_points(order)
     return clean(order)
 
 @api_router.delete("/admin/orders/{order_id}")
 async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("delete_data"))):
-    res = await db.orders.delete_one({"_id": oid(order_id)})
-    if res.deleted_count == 0:
+    order = await db.orders.find_one({"_id": oid(order_id)})
+    if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    await reverse_referral_points(order)
+    await db.orders.delete_one({"_id": oid(order_id)})
     await db.finance_transactions.delete_many({"related_order_id": order_id, "type": "order_revenue"})
     return {"ok": True}
 
@@ -831,18 +933,40 @@ async def admin_delete_product(product_id: str, admin: dict = Depends(require_pe
 # --------------------------------------------------------------------------
 # Uploads
 # --------------------------------------------------------------------------
+def optimize_image(data: bytes):
+    """Resize large images and re-encode to WebP for fast loading. Falls back to original on error."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        img = img.convert("RGB") if img.mode in ("P", "RGBA", "LA") else img
+        max_dim = 1600
+        if max(img.size) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="WEBP", quality=82, method=4)
+        return out.getvalue(), "webp", "image/webp"
+    except Exception as e:
+        logger.warning(f"Image optimize failed, using original: {e}")
+        return None
+
 @api_router.post("/admin/upload")
 async def admin_upload(file: UploadFile = File(...), admin: dict = Depends(get_current_admin)):
     ext = (file.filename.rsplit(".", 1)[-1] if "." in file.filename else "bin").lower()
     if ext not in MIME_TYPES:
         raise HTTPException(status_code=400, detail="Format gambar tidak didukung (jpg, png, webp)")
-    path = f"{APP_NAME}/uploads/{uuid.uuid4()}.{ext}"
     data = await file.read()
-    if len(data) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Ukuran gambar maksimal 8MB")
-    result = put_object(path, data, MIME_TYPES[ext])
+    if len(data) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Ukuran gambar maksimal 12MB")
+    opt = optimize_image(data)
+    if opt:
+        data, ext, ctype = opt
+    else:
+        ctype = MIME_TYPES[ext]
+    path = f"{APP_NAME}/uploads/{uuid.uuid4()}.{ext}"
+    result = put_object(path, data, ctype)
     await db.files.insert_one({"storage_path": result["path"], "original_filename": file.filename,
-                               "content_type": MIME_TYPES[ext], "size": result.get("size", len(data)),
+                               "content_type": ctype, "size": result.get("size", len(data)),
                                "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()})
     return {"path": result["path"], "url": f"/api/files/{result['path']}"}
 
@@ -892,7 +1016,7 @@ async def admin_get_settings(admin: dict = Depends(require_perm("manage_settings
 async def admin_update_settings(payload: Dict[str, Any], admin: dict = Depends(require_perm("manage_settings"))):
     allowed = ["store_name", "app_name", "tagline", "store_address", "store_maps_url",
                "whatsapp_number", "exchange_rate_idr_per_le", "bank_info", "logo_url",
-               "instagram", "facebook", "tiktok", "email"]
+               "instagram", "facebook", "tiktok", "email", "referral_program_enabled", "point_redeem_max_pct"]
     for key in allowed:
         if key in payload:
             val = payload[key]
@@ -1260,6 +1384,225 @@ async def balance_adjust(payload: Dict[str, Any], admin: dict = Depends(require_
     await db.finance_transactions.insert_one(doc)
     return {"ok": True, "account": account, "previous_balance": prev, "new_balance": new_balance, "adjustment": delta}
 
+@api_router.get("/admin/finance/monthly")
+async def finance_monthly(year: Optional[int] = None, currency: str = "EGP",
+                          admin: dict = Depends(require_perm("access_finance"))):
+    yr = year or datetime.now(timezone.utc).year
+    months = [{"month": m, "label": f"{yr}-{m:02d}", "revenue": 0.0, "cost": 0.0, "profit": 0.0} for m in range(1, 13)]
+    async for t in db.finance_transactions.find({"currency": currency}):
+        d = (t.get("date") or "")[:7]
+        try:
+            ty, tm = int(d[:4]), int(d[5:7])
+        except (ValueError, IndexError):
+            continue
+        if ty != yr:
+            continue
+        typ = t.get("type"); amt = _num(t.get("amount"))
+        row = months[tm - 1]
+        if typ in ("income", "order_revenue"):
+            row["revenue"] += amt
+        elif typ == "expense":
+            row["cost"] += amt
+    for r in months:
+        r["profit"] = r["revenue"] - r["cost"]
+    return {"year": yr, "currency": currency, "months": months}
+
+async def award_referral_points(order):
+    ref = order.get("referral") or {}
+    owner_id = ref.get("owner_id")
+    if not owner_id:
+        return
+    if await db.point_transactions.find_one({"order_id": str(order["_id"]), "type": "earn"}):
+        return
+    per = _num(ref.get("points_per_order"))
+    if per <= 0:
+        return
+    r = await db.referrals.find_one({"code": ref.get("code")})
+    if r and _num(r.get("max_total_points")) > 0 and _num(r.get("points_awarded", 0)) + per > _num(r.get("max_total_points")):
+        return
+    cust = await db.customers.find_one({"_id": oid(owner_id)})
+    if not cust:
+        return
+    new_bal = _num(cust.get("points_available")) + per
+    await db.customers.update_one({"_id": oid(owner_id)}, {"$inc": {"points_available": per, "points_earned": per}})
+    await db.point_transactions.insert_one({"customer_id": owner_id, "type": "earn", "amount": per,
+        "order_id": str(order["_id"]), "reason": f"Referral order {order.get('order_number')}",
+        "balance_after": new_bal, "created_at": datetime.now(timezone.utc).isoformat()})
+    if r:
+        await db.referrals.update_one({"_id": r["_id"]}, {"$inc": {"points_awarded": per, "reward_orders": 1}})
+
+async def reverse_referral_points(order):
+    txns = await db.point_transactions.find({"order_id": str(order["_id"]), "type": "earn"}).to_list(50)
+    for t in txns:
+        amt = _num(t.get("amount"))
+        await db.customers.update_one({"_id": oid(t["customer_id"])}, {"$inc": {"points_available": -amt, "points_earned": -amt}})
+        await db.point_transactions.insert_one({"customer_id": t["customer_id"], "type": "reverse", "amount": -amt,
+            "order_id": str(order["_id"]), "reason": f"Reversal (order dihapus/dibatalkan)", "created_at": datetime.now(timezone.utc).isoformat()})
+    await db.point_transactions.delete_many({"order_id": str(order["_id"]), "type": "earn"})
+    # refund redeemed points to the buyer
+    redeemed = order.get("points_redeemed_le") or 0
+    buyer = order.get("customer_id")
+    if redeemed and buyer:
+        await db.customers.update_one({"_id": oid(buyer)}, {"$inc": {"points_available": redeemed, "points_redeemed": -redeemed}})
+
+# ---- Customer auth ----
+def gen_referral_code(username):
+    base = re.sub(r"[^A-Z0-9]", "", username.upper())[:8] or "SGL"
+    return f"{base}{uuid.uuid4().hex[:3].upper()}"
+
+def clean_customer(c):
+    c = clean(c)
+    c.pop("password_hash", None)
+    return c
+
+@api_router.post("/customer/register")
+async def customer_register(data: CustomerRegister, response: Response):
+    phone = normalize_phone(data.phone)
+    if not valid_intl_phone(phone):
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +201234567890")
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter")
+    if await db.customers.find_one({"phone": phone}):
+        raise HTTPException(status_code=400, detail="No HP sudah terdaftar")
+    if await db.customers.find_one({"username": data.username.strip()}):
+        raise HTTPException(status_code=400, detail="Username sudah digunakan")
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {"username": data.username.strip(), "phone": phone, "email": (data.email or "").strip(),
+           "password_hash": hash_password(data.password), "created_at": now, "last_login": now,
+           "referral_code": gen_referral_code(data.username), "points_available": 0.0, "points_earned": 0.0, "points_redeemed": 0.0}
+    r = await db.customers.insert_one(doc)
+    cid = str(r.inserted_id)
+    await db.referrals.insert_one({"customer_id": cid, "code": doc["referral_code"], "status": "active",
+        "start_date": None, "end_date": None, "discount_percentage": 5, "max_discount_le": 100,
+        "max_claim_orders": 0, "max_reward_orders": 0, "max_total_points": 0, "points_per_order": 20,
+        "claims": 0, "reward_orders": 0, "points_awarded": 0, "created_at": now})
+    response.set_cookie("customer_token", create_customer_token(cid), httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
+    return clean_customer(await db.customers.find_one({"_id": r.inserted_id}))
+
+@api_router.post("/customer/login")
+async def customer_login(data: CustomerLogin, response: Response):
+    ident = data.identifier.strip()
+    c = await db.customers.find_one({"$or": [{"phone": normalize_phone(ident)}, {"username": ident}]})
+    if not c or not verify_password(data.password, c["password_hash"]):
+        raise HTTPException(status_code=401, detail="Kredensial salah")
+    await db.customers.update_one({"_id": c["_id"]}, {"$set": {"last_login": datetime.now(timezone.utc).isoformat()}})
+    response.set_cookie("customer_token", create_customer_token(str(c["_id"])), httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
+    return clean_customer(c)
+
+@api_router.post("/customer/logout")
+async def customer_logout(response: Response):
+    response.delete_cookie("customer_token", path="/")
+    return {"ok": True}
+
+@api_router.get("/customer/me")
+async def customer_me(c: dict = Depends(get_current_customer)):
+    return clean_customer(c)
+
+@api_router.get("/customer/orders")
+async def customer_orders(c: dict = Depends(get_current_customer)):
+    orders = await db.orders.find({"customer_id": str(c["_id"])}).sort("created_at", -1).to_list(500)
+    return [clean(o) for o in orders]
+
+@api_router.get("/customer/points")
+async def customer_points(c: dict = Depends(get_current_customer)):
+    txns = await db.point_transactions.find({"customer_id": str(c["_id"])}).sort("created_at", -1).to_list(500)
+    ref = await db.referrals.find_one({"customer_id": str(c["_id"])})
+    return {"available": _num(c.get("points_available")), "earned": _num(c.get("points_earned")),
+            "redeemed": _num(c.get("points_redeemed")), "referral_code": c.get("referral_code"),
+            "referral": clean(ref) if ref else None, "transactions": [clean(t) for t in txns]}
+
+# ---- Referral apply (public preview, requires login for real use) ----
+async def validate_referral(code, subtotal, buyer_id):
+    if not code:
+        return 0.0, None, None
+    enabled = await get_setting("referral_program_enabled", True)
+    if not enabled:
+        return 0.0, None, "Program referral sedang nonaktif"
+    r = await db.referrals.find_one({"code": code.strip().upper()})
+    if not r:
+        return 0.0, None, "Kode referral tidak ditemukan"
+    now = datetime.now(timezone.utc).isoformat()
+    if r.get("status") != "active":
+        return 0.0, None, "Kode referral tidak aktif"
+    if r.get("end_date") and now > (r["end_date"] + "T23:59:59"):
+        return 0.0, None, "Kode referral sudah kedaluwarsa"
+    if r.get("start_date") and now < r["start_date"]:
+        return 0.0, None, "Kode referral belum berlaku"
+    if r.get("max_claim_orders") and _num(r.get("claims", 0)) >= _num(r["max_claim_orders"]):
+        return 0.0, None, "Kuota kode referral habis"
+    if buyer_id and str(r.get("customer_id")) == str(buyer_id):
+        return 0.0, None, "Tidak dapat memakai kode referral sendiri"
+    disc = subtotal * _num(r.get("discount_percentage")) / 100.0
+    mx = _num(r.get("max_discount_le"))
+    if mx > 0:
+        disc = min(disc, mx)
+    return round(disc, 2), r, None
+
+@api_router.post("/referral/validate")
+async def referral_validate(payload: Dict[str, Any], request: Request):
+    buyer = await get_optional_customer(request)
+    disc, r, err = await validate_referral(payload.get("code"), _num(payload.get("subtotal")), str(buyer["_id"]) if buyer else None)
+    if err:
+        return {"valid": False, "message": err, "discount_amount": 0}
+    owner = await db.customers.find_one({"_id": oid(r["customer_id"])})
+    return {"valid": True, "discount_amount": disc, "percentage": _num(r.get("discount_percentage")),
+            "code": r.get("code"), "owner_name": owner.get("username") if owner else ""}
+
+# ---- Admin: referrals & customers ----
+@api_router.get("/admin/referrals")
+async def admin_referrals(admin: dict = Depends(require_perm("manage_settings"))):
+    out = []
+    for r in await db.referrals.find({}).sort("created_at", -1).to_list(500):
+        r = clean(r)
+        owner = await db.customers.find_one({"_id": oid(r["customer_id"])}) if r.get("customer_id") else None
+        r["owner_name"] = owner.get("username") if owner else ""
+        out.append(r)
+    return out
+
+@api_router.put("/admin/referrals/{rid}")
+async def admin_update_referral(rid: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("manage_settings"))):
+    upd = {}
+    for k in ["status", "start_date", "end_date", "discount_percentage", "max_discount_le", "max_claim_orders", "max_reward_orders", "max_total_points", "points_per_order"]:
+        if k in payload:
+            upd[k] = payload[k]
+    for k in ["discount_percentage", "max_discount_le", "max_claim_orders", "max_reward_orders", "max_total_points", "points_per_order"]:
+        if k in upd:
+            upd[k] = _num(upd[k])
+    if "discount_percentage" in upd:
+        upd["discount_percentage"] = max(0.0, min(100.0, upd["discount_percentage"]))
+    await db.referrals.update_one({"_id": oid(rid)}, {"$set": upd})
+    return clean(await db.referrals.find_one({"_id": oid(rid)}))
+
+@api_router.get("/admin/customers")
+async def admin_customers(q: Optional[str] = None, admin: dict = Depends(require_perm("manage_orders"))):
+    query = {}
+    if q:
+        query = {"$or": [{"username": {"$regex": q, "$options": "i"}}, {"phone": {"$regex": q, "$options": "i"}}]}
+    return [clean_customer(c) for c in await db.customers.find(query).sort("created_at", -1).to_list(500)]
+
+@api_router.get("/admin/customers/{cid}")
+async def admin_customer_detail(cid: str, admin: dict = Depends(require_perm("manage_orders"))):
+    c = await db.customers.find_one({"_id": oid(cid)})
+    if not c:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+    orders = await db.orders.find({"customer_id": cid}).sort("created_at", -1).to_list(500)
+    txns = await db.point_transactions.find({"customer_id": cid}).sort("created_at", -1).to_list(500)
+    return {"customer": clean_customer(c), "orders": [clean(o) for o in orders], "point_transactions": [clean(t) for t in txns]}
+
+@api_router.post("/admin/customers/{cid}/adjust-points")
+async def admin_adjust_points(cid: str, data: PointAdjustInput, admin: dict = Depends(require_owner())):
+    c = await db.customers.find_one({"_id": oid(cid)})
+    if not c:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+    new_bal = _num(c.get("points_available")) + _num(data.amount)
+    if new_bal < 0:
+        raise HTTPException(status_code=400, detail="Saldo poin tidak boleh negatif")
+    await db.customers.update_one({"_id": oid(cid)}, {"$inc": {"points_available": _num(data.amount)}})
+    await db.point_transactions.insert_one({"customer_id": cid, "type": "adjust", "amount": _num(data.amount),
+        "order_id": None, "reason": data.reason, "balance_after": new_bal, "by_name": admin.get("name"),
+        "created_at": datetime.now(timezone.utc).isoformat()})
+    return {"ok": True, "balance": new_bal}
+
 # --------------------------------------------------------------------------
 # Seed & migrations
 # --------------------------------------------------------------------------
@@ -1298,6 +1641,7 @@ async def seed():
         "whatsapp_number": "628XXXXXXXXXX", "exchange_rate_idr_per_le": 357,
         "bank_info": "PLACEHOLDER — Isi informasi rekening/bank melalui dashboard admin.", "logo_url": "",
         "instagram": "", "facebook": "", "tiktok": "", "email": "",
+        "referral_program_enabled": True, "point_redeem_max_pct": 50,
     }
     for k, v in defaults.items():
         if await db.settings.find_one({"key": k}) is None:

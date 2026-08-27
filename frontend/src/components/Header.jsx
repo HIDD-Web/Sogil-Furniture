@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Menu, X, ShoppingCart, Globe } from "lucide-react";
+import { Menu, X, ShoppingCart, Globe, User } from "lucide-react";
 import { Logo } from "./Logo";
 import { Button } from "./ui/button";
 import { useCart } from "../context/CartContext";
@@ -49,11 +49,13 @@ export const Header = ({ storeInfo }) => {
             <Link key={n.to} to={n.to} className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${location.pathname === n.to ? "bg-[#EFE6D5] text-[#2C1E16]" : "text-[#5C4A3D] hover:bg-[#EFE6D5]"}`}>{n.label}</Link>
           ))}
           <span className="mx-1"><LangSelect /></span>
+          <Link to="/akun" data-testid="header-account" className="flex h-10 w-10 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#2C1E16]"><User size={18} /></Link>
           <CartBtn />
         </nav>
 
         <div className="flex items-center gap-2 md:hidden">
           <LangSelect />
+          <Link to="/akun" data-testid="mobile-account" className="flex h-10 w-10 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#2C1E16]"><User size={18} /></Link>
           <CartBtn />
           <button className="p-2 text-[#2C1E16]" onClick={() => setOpen(!open)} data-testid="mobile-menu-toggle">{open ? <X size={24} /> : <Menu size={24} />}</button>
         </div>

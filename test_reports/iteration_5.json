@@ -1,0 +1,42 @@
+{
+  "summary": "V4 QA pass completed: 21/21 backend pytest cases in /app/backend/tests/test_v4_features.py PASS covering delete-order (owner success, 404 on missing/re-delete, revenue reversal on paid delete, manual finance survives), sub-admin without delete_data → 403 server-side, customer register/login/logout (JWT customer cookie, dupe phone rejected, wrong pw 401), guest checkout still works, logged-in order attaches customer_id + shows in /customer/orders, referral auto-code on register, self-referral blocked (400), referral requires login (401 for guest), referral snapshot on order, referral vs discount mutual exclusion (referral wins, promo discount zeroed), referral points awarded ONLY when paid + idempotent on repeat lunas, points reversed on delete, disabling referral code preserves earned points, points redemption capped at 50% of subtotal (default point_redeem_max_pct) and balance never negative, finance /admin/finance/monthly returns 12 months and reflects new paid orders, cross-customer order isolation via /customer/orders. Frontend Playwright verified: owner sees delete-order-{n} in list AND delete-order in detail; sub-admin (no delete_data) has both hidden AND direct fetch DELETE returns 403; /admin/finance renders 4 recharts wrappers (Pendapatan & Laba Bulanan chart visible with empty-data safe render); /akun page has data-testid login-identifier, cust-password, cust-submit, toggle-mode → reg-username, reg-phone.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/orders/{order_id}", "issue": "Public unauthenticated endpoint returns full order details by ID for ANY caller who knows the ObjectId. Not a V4 regression (pre-existing) but with V4 customer isolation feature it becomes a data-privacy concern. Consider requiring customer JWT for orders that have customer_id, or scope to short-lived order_number token."},
+      {"endpoint": "PATCH /api/admin/orders/{id} un-pay", "issue": "When un-paying (belum_dibayar/dp), reverse_referral_points also refunds redeemed points to buyer. If admin later re-marks lunas, redeem is NOT re-charged (buyer keeps refund AND still gets order at redeemed total). Consider re-charging or blocking un-pay when points_redeemed_le>0."},
+      {"endpoint": "reverse_referral_points", "issue": "Refunds points_redeemed_le with $inc points_available:+redeemed and $inc points_redeemed:-redeemed. If buyer already spent those points on another order in between, points_available could reasonably still be positive but points_redeemed lifetime counter goes negative. Cosmetic."},
+      {"endpoint": "/api/admin/referrals/{rid}", "issue": "Only manage_settings-gated. No dedicated permission for referral program management — any admin with manage_settings can mutate referral discount_percentage/points_per_order affecting all customer codes. Acceptable per spec but note."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v4_features.py",
+    "/app/test_reports/pytest/v4_results.xml"
+  ],
+  "action_items": [
+    "(Optional, security) Restrict GET /api/orders/{id} — currently public; combine with customer JWT or use unguessable order token when customer_id is set.",
+    "(Optional) In PATCH un-pay flow: either block un-pay when points_redeemed_le>0, or re-charge redeemed points on subsequent re-lunas so buyers can’t double-benefit.",
+    "(Optional) Enforce max_total_points cap in award_referral_points partially instead of skipping the whole award when it would overflow (currently silently skips — no UI feedback)."
+  ],
+  "critical_code_review_comments": [
+    "server.py now 1743 lines — long overdue to split into routers (auth, customers, orders, admin_orders, products, finance, referral, points).",
+    "record_order_revenue guards against duplicate revenue via find_one on related_order_id+type=order_revenue → correctly idempotent; delete uses delete_many which is safe.",
+    "award_referral_points is idempotent via existing 'earn' point_transaction lookup; reverse_referral_points inserts a 'reverse' txn AND deletes the 'earn' — this is fine but means a re-award after reverse would fire (order re-marked lunas post-reverse). Verify intended: yes, reverse deletes earn so next lunas can re-award. Currently no state guards against toggling lunas repeatedly to farm points, but per-order idempotency between reverse→re-award still gates one award per state cycle (acceptable).",
+    "validate_referral end_date+'T23:59:59' concat assumes date-only string; same issue flagged in V3 for discounts. Consider strict parsing.",
+    "Customer cookies use samesite=none;secure=true (correct for cross-site preview) but there is no server-side JWT revocation — logout only clears cookie client-side; stolen token remains valid until 30-day expiry.",
+    "point_redeem cap uses subtotal_le (before discount); when a referral discount also applies, effective % of paid subtotal can exceed intended max_pct — matches spec that redemption caps by subtotal not total, but worth documenting."
+  ],
+  "updated_files": ["/app/backend/tests/test_v4_features.py (new)"],
+  "success_rate": {"backend": "100% (21/21 V4)", "frontend": "100% of tested V4 flows"},
+  "test_credentials": "Owner: syahid.mujahid02@gmail.com / 0LFOCWU9_V3k. Test sub-admins and test customers created and cleaned up via API within each test class.",
+  "seed_data_creation": "All created test orders (customer_name starting TEST_), sub-admins, and manual finance txns are removed by inline test cleanup + test_zzz_cleanup at end. Verified via post-run scans of /admin/orders and /admin/admins.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "V4 test file: /app/backend/tests/test_v4_features.py — real pytest, 21 passing. Key seed pattern: register_customer uses unique username+phone with UNIQUE stamp; referral flow requires TWO customers (owner earns points, buyer places). To give BUYER points for redemption test, register a third party that uses BUYER's referral code and mark that order lunas. Frontend testids of interest: delete-order-{order_number} on /admin/orders list, delete-order on /admin/orders/{id} detail, /akun login uses login-identifier + cust-password + cust-submit + toggle-mode, register mode adds reg-username + reg-phone. /admin/finance charts confirmed rendering with recharts. GET /api/orders/{id} is intentionally public — do NOT assert 403 on that endpoint for isolation tests; use /api/customer/orders instead. Ignore legacy /app/backend/tests/backend_test.py (stale pre-migration assert).",
+  "rca of the issue": "N/A — no regressions found."
+}
