@@ -82,12 +82,24 @@ export default function AdminOrderDetail() {
         <Block title="Rincian Harga">
           <Row k="Subtotal Produk" v={`${fmtLE(order.subtotal_le)} LE`} />
           {order.discount_le > 0 && <Row k={`Diskon${order.discount_code ? ` (${order.discount_code})` : ""}`} v={`-${fmtLE(order.discount_le)} LE`} />}
+          {order.referral_discount_le > 0 && <Row k={`Diskon Referral${order.referral?.code ? ` (${order.referral.code})` : ""}`} v={`-${fmtLE(order.referral_discount_le)} LE`} />}
+          {order.points_redeemed_le > 0 && <Row k="Penukaran Poin" v={`-${fmtLE(order.points_redeemed_le)} LE`} />}
           <Row k="Ongkir" v={`${fmtLE(order.delivery_fee_le)} LE`} />
           <div className="my-1 border-t border-dashed border-[#E5DCC5]" />
           <Row k="Total LE" v={<span className="font-bold text-[#8B5A2B]">{fmtLE(order.total_le)} LE</span>} />
           <Row k="Rate" v={`Rp${fmtLE(order.exchange_rate_idr_per_le)}/LE`} />
           <Row k="Estimasi IDR" v={fmtIDR(order.estimated_total_idr)} />
         </Block>
+
+        {order.referral && (
+          <Block title="Promo & Referral">
+            <Row k="Kode Referral" v={order.referral.code} />
+            <Row k="Referral Owner" v={order.referral.owner_name || "-"} />
+            <Row k="Persentase Diskon" v={`${fmtLE(order.referral.percentage)}%`} />
+            <Row k="Jumlah Diskon" v={`${fmtLE(order.referral_discount_le)} LE`} />
+            <Row k="Poin untuk Referrer" v={`${fmtLE(order.referral.points_per_order)} poin`} />
+          </Block>
+        )}
 
         <Block title="Pembayaran & Pengiriman">
           <Row k="Metode Bayar" v={order.payment_method === "transfer" ? "Transfer" : "Cash"} />

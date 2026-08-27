@@ -5,8 +5,9 @@ import { fmtLE } from "../../lib/format";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../../lib/constants";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
+import { Input } from "../../components/ui/input";
 import { useAuth } from "../../context/AuthContext";
-import { Trash2 } from "lucide-react";
+import { Trash2, Search } from "lucide-react";
 import { toast } from "sonner";
 
 export default function AdminOrders() {
@@ -14,6 +15,8 @@ export default function AdminOrders() {
   const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [appliedQ, setAppliedQ] = useState("");
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const status = params.get("status");
@@ -24,8 +27,9 @@ export default function AdminOrders() {
     const q = {};
     if (status) q.status = status;
     if (payment) q.payment_status = payment;
+    if (appliedQ) q.q = appliedQ;
     api.get("/admin/orders", { params: q }).then((r) => setOrders(r.data)).finally(() => setLoading(false));
-  }, [status, payment]);
+  }, [status, payment, appliedQ]);
 
   const activeFilter = status ? ORDER_STATUS[status]?.label : payment ? PAYMENT_STATUS[payment]?.label : null;
 
@@ -46,6 +50,16 @@ export default function AdminOrders() {
           <p className="mt-1 text-sm text-[#8B7355]">{orders.length} pesanan{activeFilter ? ` · Filter: ${activeFilter}` : ""}</p>
         </div>
         {activeFilter && <Button variant="outline" onClick={() => setParams({})} data-testid="clear-filter" className="rounded-xl border-[#8B5A2B] text-[#8B5A2B]">Hapus Filter</Button>}
+      </div>
+
+      <div className="mt-4 flex max-w-md gap-2">
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#8B7355]" />
+          <Input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && setAppliedQ(search.trim())}
+            placeholder="Cari No. Pesanan, nama, HP, produk, username, kode referral..." data-testid="order-search" className="bg-white pl-9" />
+        </div>
+        <Button onClick={() => setAppliedQ(search.trim())} data-testid="order-search-btn" className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Cari</Button>
+        {appliedQ && <Button variant="outline" onClick={() => { setSearch(""); setAppliedQ(""); }} data-testid="order-search-clear" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]">Reset</Button>}
       </div>
 
       {loading ? <div className="mt-8 text-[#8B7355]">Memuat...</div> : orders.length === 0 ? (

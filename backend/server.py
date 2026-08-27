@@ -164,6 +164,8 @@ async def get_optional_customer(request: Request):
         if payload.get("type") != "customer":
             return None
         c = await db.customers.find_one({"_id": oid(payload["sub"])})
+        if c and c.get("active") is False:
+            return None
         return c
     except jwt.InvalidTokenError:
         return None
@@ -745,7 +747,17 @@ def build_whatsapp_message(order):
         lines.append(f"Zona: {order.get('delivery_zone_name', '-')}")
     else:
         lines.append("Pengiriman: Ambil di Toko")
-    lines += ["", "Estimasi total:", f"{fmt_le(order['total_le'])} LE (≈ {fmt_idr(order['estimated_total_idr'])})",
+    lines += ["", "Rincian Harga:", f"Subtotal: {fmt_le(_num(order.get('subtotal_le')))} LE"]
+    if _num(order.get("discount_le")) > 0:
+        _dc = order.get("discount_code")
+        lines.append(f"Diskon{f' ({_dc})' if _dc else ''}: -{fmt_le(_num(order['discount_le']))} LE")
+    if _num(order.get("referral_discount_le")) > 0:
+        _rc = (order.get("referral") or {}).get("code")
+        lines.append(f"Diskon Referral{f' ({_rc})' if _rc else ''}: -{fmt_le(_num(order['referral_discount_le']))} LE")
+    if _num(order.get("points_redeemed_le")) > 0:
+        lines.append(f"Penukaran Poin: -{fmt_le(_num(order['points_redeemed_le']))} LE")
+    lines += [f"Ongkir: {fmt_le(_num(order.get('delivery_fee_le')))} LE",
+              f"Total: {fmt_le(order['total_le'])} LE (≈ {fmt_idr(order['estimated_total_idr'])})",
               f"Rate: Rp{fmt_le(order['exchange_rate_idr_per_le'])}/LE", "",
               f"Nama: {order['customer_name']}", f"No. HP: {order['customer_phone']}", f"Alamat: {order['customer_address']}"]
     if order.get("customer_maps_url"):
@@ -772,12 +784,16 @@ async def get_order_public(order_id: str):
 # --------------------------------------------------------------------------
 @api_router.get("/admin/orders")
 async def admin_list_orders(status: Optional[str] = None, payment_status: Optional[str] = None,
-                            admin: dict = Depends(require_perm("manage_orders"))):
+                            q: Optional[str] = None, admin: dict = Depends(require_perm("manage_orders"))):
     query = {}
     if status:
         query["order_status"] = status
     if payment_status:
         query["payment_status"] = payment_status
+    if q and q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [{"order_number": rx}, {"customer_name": rx}, {"customer_phone": rx},
+                        {"customer_username": rx}, {"items.product_name_snapshot": rx}, {"referral.code": rx}]
     orders = await db.orders.find(query).sort("created_at", -1).to_list(2000)
     return [clean(o) for o in orders]
 
@@ -1468,7 +1484,7 @@ async def customer_register(data: CustomerRegister, response: Response):
         raise HTTPException(status_code=400, detail="Username sudah digunakan")
     now = datetime.now(timezone.utc).isoformat()
     doc = {"username": data.username.strip(), "phone": phone, "email": (data.email or "").strip(),
-           "password_hash": hash_password(data.password), "created_at": now, "last_login": now,
+           "password_hash": hash_password(data.password), "created_at": now, "last_login": now, "active": True,
            "referral_code": gen_referral_code(data.username), "points_available": 0.0, "points_earned": 0.0, "points_redeemed": 0.0}
     r = await db.customers.insert_one(doc)
     cid = str(r.inserted_id)
@@ -1485,6 +1501,8 @@ async def customer_login(data: CustomerLogin, response: Response):
     c = await db.customers.find_one({"$or": [{"phone": normalize_phone(ident)}, {"username": ident}]})
     if not c or not verify_password(data.password, c["password_hash"]):
         raise HTTPException(status_code=401, detail="Kredensial salah")
+    if c.get("active") is False:
+        raise HTTPException(status_code=403, detail="Akun dinonaktifkan. Silakan hubungi admin.")
     await db.customers.update_one({"_id": c["_id"]}, {"$set": {"last_login": datetime.now(timezone.utc).isoformat()}})
     response.set_cookie("customer_token", create_customer_token(str(c["_id"])), httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
     return clean_customer(c)
@@ -1588,6 +1606,16 @@ async def admin_customer_detail(cid: str, admin: dict = Depends(require_perm("ma
     orders = await db.orders.find({"customer_id": cid}).sort("created_at", -1).to_list(500)
     txns = await db.point_transactions.find({"customer_id": cid}).sort("created_at", -1).to_list(500)
     return {"customer": clean_customer(c), "orders": [clean(o) for o in orders], "point_transactions": [clean(t) for t in txns]}
+
+@api_router.patch("/admin/customers/{cid}")
+async def admin_update_customer(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_owner())):
+    c = await db.customers.find_one({"_id": oid(cid)})
+    if not c:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+    if "active" not in payload:
+        raise HTTPException(status_code=400, detail="Tidak ada perubahan")
+    await db.customers.update_one({"_id": oid(cid)}, {"$set": {"active": bool(payload["active"])}})
+    return clean_customer(await db.customers.find_one({"_id": oid(cid)}))
 
 @api_router.post("/admin/customers/{cid}/adjust-points")
 async def admin_adjust_points(cid: str, data: PointAdjustInput, admin: dict = Depends(require_owner())):

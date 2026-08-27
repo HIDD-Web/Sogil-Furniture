@@ -18,6 +18,12 @@ export default function AdminCustomers() {
   const load = () => api.get("/admin/customers", { params: q ? { q } : {} }).then((r) => setList(r.data));
   useEffect(() => { load(); }, []);
   const open = (c) => api.get(`/admin/customers/${c.id}`).then((r) => setDetail(r.data));
+  const toggleActive = async () => {
+    const cur = detail.customer.active !== false;
+    if (!window.confirm(cur ? `Nonaktifkan akun ${detail.customer.username}? Mereka tidak bisa login, tetapi riwayat pesanan, keuangan, dan referral tetap utuh.` : `Aktifkan kembali akun ${detail.customer.username}?`)) return;
+    try { await api.patch(`/admin/customers/${detail.customer.id}`, { active: !cur }); toast.success(cur ? "Akun dinonaktifkan" : "Akun diaktifkan"); open({ id: detail.customer.id }); load(); }
+    catch (e) { toast.error(e.response?.data?.detail || "Gagal"); }
+  };
   const doAdjust = async () => {
     if (!adj.amount || !adj.reason) return toast.error("Isi jumlah & alasan");
     try { await api.post(`/admin/customers/${detail.customer.id}/adjust-points`, { amount: Number(adj.amount), reason: adj.reason }); toast.success("Poin disesuaikan"); setAdj({ amount: "", reason: "" }); open({ id: detail.customer.id }); }
@@ -48,9 +54,15 @@ export default function AdminCustomers() {
 
         {detail && (
           <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="customer-detail">
-            <div className="font-heading text-lg font-bold text-[#2C1E16]">{detail.customer.username}</div>
+            <div className="flex items-center justify-between">
+              <div className="font-heading text-lg font-bold text-[#2C1E16]">{detail.customer.username}</div>
+              <span data-testid="customer-status" className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${detail.customer.active !== false ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>{detail.customer.active !== false ? "Aktif" : "Nonaktif"}</span>
+            </div>
             <div className="text-sm text-[#8B7355]">{detail.customer.phone} · Kode: {detail.customer.referral_code}</div>
             <div className="mt-2 flex gap-4 text-sm"><span>Poin: <b className="text-[#8B5A2B]">{fmtLE(detail.customer.points_available)}</b></span><span>Order: <b>{detail.orders.length}</b></span></div>
+            {isOwner && (
+              <Button variant="outline" onClick={toggleActive} data-testid="toggle-customer-active" className={`mt-3 rounded-xl ${detail.customer.active !== false ? "border-red-300 text-red-600 hover:bg-red-50" : "border-green-300 text-green-700 hover:bg-green-50"}`}>{detail.customer.active !== false ? "Nonaktifkan Akun" : "Aktifkan Akun"}</Button>
+            )}
             {isOwner && (
               <div className="mt-3 rounded-xl bg-[#FBF9F4] p-3">
                 <div className="mb-2 text-xs font-semibold text-[#8B5A2B]">Sesuaikan Poin (Owner)</div>

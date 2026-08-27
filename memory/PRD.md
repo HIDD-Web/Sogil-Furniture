@@ -57,5 +57,14 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - Admin Customers page (search, detail, order/point history, owner-only manual point adjustment with audit).
 - Tests: /app/backend/tests/test_v4_features.py — 21/21 pass (executed 2026-06, iteration_5.json). Frontend Playwright verified: owner sees delete-order button (list+detail), sub-admin without delete_data has it hidden AND gets 403 server-side; finance recharts render (empty-data safe); customer register/login/history; checkout referral+points. NO regressions found. QA COMPLETE — safe for final production testing.
 
+### v5 — done (2026-06)
+- Order price breakdown now consistent across ALL surfaces (Admin Order Detail, customer Saved-Order confirmation, WhatsApp message) — all read the SAME immutable order snapshot (subtotal_le, discount_le, referral_discount_le, points_redeemed_le, delivery_fee_le, total_le, rate, estimated_idr). Root cause of reported inconsistency: AdminOrderDetail never rendered referral_discount_le, so subtotal+ongkir != total on screen for referral orders.
+- Admin Order Detail: added Diskon Referral + Penukaran Poin rows and a "Promo & Referral" section (code/owner/percentage/amount/points) shown only when a referral was used. Historical orders never recompute from current config.
+- WhatsApp message (server-generated) now includes full "Rincian Harga:" breakdown — single authoritative source, no separate WhatsApp calc.
+- Customer confirmation page: full breakdown (per-item, subtotal, discount/referral, points, ongkir, total, rate, IDR).
+- Admin Order search: GET /api/admin/orders?q= matches order_number/customer_name/phone/username/product name/referral code; combines with status+payment filters.
+- Customer deactivation (owner-only PATCH /api/admin/customers/{cid} {active}): deactivated customers get 403 on login and lose session access; historical orders, finance, and referral records remain fully intact (soft deactivate, no destructive delete). Admin Pelanggan shows status badge + toggle.
+- Tests: /app/backend/tests/test_v5_features.py — 16/16 pass (iteration_6.json). Scenarios A–L all PASS.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

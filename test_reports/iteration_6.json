@@ -1,0 +1,54 @@
+{
+  "summary": "V5 QA: 16/16 backend pytest cases in /app/backend/tests/test_v5_features.py PASS covering (A) order total math with no discount, (B) with promo code, (C) with referral, (D) referral + points redemption; whatsapp_message 'Rincian Harga:' breakdown consistency between order create response, public GET /api/orders/{id} (confirmation), and admin GET /api/admin/orders/{id} — all reading the same immutable snapshot; admin order search across all 6 fields (order_number, customer_name, customer_phone, customer_username, items.product_name_snapshot, referral.code) plus combined with status + payment_status filters; PATCH /api/admin/customers/{cid} owner-only (403 for manager sub-admin), deactivation blocks POST /api/customer/login with 403 'Akun dinonaktifkan', reactivation restores login, and historical orders + finance monthly + customer detail orders survive deactivation intact. Frontend Playwright verified: /admin/orders shows data-testid order-search, order-search-btn, order-search-clear (visible after search); AdminOrderDetail Rincian Harga contains Subtotal Produk / Ongkir / Total LE / Rate / Estimasi IDR labels; /admin/customers detail shows data-testid customer-status='Aktif' and toggle-customer-active button.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/customer/register", "issue": "No admin-side hard-delete for customers (only deactivate). Test seed customers accumulate across runs. Consider adding DELETE /api/admin/customers/{cid} (owner-only, cascade check) for cleanup."},
+      {"endpoint": "GET /api/orders/{order_id}", "issue": "(carried over from V4) Public endpoint returns full snapshot including referral/customer_username by ObjectId — acceptable for confirmation reuse but note data-privacy for known-ID probe."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v5_features.py",
+    "/app/test_reports/pytest/v5_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Add DELETE /api/admin/customers/{cid} for owner cleanup — pytest cannot currently purge test customers.",
+    "(Optional) Add index on orders.items.product_name_snapshot / orders.referral.code / orders.customer_username to keep the new $or regex search performant as order volume grows."
+  ],
+  "critical_code_review_comments": [
+    "server.py grew from 1743 to 1770 lines; splitting into routers (auth, customers, orders, admin_orders, referral, points, finance) is overdue.",
+    "admin_list_orders builds $or with re.escape — good (regex-injection safe). If perf becomes a concern, switch to $text index across the same fields.",
+    "customer_login checks active AFTER password verify — leaks 'account exists but disabled' via error text. Consider generic 401 for both, or check active before verify (fine as-is per spec).",
+    "get_optional_customer treats inactive customer as anonymous (returns None). Correct: prevents inactive user from placing orders as themselves via still-valid cookie.",
+    "PATCH /api/admin/customers/{cid} silently ignores fields other than 'active'. If future edits (username/email) are added, must whitelist inputs to avoid mass-assignment.",
+    "Admin order detail 'Rincian Harga' displays order.referral_discount_le direct from snapshot — historical orders correctly do NOT recompute (verified: total math reconciles for old and new orders)."
+  ],
+  "updated_files": ["/app/backend/tests/test_v5_features.py (new)"],
+  "success_rate": {"backend": "100% (16/16 V5)", "frontend": "100% of tested V5 UI selectors present and functional"},
+  "test_credentials": "Owner: syahid.mujahid02@gmail.com / 0LFOCWU9_V3k. Test customers register under TEST{V5<epoch>}<suffix>, test orders under TEST_{V5<epoch>}_*.",
+  "seed_data_creation": "Test orders auto-cleaned via TestZzzCleanup. Test customers remain in /admin/customers (no delete endpoint — see minor issues). Test sub-admin created & deleted inline.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "V5 test file uses UNIQUE=V5<epoch> for username AND PHONE_STAMP for phone (both must be unique across runs to avoid 400 'No HP sudah terdaftar'). Run with `pytest -n 0 backend/tests/test_v5_features.py` — the loadscope xdist default splits classes to different workers, and TestZzzCleanup running in parallel with TestOrderTotalMath race-deletes the seed order that scenario D depends on (points get reversed mid-test). Frontend testids of interest: order-search, order-search-btn, order-search-clear on /admin/orders; customer-status (Aktif|Nonaktif) + toggle-customer-active on /admin/customers/{cid}; order-breakdown / conf-discount / conf-referral-discount on /order/{id} confirmation. Admin Order Detail 'Rincian Harga' block renders Subtotal Produk / (Diskon | Diskon Referral) / Penukaran Poin / Ongkir / Total LE / Rate / Estimasi IDR, and 'Promo & Referral' block only when order.referral snapshot exists.",
+  "scenarios_pass_fail": {
+    "A_no_discount_math": "PASS",
+    "B_promo_math": "PASS",
+    "C_referral_math": "PASS",
+    "D_referral_plus_points_math": "PASS",
+    "E_whatsapp_contains_rincian": "PASS",
+    "F_confirmation_matches_admin_matches_whatsapp": "PASS",
+    "G_search_by_order_number": "PASS",
+    "H_search_by_name_phone_product_username_referralcode": "PASS",
+    "I_search_combined_with_status_payment_filter": "PASS",
+    "J_deactivate_blocks_login_403": "PASS",
+    "K_reactivate_restores_login": "PASS",
+    "L_non_owner_patch_customer_403": "PASS",
+    "integrity_orders_finance_referral_survive_deactivation": "PASS"
+  },
+  "rca of the issue": "Original root cause (reported by main agent): AdminOrderDetail.jsx never rendered referral_discount_le row, so on-screen subtotal + ongkir did not equal displayed total for referral orders. Fix confirmed present at /app/frontend/src/pages/admin/AdminOrderDetail.jsx L82-92 (Rincian Harga block includes conditional 'Diskon Referral' row on order.referral_discount_le > 0) and L94-102 (Promo & Referral block only renders when order.referral truthy). Backend build_whatsapp_message (server.py L733-770) emits matching 'Rincian Harga:' section, and OrderConfirmation.jsx L41-50 renders same snapshot fields — all three surfaces (admin detail, customer confirmation, whatsapp) now consume the immutable order snapshot fields (subtotal_le, discount_le, referral_discount_le, points_redeemed_le, delivery_fee_le, total_le, exchange_rate_idr_per_le, estimated_total_idr) stored at order create time in server.py L674-692, guaranteeing consistency across surfaces AND across historical orders (no recompute)."
+}

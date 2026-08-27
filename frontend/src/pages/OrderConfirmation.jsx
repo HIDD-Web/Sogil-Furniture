@@ -38,10 +38,15 @@ export default function OrderConfirmation() {
         <p className="mt-1 text-sm text-[#5C4A3D]">{t("conf.nomor")}</p>
         <div className="mt-1 font-heading text-2xl font-bold tracking-tight text-[#8B5A2B]" data-testid="order-number">{order.order_number}</div>
 
-        <div className="mt-6 space-y-2 rounded-xl bg-[#EFE6D5] p-4 text-left">
+        <div className="mt-6 space-y-1.5 rounded-xl bg-[#EFE6D5] p-4 text-left" data-testid="order-breakdown">
           {items.map((it, i) => it && (
-            <div key={i} className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{it.product_name_snapshot} ×{it.quantity}</span></div>
+            <div key={i} className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{it.product_name_snapshot} ×{it.quantity}</span><span className="font-medium text-[#2C1E16]">{fmtLE(it.subtotal_le)} LE</span></div>
           ))}
+          <div className="flex justify-between border-t border-dashed border-[#D8C9AD] pt-2 text-sm"><span className="text-[#5C4A3D]">Subtotal</span><span className="font-medium text-[#2C1E16]">{fmtLE(order.subtotal_le)} LE</span></div>
+          {order.discount_le > 0 && <div className="flex justify-between text-sm text-green-700" data-testid="conf-discount"><span>Diskon{order.discount_code ? ` (${order.discount_code})` : ""}</span><span>-{fmtLE(order.discount_le)} LE</span></div>}
+          {order.referral_discount_le > 0 && <div className="flex justify-between text-sm text-green-700" data-testid="conf-referral-discount"><span>Diskon Referral{order.referral?.code ? ` (${order.referral.code})` : ""}</span><span>-{fmtLE(order.referral_discount_le)} LE</span></div>}
+          {order.points_redeemed_le > 0 && <div className="flex justify-between text-sm text-green-700"><span>Penukaran Poin</span><span>-{fmtLE(order.points_redeemed_le)} LE</span></div>}
+          <div className="flex justify-between text-sm"><span className="text-[#5C4A3D]">Ongkir</span><span className="font-medium text-[#2C1E16]">{fmtLE(order.delivery_fee_le)} LE</span></div>
           <div className="flex justify-between border-t border-dashed border-[#D8C9AD] pt-2"><span className="text-sm text-[#5C4A3D]">{t("conf.estimasi_total")}</span>
             <span className="text-right"><span className="block font-heading text-lg font-bold text-[#8B5A2B]">{fmtLE(order.total_le)} LE</span><span className="block text-xs text-[#8B7355]">≈ {fmtIDR(order.estimated_total_idr)} · Rp{fmtLE(order.exchange_rate_idr_per_le)}/LE</span></span>
           </div>
