@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import api, { imgUrl } from "../../lib/api";
 import { formatApiError } from "../../lib/format";
 import { CATEGORY_LABELS } from "../../lib/constants";
+import { config_summary_client } from "../../lib/summary";
 import { ProductImage } from "../../components/ProductImage";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
@@ -24,6 +25,7 @@ export default function AdminProductEdit() {
   const navigate = useNavigate();
   const [p, setP] = useState(null);
   const [pricingText, setPricingText] = useState("{}");
+  const [coverPreview, setCoverPreview] = useState(null);
   const fileRef = useRef();
   const coverRef = useRef();
   const photoRefs = useRef({});
@@ -34,6 +36,11 @@ export default function AdminProductEdit() {
       if (prod) { prod.photos = prod.photos || []; setP(prod); setPricingText(JSON.stringify(prod.pricing || {}, null, 2)); }
     });
   }, [id]);
+
+  useEffect(() => {
+    if (p?.cover_mode === "auto") api.get(`/admin/products/${id}/cover-preview`).then((r) => setCoverPreview(r.data)).catch(() => setCoverPreview(null));
+    else setCoverPreview(null);
+  }, [p?.cover_mode, id]);
 
   const setField = (k, v) => setP((prev) => ({ ...prev, [k]: v }));
   const setBasePrice = (key, val) => setP((prev) => ({ ...prev, pricing: { ...prev.pricing, base_prices: { ...prev.pricing.base_prices, [key]: Number(val) || 0 } } }));
@@ -111,6 +118,25 @@ export default function AdminProductEdit() {
               <SelectContent><SelectItem value="manual">Manual (gambar di atas)</SelectItem><SelectItem value="auto">Otomatis (konfigurasi terlaris)</SelectItem></SelectContent>
             </Select>
           </div>
+          {p.cover_mode === "auto" && (
+            <div className="mt-3 rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] p-3" data-testid="cover-auto-preview">
+              <div className="text-xs font-semibold text-[#8B5A2B]">Pratinjau Cover Otomatis</div>
+              {coverPreview?.selected ? (
+                <div className="mt-2 flex items-center gap-3">
+                  <div className="h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-[#E5DCC5] bg-white">
+                    {coverPreview.selected.image ? <img src={imgUrl(coverPreview.selected.image)} alt="" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-[10px] text-[#8B7355]">Tanpa foto</div>}
+                  </div>
+                  <div className="text-xs text-[#5C4A3D]">
+                    <div className="font-medium text-[#2C1E16]">{p.name} — {config_summary_client(p.category, coverPreview.selected.config) || "Konfigurasi"}</div>
+                    <div className="mt-0.5 text-[#8B7355]">Berdasarkan {coverPreview.selected.count} unit dipesan (konfigurasi terlaris)</div>
+                    {!coverPreview.selected.image && <div className="mt-0.5 text-amber-600">Belum ada foto konfigurasi yang cocok — cover katalog akan kosong sampai foto ditambahkan.</div>}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-2 text-xs text-[#8B7355]">Belum ada pesanan untuk kategori ini, jadi belum ada konfigurasi terlaris yang bisa dipilih.</div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Photo manager */}

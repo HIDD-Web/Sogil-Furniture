@@ -171,8 +171,8 @@ class TestBreakdownConsistency:
         created = r.json()
         oid_ = created["id"]
 
-        # public GET (used by /order/{id} confirmation)
-        conf = requests.get(f"{API}/orders/{oid_}").json()
+        # public GET (used by /order/{id} confirmation) — buyer is logged in so use their session
+        conf = buyer_s.get(f"{API}/orders/{oid_}").json()
         assert conf["total_le"] == created["total_le"]
         assert conf["referral_discount_le"] == created["referral_discount_le"]
         assert conf["subtotal_le"] == created["subtotal_le"]

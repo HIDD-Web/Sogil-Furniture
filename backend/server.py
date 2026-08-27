@@ -493,6 +493,30 @@ async def auto_category_cover(product):
                 return url
     return ""
 
+async def auto_category_cover_detail(product):
+    """Preview details for automatic category cover: winning config, order count, matched image."""
+    category = product.get("category")
+    agg = {}
+    async for o in db.orders.find({"order_status": {"$ne": "dibatalkan"}}):
+        for it in o.get("items", [o.get("item")]):
+            if not it or it.get("category") != category:
+                continue
+            cfg = it.get("configuration_snapshot", {}) or {}
+            key = tuple(sorted((k, str(v)) for k, v in cfg.items() if k != "custom_note"))
+            agg[key] = agg.get(key, {"count": 0, "cfg": cfg})
+            agg[key]["count"] += int(it.get("quantity", 1))
+    ordered = sorted(agg.items(), key=lambda x: x[1]["count"], reverse=True)
+    for _, e in ordered:
+        m = match_photo(product, e["cfg"])
+        ph = m.get("photo")
+        if ph:
+            url = ph.get("main_url") or ph.get("front_url") or ph.get("side_url")
+            if url:
+                return {"config": e["cfg"], "count": e["count"], "image": url}
+    if ordered:
+        return {"config": ordered[0][1]["cfg"], "count": ordered[0][1]["count"], "image": ""}
+    return None
+
 async def resolve_display_photo(product):
     """Category COVER image only. Never falls back to a specific config photo (except in auto mode)."""
     if product.get("cover_mode") == "auto":
@@ -511,6 +535,17 @@ async def list_products(admin_view: bool = False):
         c["display_image"] = await resolve_display_photo(c)
         out.append(c)
     return out
+
+@api_router.get("/admin/products/{product_id}/cover-preview")
+async def admin_cover_preview(product_id: str, admin: dict = Depends(get_current_admin)):
+    product = await db.products.find_one({"_id": oid(product_id)})
+    if not product:
+        raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
+    product = clean(product)
+    mode = product.get("cover_mode", "manual")
+    selected = await auto_category_cover_detail(product) if mode == "auto" else None
+    return {"cover_mode": mode, "category_cover_image": product.get("category_cover_image", ""),
+            "resolved_image": await resolve_display_photo(product), "selected": selected}
 
 @api_router.get("/products/{slug}")
 async def get_product(slug: str):
@@ -770,10 +805,17 @@ def build_whatsapp_message(order):
     return "\n".join(lines)
 
 @api_router.get("/orders/{order_id}")
-async def get_order_public(order_id: str):
+async def get_order_public(order_id: str, request: Request):
     order = await db.orders.find_one({"_id": oid(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    # Orders tied to a customer account are private to that customer.
+    # Guest orders (no customer_id) stay accessible by ID for checkout confirmation.
+    # Admins/Owner use the RBAC-gated /admin/orders endpoints.
+    if order.get("customer_id"):
+        buyer = await get_optional_customer(request)
+        if not buyer or str(buyer["_id"]) != str(order["customer_id"]):
+            raise HTTPException(status_code=403, detail="Tidak diizinkan mengakses pesanan ini")
     order = clean(order)
     order["whatsapp_message"] = build_whatsapp_message(order)
     order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
@@ -1617,6 +1659,25 @@ async def admin_update_customer(cid: str, payload: Dict[str, Any], admin: dict =
     await db.customers.update_one({"_id": oid(cid)}, {"$set": {"active": bool(payload["active"])}})
     return clean_customer(await db.customers.find_one({"_id": oid(cid)}))
 
+@api_router.delete("/admin/customers/{cid}")
+async def admin_delete_customer(cid: str, admin: dict = Depends(require_owner())):
+    c = await db.customers.find_one({"_id": oid(cid)})
+    if not c:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+    # Block permanent deletion when there is meaningful business history to preserve.
+    has_orders = await db.orders.find_one({"customer_id": cid})
+    referred_others = await db.orders.find_one({"referral.owner_id": cid})
+    has_points_history = await db.point_transactions.find_one({"customer_id": cid})
+    ref = await db.referrals.find_one({"customer_id": cid})
+    ref_active_history = bool(ref and (_num(ref.get("claims", 0)) > 0 or _num(ref.get("points_awarded", 0)) > 0 or _num(ref.get("reward_orders", 0)) > 0))
+    if has_orders or referred_others or has_points_history or ref_active_history or _num(c.get("points_available")) > 0 or _num(c.get("points_earned")) > 0:
+        raise HTTPException(status_code=400, detail="Pelanggan memiliki riwayat bisnis (pesanan/keuangan/referral/poin). Gunakan Nonaktifkan Akun agar riwayat tetap utuh.")
+    # Safe to hard-delete: no business history. Remove account + its unused referral code.
+    await db.customers.delete_one({"_id": oid(cid)})
+    if ref:
+        await db.referrals.delete_one({"_id": ref["_id"]})
+    return {"ok": True, "deleted": True}
+
 @api_router.post("/admin/customers/{cid}/adjust-points")
 async def admin_adjust_points(cid: str, data: PointAdjustInput, admin: dict = Depends(require_owner())):
     c = await db.customers.find_one({"_id": oid(cid)})
@@ -1659,6 +1720,16 @@ async def seed():
 
     await db.admins.create_index("email", unique=True)
     await db.products.create_index("slug", unique=True)
+    # Focused indexes to keep order/customer queries responsive as data grows.
+    for spec in ["customer_id", "order_number", "order_status", "payment_status", "referral.code"]:
+        await db.orders.create_index(spec)
+    await db.orders.create_index([("created_at", -1)])
+    await db.customers.create_index("phone")
+    await db.customers.create_index("username")
+    await db.point_transactions.create_index("customer_id")
+    await db.point_transactions.create_index("order_id")
+    await db.finance_transactions.create_index("related_order_id")
+    await db.referrals.create_index("code")
 
     defaults = {
         "store_name": "Sogil Furniture",

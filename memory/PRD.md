@@ -66,5 +66,14 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - Customer deactivation (owner-only PATCH /api/admin/customers/{cid} {active}): deactivated customers get 403 on login and lose session access; historical orders, finance, and referral records remain fully intact (soft deactivate, no destructive delete). Admin Pelanggan shows status badge + toggle.
 - Tests: /app/backend/tests/test_v5_features.py — 16/16 pass (iteration_6.json). Scenarios A–L all PASS.
 
+### v6 — final production hardening (2026-06)
+- Order privacy: GET /api/orders/{id} now blocks access to customer-linked orders unless the requester is that logged-in customer (403); guest orders (no customer_id) stay publicly retrievable for checkout confirmation. Server-side enforced. Admins use RBAC-gated /admin/orders.
+- Safe permanent customer delete: owner-only DELETE /api/admin/customers/{cid}; blocked (400, recommend deactivate) when the customer has ANY business history (orders as buyer, orders they referred, point_transactions, referral claims/points_awarded/reward_orders, points balance/earned). Only history-free test/spam accounts hard-delete (also removes their unused referral code). Deactivate remains the default safe path.
+- Automatic category-cover preview: GET /api/admin/products/{id}/cover-preview + AdminProductEdit panel (cover-auto-preview) showing the most-ordered config, its order count, and matched image. Does NOT alter weighted similarity matching; cover never used as per-config fallback.
+- DB indexes added at startup for orders (customer_id/order_number/order_status/payment_status/referral.code/created_at), customers (phone/username), point_transactions, finance_transactions, referrals — keeps search responsive.
+- Verified already-satisfying requirements (no change): finance trend charts (period filter, comparison %, balances, cash flow, monthly bar, empty-safe); WebP image optimization (1600px max, quality 82); DB-driven product/config/price/photo/discount/referral/finance/contact data.
+- Decision: customer login stays username/phone/password + optional email; username serves as display name; guest checkout preserved (no breaking required-field change).
+- Tests: /app/backend/tests/test_v6_features.py 13/13 + combined V5+V6 29/29 PASS (iteration_7.json). Production readiness: GREEN.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

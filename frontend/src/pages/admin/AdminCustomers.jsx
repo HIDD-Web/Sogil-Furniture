@@ -24,6 +24,11 @@ export default function AdminCustomers() {
     try { await api.patch(`/admin/customers/${detail.customer.id}`, { active: !cur }); toast.success(cur ? "Akun dinonaktifkan" : "Akun diaktifkan"); open({ id: detail.customer.id }); load(); }
     catch (e) { toast.error(e.response?.data?.detail || "Gagal"); }
   };
+  const permanentDelete = async () => {
+    if (!window.confirm(`HAPUS PERMANEN akun ${detail.customer.username}? Ini hanya untuk akun uji/spam tanpa riwayat bisnis. Tindakan tidak dapat dibatalkan.`)) return;
+    try { await api.delete(`/admin/customers/${detail.customer.id}`); toast.success("Akun dihapus permanen"); setDetail(null); load(); }
+    catch (e) { toast.error(e.response?.data?.detail || "Gagal menghapus"); }
+  };
   const doAdjust = async () => {
     if (!adj.amount || !adj.reason) return toast.error("Isi jumlah & alasan");
     try { await api.post(`/admin/customers/${detail.customer.id}/adjust-points`, { amount: Number(adj.amount), reason: adj.reason }); toast.success("Poin disesuaikan"); setAdj({ amount: "", reason: "" }); open({ id: detail.customer.id }); }
@@ -62,6 +67,9 @@ export default function AdminCustomers() {
             <div className="mt-2 flex gap-4 text-sm"><span>Poin: <b className="text-[#8B5A2B]">{fmtLE(detail.customer.points_available)}</b></span><span>Order: <b>{detail.orders.length}</b></span></div>
             {isOwner && (
               <Button variant="outline" onClick={toggleActive} data-testid="toggle-customer-active" className={`mt-3 rounded-xl ${detail.customer.active !== false ? "border-red-300 text-red-600 hover:bg-red-50" : "border-green-300 text-green-700 hover:bg-green-50"}`}>{detail.customer.active !== false ? "Nonaktifkan Akun" : "Aktifkan Akun"}</Button>
+            )}
+            {isOwner && detail.orders.length === 0 && (
+              <Button variant="ghost" onClick={permanentDelete} data-testid="delete-customer-permanent" className="mt-2 ml-2 rounded-xl text-xs text-red-600 hover:bg-red-50">Hapus Permanen (akun uji/spam)</Button>
             )}
             {isOwner && (
               <div className="mt-3 rounded-xl bg-[#FBF9F4] p-3">
