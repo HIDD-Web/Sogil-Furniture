@@ -95,5 +95,13 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - XLSX exports (openpyxl) at /admin/export: Keuangan, Pesanan, Analitik Konfigurasi, Pelanggan, Akun+Upah (owner-only, 2 sheets), Harga Produk (history+current). RBAC-gated, read-only, NO passwords/hashes/tokens/secrets (verified by openpyxl cell scan). Product price-history recorded forward-only on product edit; historical order prices immutable.
 - Tests: /app/backend/tests/test_v9_features.py 26/26 PASS (iteration_10.json). No historical data deleted; single canonical owner.
 
+### Phase 2A — per-product configuration engine (2026-06)
+- Per-product photo-matching priority: exposed existing `product.photo_weights` (backend match_photo + client matchPhoto already honored it with category-default fallback). AdminProductEdit "Prioritas Pencocokan Foto" move up/down → weights on save; per-product & isolated (editing rak never touches meja_rak). Exact match still wins; higher-priority mismatch weighs more.
+- Per-product option notes: `product.option_notes` {optionKey: text}; AdminProductEdit "Catatan Opsi" inputs (keyed by option key, survive label changes); customer ProductConfigure renders note under the group heading only when non-empty. Product A note never shows on Product B.
+- JSON editor: "Konfigurasi Lanjutan (JSON)" validates syntax + must be an object before save (invalid rejected, not saved); unknown/custom pricing fields preserved. Backend now also rejects non-dict pricing (400) and strips empty option_notes (defense-in-depth for non-UI clients).
+- Only change to backend model: admin_update_product allowed fields += photo_weights, option_notes (+ the two guards). No new pricing/matching engine; existing pricing untouched; historical order snapshots immutable.
+- RBAC: PUT /admin/products/{id} requires modify_products (403 otherwise), server-side enforced. Owner full access.
+- Tests: /app/backend/tests/test_v10_features.py 12/12 + 16/16 scenarios PASS (iteration_11.json). No data loss; no global priority; rak restored to canonical state (length>level>type>finishing, note 'Jarak per tingkat ± 28 cm').
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

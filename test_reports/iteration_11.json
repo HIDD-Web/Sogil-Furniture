@@ -1,0 +1,59 @@
+{
+  "summary": "V10 Phase-2A verification (per-product photo priority, per-product option notes, JSON editor validation, RBAC modify_products). Backend: 12/12 pytest cases pass in /app/backend/tests/test_v10_features.py (-n 0). Frontend: /admin/products/{rakId} renders priority-{length|level|type|finishing} + priority-up/down + note-{key} + product-pricing-json testids; canonical priority order (length first) and canonical note ('Jarak per tingkat ± 28 cm') restored; invalid JSON and non-object JSON both rejected client-side (toast 'Konfigurasi JSON harus berupa objek {}' + no navigation). Customer /produk/rak-kayu renders exactly 1 option-note under 'Jumlah Tingkat' and pricing engine still computes total (565 LE for 60cm/2-tingkat). Customer /produk/meja-rak renders 0 notes -> product isolation confirmed. Backend PUT persists photo_weights + option_notes; editing rak does NOT mutate meja_rak; pricing untouched by weights/notes edit; unknown pricing fields preserved (custom_marker/some_new_flag round-tripped). RBAC: sub-admin without modify_products -> 403 on PUT /admin/products/{id}; sub-admin WITH modify_products can edit. Non-dict pricing does not 500 (gracefully accepted as passthrough — see caveat). Rak product fully restored to canonical state post-run (photo_weights={length:0.4,level:0.3,type:0.2,finishing:0.1}, option_notes={level:'Jarak per tingkat ± 28 cm'}, pricing byte-equal to pre-run snapshot). No global priority setting created — each product independent.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "PUT /api/admin/products/{id}", "issue": "Backend does not validate pricing shape — accepts arrays/strings/nulls as passthrough (no 500, but no rejection either). Frontend is the only validation layer. Consider server-side `isinstance(pricing, dict)` check that returns 400 to defend against non-UI clients."},
+      {"endpoint": "PUT /api/admin/products/{id}", "issue": "option_notes is stored as-sent — backend does NOT strip empty-string values. If a caller sends {'level': ''} it will persist an empty string; customer UI already renders nothing for empty, so cosmetic only. The frontend Object.fromEntries filter is the only stripper."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "scenarios": {
+    "put_persists_photo_weights_and_option_notes": "PASS",
+    "product_isolation_edit_rak_does_not_touch_meja_rak": "PASS",
+    "pricing_intact_after_weights_notes_edit": "PASS (byte-equal to snapshot)",
+    "empty_notes_backend_passthrough": "PASS (frontend strips before send)",
+    "non_dict_pricing_no_500": "PASS (accepted as passthrough — see minor issue)",
+    "rbac_admin_without_modify_products_403": "PASS",
+    "rbac_admin_with_modify_products_200": "PASS",
+    "pricing_unknown_fields_preserved": "PASS (custom_marker + some_new_flag round-trip)",
+    "customer_rak_kayu_shows_one_option_note": "PASS",
+    "customer_meja_rak_shows_zero_option_notes": "PASS (isolation)",
+    "customer_pricing_engine_still_computes": "PASS (order preview 565 LE)",
+    "ui_priority_testids_and_canonical_order": "PASS (length,level,type,finishing)",
+    "ui_note_testids_and_canonical_value": "PASS (note-level = 'Jarak per tingkat ± 28 cm')",
+    "ui_invalid_json_rejected_client_side": "PASS (no navigation + red toast)",
+    "ui_non_object_json_rejected_client_side": "PASS",
+    "canonical_rak_state_restored": "PASS"
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v10_features.py",
+    "/app/test_reports/pytest/v10_results.xml"
+  ],
+  "action_items": [
+    "OPTIONAL (defense-in-depth): add server-side `isinstance(payload['pricing'], dict)` guard in admin_update_product returning 400 for non-dict; UI already blocks it but bypass via curl currently succeeds.",
+    "OPTIONAL: strip empty-string option_notes on server too (mirror the frontend filter) so misbehaving clients cannot persist blank notes."
+  ],
+  "critical_code_review_comments": [
+    "AdminProductEdit.jsx save(): weight rounding uses `Math.round((n - i) / denom * 100) / 100` — for n=4 the weights are 0.4/0.3/0.2/0.1 but for n=3 they become 0.5/0.33/0.17 (sum 1.0 within rounding). Fine, but consider computing then normalizing so sum is guaranteed exactly 1.0 to avoid drift after multiple reorders (currently drift is bounded to <=0.02).",
+    "server.py admin_update_product accepts `photo_weights` as arbitrary dict — no schema/shape validation (keys are not constrained to the category's attribute keys, values not clamped to [0,1]). Not exploitable (match_photo tolerates unknown keys) but worth a light validator.",
+    "PHOTO_ATTRS in AdminProductEdit is duplicated from the backend DEFAULT_WEIGHTS map — if categories evolve, both files must be updated. Consider exposing category attribute definitions via /api/admin/product-schema or similar.",
+    "server.py is now 2209 lines — refactor into routers (auth/finance/products/exports) is still overdue (called out in iteration_10 too).",
+    "Frontend save() catches PUT errors with a generic `Gagal menyimpan` toast without surfacing backend error detail (e.g. 403 becomes indistinguishable from 500). Consider `formatApiError(err.response?.data?.detail)`."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v10_features.py",
+    "/app/test_reports/pytest/v10_results.xml"
+  ],
+  "success_rate": {"backend": "100% (12/12)", "frontend": "100% (all Phase-2A testids present, invalid/non-object JSON both rejected, customer note renders + isolation)"},
+  "test_credentials": "owner: sogil.furniture@gmail.com / 0LFOCWU9_V3k. Ephemeral sub-admins TEST_V10<ts>_np (no modify_products) + TEST_V10<ts>_yp (with modify_products) created and cleaned up.",
+  "seed_data_creation": "Ephemeral TEST_V10 sub-admins created + deleted in TestZzzRestore. Rak product PUT-mutated during isolation/pricing tests then explicitly restored to canonical state (photo_weights + option_notes + pricing + starting_price_le byte-equal to pre-run snapshot). Meja_rak untouched. No products deleted. No global priority setting created.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Phase-2A closed. To rerun regression use `pytest /app/backend/tests/test_v10_features.py -n 0`. Rak canonical state: photo_weights={length:0.4,level:0.3,type:0.2,finishing:0.1}, option_notes={level:'Jarak per tingkat ± 28 cm'}. Rak id 6a8fc3c6d7ae98fcf9f4590a; meja_rak id 6a8fc3c6d7ae98fcf9f4590c. Backend has NO server-side pricing shape validation nor empty-note stripping — those are UI concerns only. For any new Phase-2B RBAC surface, follow the same sub-admin pattern (POST /admin/admins with permissions dict, then login separately). V9 Phase-1 tests remain green.",
+  "rca of the issue": "n/a - all Phase-2A review scenarios pass. Two low-severity defense-in-depth suggestions documented (server-side pricing dict check + server-side empty-note strip)."
+}

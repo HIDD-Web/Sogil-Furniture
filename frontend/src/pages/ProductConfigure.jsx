@@ -141,20 +141,20 @@ export default function ProductConfigure() {
               ) : (
                 <>
                   {product.category === "rak" && (<>
-                    <Section title={t("cfg.pilih_ukuran")}>{(pr.lengths || []).map((l) => <Chip key={l} active={config.length === l} onClick={() => set("length", l)} testid={`opt-length-${l}`}>{l} cm</Chip>)}</Section>
-                    <Section title={t("cfg.jumlah_tingkat")}>{(pr.levels || []).map((l) => <Chip key={l} active={config.level === l} onClick={() => set("level", l)} testid={`opt-level-${l}`}>{l} {t("cfg.tingkat")}</Chip>)}</Section>
-                    <Section title={t("cfg.tipe_rak")} hint={t("cfg.tipe_hint")}>{(pr.types || []).map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
-                    <Section title={t("cfg.jenis_finishing")}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
+                    <Section title={t("cfg.pilih_ukuran")} note={product.option_notes?.length}>{(pr.lengths || []).map((l) => <Chip key={l} active={config.length === l} onClick={() => set("length", l)} testid={`opt-length-${l}`}>{l} cm</Chip>)}</Section>
+                    <Section title={t("cfg.jumlah_tingkat")} note={product.option_notes?.level}>{(pr.levels || []).map((l) => <Chip key={l} active={config.level === l} onClick={() => set("level", l)} testid={`opt-level-${l}`}>{l} {t("cfg.tingkat")}</Chip>)}</Section>
+                    <Section title={t("cfg.tipe_rak")} hint={t("cfg.tipe_hint")} note={product.option_notes?.type}>{(pr.types || []).map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
+                    <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
                   </>)}
                   {product.category === "meja" && (<>
-                    <Section title={t("cfg.ukuran_tabletop")}>{(pr.sizes || []).map((s) => <Chip key={s} active={config.size === s} onClick={() => set("size", s)} testid={`opt-size-${s}`}>{s} cm</Chip>)}</Section>
-                    <Section title={t("cfg.tinggi_meja")}>{(pr.heights || []).map((h) => <Chip key={h} active={config.height === h} onClick={() => set("height", h)} testid={`opt-height-${h}`}>{h} cm {h === "30" ? "(Lesehan)" : h === "75" ? "(Kursi)" : ""}</Chip>)}</Section>
-                    <Section title={t("cfg.jenis_finishing")}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
+                    <Section title={t("cfg.ukuran_tabletop")} note={product.option_notes?.size}>{(pr.sizes || []).map((s) => <Chip key={s} active={config.size === s} onClick={() => set("size", s)} testid={`opt-size-${s}`}>{s} cm</Chip>)}</Section>
+                    <Section title={t("cfg.tinggi_meja")} note={product.option_notes?.height}>{(pr.heights || []).map((h) => <Chip key={h} active={config.height === h} onClick={() => set("height", h)} testid={`opt-height-${h}`}>{h} cm {h === "30" ? "(Lesehan)" : h === "75" ? "(Kursi)" : ""}</Chip>)}</Section>
+                    <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
                   </>)}
                   {product.category === "meja_rak" && (<>
-                    <Section title={t("cfg.pilih_varian")}>{(pr.variants || []).map((v) => <Chip key={v} active={config.variant === v} onClick={() => set("variant", v)} testid={`opt-variant-${v}`}>{v}</Chip>)}</Section>
-                    <Section title={t("cfg.tipe")} hint={t("cfg.tipe_hint")}>{(pr.types || []).map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
-                    <Section title={t("cfg.jenis_finishing")}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
+                    <Section title={t("cfg.pilih_varian")} note={product.option_notes?.variant}>{(pr.variants || []).map((v) => <Chip key={v} active={config.variant === v} onClick={() => set("variant", v)} testid={`opt-variant-${v}`}>{v}</Chip>)}</Section>
+                    <Section title={t("cfg.tipe")} hint={t("cfg.tipe_hint")} note={product.option_notes?.type}>{(pr.types || []).map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
+                    <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
                   </>)}
                   <Section title={t("cfg.jumlah")}>
                     <div className="flex items-center gap-3">
@@ -204,10 +204,11 @@ export default function ProductConfigure() {
   );
 }
 
-const Section = ({ title, hint, children }) => (
+const Section = ({ title, hint, note, children }) => (
   <div>
     <Label className="mb-2 block font-heading text-sm font-semibold text-[#2C1E16]">{title}</Label>
     {hint && <p className="mb-2 text-xs text-[#8B7355]">{hint}</p>}
+    {note && <p className="mb-2 text-xs text-[#8B5A2B]" data-testid="option-note">{note}</p>}
     <div className="flex flex-wrap gap-2">{children}</div>
   </div>
 );

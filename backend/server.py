@@ -978,9 +978,13 @@ async def admin_create_product(payload: Dict[str, Any], admin: dict = Depends(re
 async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("modify_products"))):
     allowed = ["name", "category", "description", "image_url", "active", "configurable",
                "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug",
-               "category_cover_image", "cover_mode"]
+               "category_cover_image", "cover_mode", "photo_weights", "option_notes"]
     existing = await db.products.find_one({"_id": oid(product_id)})
     upd = {k: payload[k] for k in allowed if k in payload}
+    if "pricing" in upd and not isinstance(upd["pricing"], dict):
+        raise HTTPException(status_code=400, detail="Konfigurasi (pricing) harus berupa objek JSON")
+    if "option_notes" in upd and isinstance(upd["option_notes"], dict):
+        upd["option_notes"] = {k: v for k, v in upd["option_notes"].items() if str(v or "").strip()}
     upd.update(audit_fields(admin))
     if "starting_price_le" in upd:
         upd["starting_price_le"] = _num(upd["starting_price_le"])

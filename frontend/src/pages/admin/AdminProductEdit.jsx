@@ -25,6 +25,8 @@ export default function AdminProductEdit() {
   const navigate = useNavigate();
   const [p, setP] = useState(null);
   const [pricingText, setPricingText] = useState("{}");
+  const [priority, setPriority] = useState([]);
+  const [notes, setNotes] = useState({});
   const [coverPreview, setCoverPreview] = useState(null);
   const fileRef = useRef();
   const coverRef = useRef();
@@ -33,7 +35,13 @@ export default function AdminProductEdit() {
   useEffect(() => {
     api.get("/products?admin_view=true").then((r) => {
       const prod = r.data.find((x) => x.id === id);
-      if (prod) { prod.photos = prod.photos || []; setP(prod); setPricingText(JSON.stringify(prod.pricing || {}, null, 2)); }
+      if (prod) {
+        prod.photos = prod.photos || []; setP(prod); setPricingText(JSON.stringify(prod.pricing || {}, null, 2));
+        const defs = PHOTO_ATTRS[prod.category] || [];
+        const w = prod.photo_weights || {};
+        const ordered = Object.keys(w).length ? [...defs.map((d) => d[0])].sort((a, b) => (w[b] || 0) - (w[a] || 0)) : defs.map((d) => d[0]);
+        setPriority(ordered); setNotes(prod.option_notes || {});
+      }
     });
   }, [id]);
 
@@ -62,15 +70,21 @@ export default function AdminProductEdit() {
 
   const save = async () => {
     let pricing = p.pricing;
-    try { pricing = JSON.parse(pricingText); } catch { toast.error("Format JSON pricing tidak valid"); return; }
+    try { pricing = JSON.parse(pricingText); } catch { toast.error("Format JSON tidak valid — perubahan tidak disimpan"); return; }
+    if (typeof pricing !== "object" || Array.isArray(pricing) || pricing === null) { toast.error("Konfigurasi JSON harus berupa objek {}"); return; }
+    const n = priority.length, denom = n * (n + 1) / 2;
+    const photo_weights = {}; priority.forEach((k, i) => { photo_weights[k] = denom ? Math.round((n - i) / denom * 100) / 100 : 0; });
+    const option_notes = Object.fromEntries(Object.entries(notes).filter(([, v]) => (v || "").trim()));
     try {
       await api.put(`/admin/products/${id}`, { name: p.name, category: p.category, description: p.description, image_url: p.image_url,
         active: p.active, configurable: p.configurable, starting_price_le: p.starting_price_le, pricing,
-        photos: p.photos, representative_photo_id: p.representative_photo_id,
+        photos: p.photos, representative_photo_id: p.representative_photo_id, photo_weights, option_notes,
         category_cover_image: p.category_cover_image || "", cover_mode: p.cover_mode || "manual" });
       toast.success("Produk disimpan"); navigate("/admin/products");
     } catch { toast.error("Gagal menyimpan"); }
   };
+  const KEY_LABELS = { length: "Panjang", level: "Jumlah Tingkat", type: "Tipe", finishing: "Finishing", size: "Ukuran Meja", height: "Tinggi Meja", variant: "Varian/Tingkat" };
+  const movePriority = (i, dir) => setPriority((prev) => { const a = [...prev]; const j = i + dir; if (j < 0 || j >= a.length) return prev; [a[i], a[j]] = [a[j], a[i]]; return a; });
   const remove = async () => { if (!window.confirm("Hapus produk ini?")) return; await api.delete(`/admin/products/${id}`); navigate("/admin/products"); };
 
   if (!p) return <div className="text-[#8B7355]">Memuat...</div>;
@@ -201,8 +215,42 @@ export default function AdminProductEdit() {
 
         {p.configurable && (
           <div className="border-t border-[#F1EBE0] pt-4">
+            <Label className="mb-1 block font-heading text-sm font-semibold">Prioritas Pencocokan Foto</Label>
+            <p className="mb-2 text-xs text-[#8B7355]">Urutan ini khusus produk ini. Menentukan opsi mana yang paling diprioritaskan saat memilih foto terdekat (bila tidak ada foto sama persis).</p>
+            <div className="space-y-1.5">
+              {priority.map((k, i) => (
+                <div key={k} className="flex items-center justify-between rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] px-3 py-2" data-testid={`priority-${k}`}>
+                  <span className="text-sm text-[#2C1E16]"><b className="mr-1 text-[#8B5A2B]">{i + 1}.</b> {KEY_LABELS[k] || k}</span>
+                  <div className="flex gap-1">
+                    <button onClick={() => movePriority(i, -1)} disabled={i === 0} data-testid={`priority-up-${k}`} className="rounded border border-[#E5DCC5] p-1 text-[#8B5A2B] disabled:opacity-30"><ArrowUp size={14} /></button>
+                    <button onClick={() => movePriority(i, 1)} disabled={i === priority.length - 1} data-testid={`priority-down-${k}`} className="rounded border border-[#E5DCC5] p-1 text-[#8B5A2B] disabled:opacity-30"><ArrowDown size={14} /></button>
+                  </div>
+                </div>
+              ))}
+              {priority.length === 0 && <p className="text-xs text-[#8B7355]">Kategori ini belum punya grup opsi untuk pencocokan foto.</p>}
+            </div>
+          </div>
+        )}
+
+        {p.configurable && attrDefs.length > 0 && (
+          <div className="border-t border-[#F1EBE0] pt-4">
+            <Label className="mb-1 block font-heading text-sm font-semibold">Catatan Opsi (Notes)</Label>
+            <p className="mb-2 text-xs text-[#8B7355]">Catatan opsional per grup opsi (mis. "Jarak per tingkat ± 28 cm"). Kosongkan bila tidak perlu — tidak akan tampil.</p>
+            <div className="space-y-2">
+              {attrDefs.map(([key]) => (
+                <div key={key}>
+                  <Label className="mb-0.5 block text-xs text-[#8B7355]">{KEY_LABELS[key] || key}</Label>
+                  <Input value={notes[key] || ""} onChange={(e) => setNotes((prev) => ({ ...prev, [key]: e.target.value }))} data-testid={`note-${key}`} placeholder="Catatan (opsional)" className="bg-white" />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {p.configurable && (
+          <div className="border-t border-[#F1EBE0] pt-4">
             <Label className="mb-1 block font-heading text-sm font-semibold">Konfigurasi Lanjutan (JSON)</Label>
-            <p className="mb-2 text-xs text-[#8B7355]">Tipe, penyesuaian tipe, dan harga finishing.</p>
+            <p className="mb-2 text-xs text-[#8B7355]">Grup opsi, nilai, harga & finishing produk ini. JSON divalidasi sebelum disimpan.</p>
             <Textarea value={pricingText} onChange={(e) => setPricingText(e.target.value)} data-testid="product-pricing-json" className="min-h-[200px] bg-[#FBF9F4] font-mono text-xs" />
           </div>
         )}
