@@ -164,7 +164,7 @@ export default function AdminProductEdit() {
             <Button variant="outline" onClick={addPhoto} data-testid="add-photo" className="rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B]"><Plus size={14} className="mr-1" /> Tambah Foto</Button>
           </div>
           <p className="mt-1 text-xs text-[#8B7355]">Tentukan atribut & foto per konfigurasi. Gunakan panah untuk mengatur urutan konfigurasi (↑↓) dan urutan foto di dalamnya (←→). Foto 1 = foto utama.</p>
-          <div className="mt-3 space-y-3">
+          <div className="mt-3 max-h-[460px] space-y-3 overflow-y-auto rounded-xl border border-[#F1EBE0] p-2">
             {(p.photos || []).map((ph, idx) => (
               <div key={ph.id} className="rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] p-3" data-testid={`photo-set-${ph.id}`}>
                 <div className="flex items-center justify-between">
@@ -196,6 +196,19 @@ export default function AdminProductEdit() {
                       </div>
                     </div>
                   ))}
+                </div>
+                <div className="mt-2">
+                  <div className="mb-1 text-[10px] font-medium text-[#8B7355]">Foto tambahan (boleh lebih dari 3)</div>
+                  <div className="flex flex-wrap gap-2">
+                    {(ph.images || []).map((u, ii) => (
+                      <div key={ii} className="relative">
+                        <div className="h-14 w-14 overflow-hidden rounded-lg border border-[#E5DCC5] bg-white"><img src={imgUrl(u)} alt="" className="h-full w-full object-cover" /></div>
+                        <button onClick={() => updPhoto(ph.id, { images: (ph.images || []).filter((_, x) => x !== ii) })} data-testid={`img-del-${ph.id}-${ii}`} className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] leading-none text-white">×</button>
+                      </div>
+                    ))}
+                    <input type="file" accept="image/*" hidden ref={(el) => (photoRefs.current[ph.id + "add"] = el)} onChange={(e) => e.target.files[0] && uploadTo(e.target.files[0], (u) => updPhoto(ph.id, { images: [...(ph.images || []), u] }))} />
+                    <button onClick={() => photoRefs.current[ph.id + "add"]?.click()} data-testid={`add-photo-${ph.id}`} className="flex h-14 w-14 items-center justify-center rounded-lg border-2 border-dashed border-[#8B5A2B] text-[#8B5A2B]"><Plus size={16} /></button>
+                  </div>
                 </div>
               </div>
             ))}

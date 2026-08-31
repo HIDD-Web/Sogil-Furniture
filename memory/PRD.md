@@ -103,5 +103,12 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - RBAC: PUT /admin/products/{id} requires modify_products (403 otherwise), server-side enforced. Owner full access.
 - Tests: /app/backend/tests/test_v10_features.py 12/12 + 16/16 scenarios PASS (iteration_11.json). No data loss; no global priority; rak restored to canonical state (length>level>type>finishing, note 'Jarak per tingkat ± 28 cm').
 
+### Phase 2B (partial) — photo gallery & admin photo mgmt (2026-06)
+- Task A DONE: customer marketplace-style gallery in ProductConfigure — 3:4 large image, clickable thumbnails with active-border state, horizontal-scroll thumb strip, supports >3 photos, single-photo hides thumbs, no-photo keeps fallback. Verified: thumb click swaps main image.
+- Task B DONE: admin >3 photos per configuration via additive `photos[].images` array + "Add Photo" (add-photo-{id}) + per-image delete. Persists with ZERO backend/schema change (product PUT already saves photos objects); existing 3 slots (main/front/side) untouched; matching logic unchanged.
+- Task C DONE (core): admin photo-set list wrapped in a max-h scrollable panel; extra-photo previews are compact (56px). (Lightbox enlarge not added — minor.)
+- Zero data touched: rak restored to canonical (pricing byte-intact, priority length>level>type>finishing, note preserved); meja_rak untouched; extra-photos round-trip verified then cleaned up.
+- DEFERRED to Phase 2B-cont (budget): Tasks D–G multilingual completion (footer/checkout/order-summary/confirmation i18n audit), WhatsApp message language, admin language switcher (default id), Arabic location/store-address fields with fallback, dark-mode audit, broader mobile audit. No data model changes made for these yet; order already has a `language` field to reuse.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

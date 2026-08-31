@@ -48,6 +48,8 @@ export default function ProductConfigure() {
   const photoMatch = useMemo(() => (product ? matchPhoto(product, config) : { photo: null, exact: false }), [product, config]);
   const isConfigurable = product?.configurable;
   const set = (k, v) => setConfig((c) => ({ ...c, [k]: v }));
+  const [gidx, setGidx] = useState(0);
+  useEffect(() => { setGidx(0); }, [photoMatch.photo?.id]);
 
   const canAdd = () => {
     if (!isConfigurable) return true;
@@ -74,7 +76,8 @@ export default function ProductConfigure() {
   if (!product) return <div className="py-20 text-center text-[#8B7355]">Memuat...</div>;
   const pr = product.pricing || {};
   const ph = photoMatch.photo;
-  const photoSlots = ph ? [ph.main_url, ph.front_url, ph.side_url].filter(Boolean) : [];
+  const photoSlots = ph ? [ph.main_url, ph.front_url, ph.side_url, ...(ph.images || [])].filter(Boolean) : [];
+  const gi = Math.min(gidx, Math.max(0, photoSlots.length - 1));
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 pb-40 sm:px-6 lg:pb-10">
@@ -88,15 +91,17 @@ export default function ProductConfigure() {
           <div>
             <div className="overflow-hidden rounded-2xl border border-[#E5DCC5] bg-white">
               {photoSlots.length ? (
-                <div className="aspect-[4/3] w-full overflow-hidden"><img src={imgUrl(photoSlots[0])} alt={product.name} className="h-full w-full object-cover" data-testid="config-photo-main" /></div>
+                <div className="aspect-[3/4] w-full overflow-hidden bg-[#FBF9F4]"><img src={imgUrl(photoSlots[gi])} alt={product.name} className="h-full w-full object-contain" data-testid="config-photo-main" /></div>
               ) : (
                 <ProductImage url={product.display_image} alt={product.name} />
               )}
             </div>
             {photoSlots.length > 1 && (
-              <div className="mt-2 grid grid-cols-3 gap-2">
-                {photoSlots.slice(0, 3).map((u, i) => (
-                  <div key={i} className="aspect-square overflow-hidden rounded-xl border border-[#E5DCC5] bg-white"><img src={imgUrl(u)} alt="" className="h-full w-full object-cover" /></div>
+              <div className="mt-2 flex gap-2 overflow-x-auto pb-1" data-testid="gallery-thumbs">
+                {photoSlots.map((u, i) => (
+                  <button key={i} onClick={() => setGidx(i)} data-testid={`gallery-thumb-${i}`} className={`h-16 w-14 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${i === gi ? "border-[#8B5A2B]" : "border-[#E5DCC5]"}`}>
+                    <img src={imgUrl(u)} alt="" className="h-full w-full object-cover" />
+                  </button>
                 ))}
               </div>
             )}
