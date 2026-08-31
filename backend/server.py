@@ -13,6 +13,7 @@ import logging
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uuid
+import json
 import re
 import jwt
 import bcrypt
@@ -238,6 +239,7 @@ class AdminUpdateInput(BaseModel):
     password: Optional[str] = None
     role: Optional[str] = None
     permissions: Optional[Dict[str, bool]] = None
+    status: Optional[str] = None
 
 class FinanceTxnInput(BaseModel):
     date: Optional[str] = None
@@ -246,6 +248,7 @@ class FinanceTxnInput(BaseModel):
     amount: float
     currency: str  # IDR | EGP
     description: Optional[str] = ""
+    recipient_employee_id: Optional[str] = None
 
 class TransferInput(BaseModel):
     date: Optional[str] = None
@@ -976,10 +979,20 @@ async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: 
     allowed = ["name", "category", "description", "image_url", "active", "configurable",
                "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug",
                "category_cover_image", "cover_mode"]
+    existing = await db.products.find_one({"_id": oid(product_id)})
     upd = {k: payload[k] for k in allowed if k in payload}
     upd.update(audit_fields(admin))
     if "starting_price_le" in upd:
         upd["starting_price_le"] = _num(upd["starting_price_le"])
+    # Record forward-looking price-change history (non-destructive; historical orders keep their own snapshots).
+    if existing and ("pricing" in upd or "starting_price_le" in upd):
+        old_p = existing.get("pricing"); new_p = upd.get("pricing", old_p)
+        old_s = _num(existing.get("starting_price_le")); new_s = _num(upd.get("starting_price_le", old_s))
+        if old_p != new_p or old_s != new_s:
+            await db.price_history.insert_one({"product_id": product_id, "product_name": existing.get("name"),
+                "category": existing.get("category"), "old_pricing": old_p, "new_pricing": new_p,
+                "old_starting_price_le": old_s, "new_starting_price_le": new_s,
+                "changed_by_name": admin.get("name"), "changed_at": datetime.now(timezone.utc).isoformat()})
     await db.products.update_one({"_id": oid(product_id)}, {"$set": upd})
     return clean(await db.products.find_one({"_id": oid(product_id)}))
 
@@ -1132,6 +1145,8 @@ async def update_admin(admin_id: str, data: AdminUpdateInput, admin: dict = Depe
     upd = {}
     if data.name is not None:
         upd["name"] = data.name.strip()
+    if data.status in ("active", "inactive"):
+        upd["status"] = data.status
     if data.email is not None:
         new_email = data.email.strip().lower()
         if await db.admins.find_one({"email": new_email, "_id": {"$ne": oid(admin_id)}}):
@@ -1169,9 +1184,10 @@ async def delete_admin(admin_id: str, admin: dict = Depends(require_owner())):
 # Finance
 # --------------------------------------------------------------------------
 DEFAULT_FINANCE_CATEGORIES = {
-    "income": ["Penjualan", "Pendapatan Lain", "Penyesuaian"],
-    "expense": ["Pembelian Bahan", "Biaya Kayu/Material", "Upah Pekerja", "Biaya Pengiriman",
-                "Operasional", "Peralatan/Perkakas", "Marketing", "Pengeluaran Lain", "Penyesuaian"],
+    "income": ["Penjualan", "Pendapatan Lain"],
+    "expense": ["Material", "Pekerja", "Biaya Sewa Ruang", "Naql", "Parts", "Pemotongan", "Transport",
+                "Peralatan & Perkakas", "Perbaikan & Pemeliharaan", "Konsumsi Operasional", "Air & Listrik",
+                "Mesin & Kendaraan", "Pengembangan Aplikasi Web", "Marketing"],
 }
 
 @api_router.get("/admin/finance/categories")
@@ -1205,21 +1221,44 @@ async def finance_accounts(admin: dict = Depends(require_perm("access_finance"))
 
 @api_router.get("/admin/finance/transactions")
 async def finance_list(currency: Optional[str] = None, type: Optional[str] = None,
-                       start: Optional[str] = None, end: Optional[str] = None,
+                       start: Optional[str] = None, end: Optional[str] = None, q: Optional[str] = None,
                        admin: dict = Depends(require_perm("access_finance"))):
-    q = {}
+    conds = []
     if currency:
-        q["$or"] = [{"currency": currency}, {"from_account": currency}, {"to_account": currency}]
+        conds.append({"$or": [{"currency": currency}, {"from_account": currency}, {"to_account": currency}]})
     if type:
-        q["type"] = type
+        conds.append({"type": type})
     if start or end:
-        q["date"] = {}
+        d = {}
         if start:
-            q["date"]["$gte"] = start
+            d["$gte"] = start
         if end:
-            q["date"]["$lte"] = end + "T23:59:59"
-    txns = await db.finance_transactions.find(q).sort("date", -1).to_list(2000)
+            d["$lte"] = end + "T23:59:59"
+        conds.append({"date": d})
+    if q and q.strip():
+        qs = q.strip()
+        rx = {"$regex": re.escape(qs), "$options": "i"}
+        ors = [{"description": rx}, {"category": rx}, {"type": rx}, {"classification": rx},
+               {"created_by_name": rx}, {"recipient_employee_name": rx}]
+        try:
+            ors.append({"amount": float(qs)})
+        except ValueError:
+            pass
+        conds.append({"$or": ors})
+    query = {"$and": conds} if conds else {}
+    txns = await db.finance_transactions.find(query).sort("date", -1).to_list(2000)
     return [clean(t) for t in txns]
+
+async def category_classification(name, typ):
+    """Revenue/Cost vs Transfer classification for a category (snapshot onto each txn)."""
+    c = await db.finance_categories.find_one({"name": name, "type": typ})
+    if c and c.get("classification") in ("revenue", "cost", "transfer"):
+        return c["classification"]
+    return "revenue" if typ == "income" else "cost"
+
+def _is_wage_category(name):
+    n = (name or "").lower()
+    return "upah" in n or "wage" in n or "pekerja" in n
 
 @api_router.post("/admin/finance/transactions")
 async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_perm("access_finance"))):
@@ -1228,12 +1267,26 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
     if data.currency not in ("IDR", "EGP"):
         raise HTTPException(status_code=400, detail="Mata uang tidak valid")
     now = datetime.now(timezone.utc).isoformat()
+    classification = await category_classification(data.category, data.type)
     doc = {"date": data.date or now, "type": data.type, "category": data.category,
            "amount": _num(data.amount), "currency": data.currency, "account": data.currency,
+           "classification": classification,
            "description": data.description or "", "related_order_id": None,
            "created_by_id": admin.get("id"), "created_by_name": admin.get("name"),
            "updated_by_name": admin.get("name"), "created_at": now, "updated_at": now}
+    is_wage = data.type == "expense" and _is_wage_category(data.category)
+    if is_wage and data.recipient_employee_id:
+        emp = await db.admins.find_one({"_id": oid(data.recipient_employee_id)})
+        if not emp:
+            raise HTTPException(status_code=400, detail="Karyawan penerima tidak ditemukan")
+        doc["recipient_employee_id"] = data.recipient_employee_id
+        doc["recipient_employee_name"] = emp.get("name")
     result = await db.finance_transactions.insert_one(doc)
+    tid = str(result.inserted_id)
+    if doc.get("recipient_employee_id"):
+        await db.employee_wages.insert_one({"employee_id": doc["recipient_employee_id"], "employee_name": doc["recipient_employee_name"],
+            "amount": _num(data.amount), "currency": data.currency, "date": doc["date"], "category": data.category,
+            "description": data.description or "", "transaction_id": tid, "recorded_by_name": admin.get("name"), "created_at": now})
     return clean(await db.finance_transactions.find_one({"_id": result.inserted_id}))
 
 @api_router.put("/admin/finance/transactions/{txn_id}")
@@ -1245,13 +1298,31 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
         raise HTTPException(status_code=400, detail="Pendapatan otomatis pesanan tidak dapat diubah manual")
     upd = {"date": data.date or t.get("date"), "type": data.type, "category": data.category,
            "amount": _num(data.amount), "currency": data.currency, "account": data.currency,
+           "classification": await category_classification(data.category, data.type),
            "description": data.description or "", "updated_by_name": admin.get("name"),
            "updated_at": datetime.now(timezone.utc).isoformat()}
+    # Re-sync wage linkage: recompute wage-ness/recipient so employee history stays consistent on edit.
+    is_wage = data.type == "expense" and _is_wage_category(data.category)
+    upd["recipient_employee_id"] = None
+    upd["recipient_employee_name"] = None
+    if is_wage and data.recipient_employee_id:
+        emp = await db.admins.find_one({"_id": oid(data.recipient_employee_id)})
+        if not emp:
+            raise HTTPException(status_code=400, detail="Karyawan penerima tidak ditemukan")
+        upd["recipient_employee_id"] = data.recipient_employee_id
+        upd["recipient_employee_name"] = emp.get("name")
     await db.finance_transactions.update_one({"_id": oid(txn_id)}, {"$set": upd})
+    await db.employee_wages.delete_many({"transaction_id": txn_id})
+    if upd["recipient_employee_id"]:
+        await db.employee_wages.insert_one({"employee_id": upd["recipient_employee_id"], "employee_name": upd["recipient_employee_name"],
+            "amount": _num(data.amount), "currency": data.currency, "date": upd["date"], "category": data.category,
+            "description": data.description or "", "transaction_id": txn_id, "recorded_by_name": admin.get("name"),
+            "created_at": datetime.now(timezone.utc).isoformat()})
     return clean(await db.finance_transactions.find_one({"_id": oid(txn_id)}))
 
 @api_router.delete("/admin/finance/transactions/{txn_id}")
 async def finance_delete(txn_id: str, admin: dict = Depends(require_perm("access_finance"))):
+    await db.employee_wages.delete_many({"transaction_id": txn_id})
     await db.finance_transactions.delete_one({"_id": oid(txn_id)})
     return {"ok": True}
 
@@ -1294,6 +1365,13 @@ def _period_range(period, start, end):
         e = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
         ps = s.replace(year=s.year - 1)
         return s.isoformat(), e.isoformat(), ps.isoformat(), s.isoformat()
+    if period == "last_3_months":
+        m = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        y, mo = m.year, m.month - 2
+        while mo <= 0:
+            mo += 12; y -= 1
+        s = m.replace(year=y, month=mo)
+        return s.isoformat(), now.isoformat(), None, None
     return None, None, None, None
 
 async def _stats_for(s, e):
@@ -1306,12 +1384,14 @@ async def _stats_for(s, e):
             q["date"]["$lte"] = e
     res = {"IDR": {"revenue": 0.0, "cost": 0.0}, "EGP": {"revenue": 0.0, "cost": 0.0}}
     async for t in db.finance_transactions.find(q):
-        cur = t.get("currency", "EGP"); typ = t.get("type"); amt = _num(t.get("amount"))
+        cur = t.get("currency", "EGP"); typ = t.get("type"); amt = _num(t.get("amount")); cls = t.get("classification")
         if cur not in res:
             continue
-        if typ in ("income", "order_revenue"):
+        if typ == "order_revenue":
             res[cur]["revenue"] += amt
-        elif typ == "expense":
+        elif typ == "income" and cls in (None, "revenue"):
+            res[cur]["revenue"] += amt
+        elif typ == "expense" and cls in (None, "cost"):
             res[cur]["cost"] += amt
     for cur in res:
         r = res[cur]
@@ -1415,15 +1495,56 @@ async def create_custom_category(payload: Dict[str, Any], admin: dict = Depends(
     typ = payload.get("type", "expense")
     if not name or typ not in ("income", "expense"):
         raise HTTPException(status_code=400, detail="Nama & tipe kategori wajib benar")
-    doc = {"name": name, "type": typ, "status": payload.get("status", "active"),
+    valid = {"income": ["revenue", "transfer"], "expense": ["cost", "transfer"]}
+    classification = payload.get("classification")
+    if classification not in valid[typ]:
+        classification = "revenue" if typ == "income" else "cost"
+    doc = {"name": name, "type": typ, "classification": classification, "status": payload.get("status", "active"),
            "created_at": datetime.now(timezone.utc).isoformat(), "created_by_name": admin.get("name")}
     r = await db.finance_categories.insert_one(doc)
     return clean(await db.finance_categories.find_one({"_id": r.inserted_id}))
 
+@api_router.put("/admin/finance/custom-categories/{cid}")
+async def update_custom_category(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("access_finance"))):
+    upd = {}
+    if payload.get("classification") in ("revenue", "cost", "transfer"):
+        upd["classification"] = payload["classification"]
+    if payload.get("status") in ("active", "inactive"):
+        upd["status"] = payload["status"]
+    if upd:
+        await db.finance_categories.update_one({"_id": oid(cid)}, {"$set": upd})
+    return clean(await db.finance_categories.find_one({"_id": oid(cid)}))
+
 @api_router.delete("/admin/finance/custom-categories/{cid}")
 async def delete_custom_category(cid: str, admin: dict = Depends(require_perm("access_finance"))):
-    await db.finance_categories.delete_one({"_id": oid(cid)})
+    # Soft-delete: historical transactions keep their category/classification; just stop offering it for new txns.
+    await db.finance_categories.update_one({"_id": oid(cid)}, {"$set": {"status": "inactive"}})
     return {"ok": True}
+
+@api_router.get("/admin/employees")
+async def list_employees(admin: dict = Depends(require_perm("access_finance"))):
+    return [clean(a) for a in await db.admins.find({"role": "employee", "status": {"$ne": "inactive"}}).to_list(200)]
+
+@api_router.get("/admin/employees/wages")
+async def employee_wages_summary(admin: dict = Depends(require_perm("access_finance"))):
+    now = datetime.now(timezone.utc)
+    mkey = now.strftime("%Y-%m"); ykey = now.strftime("%Y")
+    out = []
+    for e in await db.admins.find({"role": "employee"}).to_list(200):
+        eid = str(e["_id"])
+        wages = await db.employee_wages.find({"employee_id": eid}).sort("date", -1).to_list(500)
+        totals, month, year = {}, {}, {}
+        for w in wages:
+            c = w.get("currency", "EGP"); amt = _num(w.get("amount")); d = (w.get("date") or "")
+            totals[c] = totals.get(c, 0) + amt
+            if d[:7] == mkey:
+                month[c] = month.get(c, 0) + amt
+            if d[:4] == ykey:
+                year[c] = year.get(c, 0) + amt
+        out.append({"id": eid, "name": e.get("name"), "email": e.get("email"), "role": e.get("role"),
+                    "status": e.get("status", "active"), "totals": totals, "month": month, "year": year,
+                    "count": len(wages), "history": [clean(w) for w in wages]})
+    return out
 
 @api_router.post("/admin/finance/balance-adjust")
 async def balance_adjust(payload: Dict[str, Any], admin: dict = Depends(require_perm("access_finance"))):
@@ -1553,6 +1674,16 @@ async def customer_login(data: CustomerLogin, response: Response):
 async def customer_logout(response: Response):
     response.delete_cookie("customer_token", path="/")
     return {"ok": True}
+
+@api_router.post("/customer/find-username")
+async def find_username(payload: Dict[str, Any]):
+    phone = normalize_phone(payload.get("phone") or "")
+    if not valid_intl_phone(phone):
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +201234567890")
+    c = await db.customers.find_one({"phone": phone})
+    if not c:
+        raise HTTPException(status_code=404, detail="Tidak ada akun terdaftar dengan No HP ini")
+    return {"username": c.get("username")}
 
 @api_router.get("/customer/me")
 async def customer_me(c: dict = Depends(get_current_customer)):
@@ -1720,6 +1851,17 @@ async def admin_delete_customer(cid: str, admin: dict = Depends(require_owner())
         await db.referrals.delete_one({"_id": ref["_id"]})
     return {"ok": True, "deleted": True}
 
+@api_router.post("/admin/customers/{cid}/reset-password")
+async def admin_reset_customer_password(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_owner())):
+    c = await db.customers.find_one({"_id": oid(cid)})
+    if not c:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+    np = payload.get("new_password") or ""
+    if len(np) < 6:
+        raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter")
+    await db.customers.update_one({"_id": oid(cid)}, {"$set": {"password_hash": hash_password(np)}})
+    return {"ok": True}
+
 @api_router.post("/admin/customers/{cid}/adjust-points")
 async def admin_adjust_points(cid: str, data: PointAdjustInput, admin: dict = Depends(require_owner())):
     c = await db.customers.find_one({"_id": oid(cid)})
@@ -1864,6 +2006,189 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     client.close()
+
+# --------------------------------------------------------------------------
+# Finance statistics, customer password, XLSX exports
+# --------------------------------------------------------------------------
+@api_router.get("/admin/finance/statistics")
+async def finance_statistics(period: str = "this_month", start: Optional[str] = None, end: Optional[str] = None,
+                             currency: str = "EGP", admin: dict = Depends(require_perm("access_finance"))):
+    s, e, _ps, _pe = _period_range(period, start, end)
+    q = {"currency": currency}
+    if s or e:
+        q["date"] = {}
+        if s:
+            q["date"]["$gte"] = s
+        if e:
+            q["date"]["$lte"] = e
+    groups = {}
+    totals = {"revenue": 0.0, "transfer_income": 0.0, "cost": 0.0, "transfer_expense": 0.0}
+    async for t in db.finance_transactions.find(q):
+        typ = t.get("type"); amt = _num(t.get("amount")); cls = t.get("classification")
+        if typ == "order_revenue":
+            typ = "income"; cls = "revenue"
+        if typ not in ("income", "expense"):
+            continue
+        cat = t.get("category", "(tanpa kategori)")
+        key = (typ, cat)
+        g = groups.setdefault(key, {"type": typ, "category": cat, "total": 0.0, "count": 0, "classification": cls or ("revenue" if typ == "income" else "cost")})
+        g["total"] += amt; g["count"] += 1
+        if typ == "income":
+            totals["revenue" if cls in (None, "revenue") else "transfer_income"] += amt
+        else:
+            totals["cost" if cls in (None, "cost") else "transfer_expense"] += amt
+    income = sorted([g for g in groups.values() if g["type"] == "income"], key=lambda x: x["total"], reverse=True)
+    expense = sorted([g for g in groups.values() if g["type"] == "expense"], key=lambda x: x["total"], reverse=True)
+    inc_sum = sum(g["total"] for g in income) or 1
+    exp_sum = sum(g["total"] for g in expense) or 1
+    for g in income:
+        g["pct"] = round(g["total"] / inc_sum * 100, 1)
+    for g in expense:
+        g["pct"] = round(g["total"] / exp_sum * 100, 1)
+    totals["operating_profit"] = totals["revenue"] - totals["cost"]
+    return {"currency": currency, "period": period, "range": {"start": s, "end": e},
+            "income": income, "expense": expense, "totals": totals}
+
+@api_router.post("/customer/change-password")
+async def customer_change_password(payload: Dict[str, Any], c: dict = Depends(get_current_customer)):
+    cur = payload.get("current_password") or ""
+    new = payload.get("new_password") or ""
+    if not verify_password(cur, c["password_hash"]):
+        raise HTTPException(status_code=400, detail="Kata sandi saat ini salah")
+    if len(new) < 6:
+        raise HTTPException(status_code=400, detail="Kata sandi baru minimal 6 karakter")
+    await db.customers.update_one({"_id": c["_id"]}, {"$set": {"password_hash": hash_password(new)}})
+    return {"ok": True}
+
+def build_xlsx(sheets):
+    from openpyxl import Workbook
+    import io
+    wb = Workbook(); wb.remove(wb.active)
+    for title, headers, rows in sheets:
+        ws = wb.create_sheet((title or "Sheet")[:31])
+        ws.append(headers)
+        for r in rows:
+            ws.append([("" if v is None else v) for v in r])
+    if not wb.sheetnames:
+        wb.create_sheet("Data")
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.getvalue()
+
+def xlsx_response(data, filename):
+    return StarletteResponse(content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+def _date_query(period, start, end):
+    s, e, _ps, _pe = _period_range(period, start, end)
+    q = {}
+    if s or e:
+        q["date"] = {}
+        if s:
+            q["date"]["$gte"] = s
+        if e:
+            q["date"]["$lte"] = e
+    return q, s, e
+
+@api_router.get("/admin/export/finance")
+async def export_finance(period: str = "this_year", start: Optional[str] = None, end: Optional[str] = None,
+                         admin: dict = Depends(require_perm("access_finance"))):
+    q, _s, _e = _date_query(period, start, end)
+    txns = await db.finance_transactions.find(q).sort("date", -1).to_list(10000)
+    headers = ["Tanggal", "ID Referensi", "Tipe", "Klasifikasi", "Kategori", "Deskripsi", "Jumlah", "Mata Uang", "Dari", "Ke", "Penerima", "Dicatat oleh"]
+    rows = []
+    for t in txns:
+        amt = _num(t.get("amount")) if t.get("type") != "transfer" else _num(t.get("from_amount"))
+        rows.append([(t.get("date") or "")[:19], str(t.get("_id")), t.get("type", ""), t.get("classification", ""),
+                     t.get("category", ""), t.get("description", ""), amt, t.get("currency", t.get("from_account", "")),
+                     t.get("from_account", ""), t.get("to_account", ""), t.get("recipient_employee_name", ""), t.get("created_by_name", "")])
+    return xlsx_response(build_xlsx([("Keuangan", headers, rows)]), f"keuangan_{period}.xlsx")
+
+@api_router.get("/admin/export/orders")
+async def export_orders(period: str = "this_year", start: Optional[str] = None, end: Optional[str] = None,
+                        admin: dict = Depends(require_perm("manage_orders"))):
+    s, e, _ps, _pe = _period_range(period, start, end)
+    q = {}
+    if s or e:
+        q["created_at"] = {}
+        if s:
+            q["created_at"]["$gte"] = s
+        if e:
+            q["created_at"]["$lte"] = e
+    orders = await db.orders.find(q).sort("created_at", -1).to_list(10000)
+    headers = ["No Pesanan", "Tanggal", "Pelanggan", "No HP", "Produk & Konfigurasi", "Qty", "Subtotal", "Diskon", "Diskon Referral", "Poin", "Ongkir", "Total", "Mata Uang", "Status Pembayaran", "Status Pesanan", "Kode Referral", "Bahasa"]
+    rows = []
+    for o in orders:
+        items = o.get("items") or ([o.get("item")] if o.get("item") else [])
+        desc = "; ".join([f"{it.get('product_name_snapshot','')} [" + ", ".join(f"{k}={v}" for k, v in (it.get('configuration_snapshot') or {}).items()) + f"] x{it.get('quantity',1)}" for it in items if it])
+        qty = sum(int(it.get("quantity", 1)) for it in items if it)
+        rows.append([o.get("order_number", ""), (o.get("created_at") or "")[:19], o.get("customer_name", ""), o.get("customer_phone", ""),
+                     desc, qty, _num(o.get("subtotal_le")), _num(o.get("discount_le")), _num(o.get("referral_discount_le")),
+                     _num(o.get("points_redeemed_le")), _num(o.get("delivery_fee_le")), _num(o.get("total_le")), "LE",
+                     o.get("payment_status", ""), o.get("order_status", ""), (o.get("referral") or {}).get("code", ""), o.get("language", "")])
+    return xlsx_response(build_xlsx([("Pesanan", headers, rows)]), f"pesanan_{period}.xlsx")
+
+@api_router.get("/admin/export/config-analytics")
+async def export_config_analytics(admin: dict = Depends(require_perm("manage_orders"))):
+    agg = {}
+    async for o in db.orders.find({}):
+        items = o.get("items") or ([o.get("item")] if o.get("item") else [])
+        for it in items:
+            if not it:
+                continue
+            cfg = it.get("configuration_snapshot") or {}
+            cfgs = ", ".join(f"{k}={v}" for k, v in cfg.items())
+            key = (it.get("category", ""), it.get("product_name_snapshot", ""), cfgs)
+            g = agg.setdefault(key, {"orders": 0, "qty": 0})
+            g["orders"] += 1; g["qty"] += int(it.get("quantity", 1))
+    ranked = sorted(agg.items(), key=lambda x: x[1]["qty"], reverse=True)
+    headers = ["Peringkat", "Kategori", "Produk", "Konfigurasi", "Jumlah Pesanan", "Total Qty Dipesan"]
+    rows = [[i + 1, k[0], k[1], k[2], v["orders"], v["qty"]] for i, (k, v) in enumerate(ranked)]
+    return xlsx_response(build_xlsx([("Analitik Konfigurasi", headers, rows)]), "analitik_konfigurasi.xlsx")
+
+@api_router.get("/admin/export/customers")
+async def export_customers(admin: dict = Depends(require_perm("manage_orders"))):
+    custs = await db.customers.find({}).sort("created_at", -1).to_list(10000)
+    headers = ["ID", "Nama Pengguna", "Email", "No HP", "Terdaftar", "Status", "Kode Referral", "Poin Tersedia", "Poin Diperoleh"]
+    rows = [[str(c.get("_id")), c.get("username", ""), c.get("email", ""), c.get("phone", ""), (c.get("created_at") or "")[:19],
+             "aktif" if c.get("active", True) else "nonaktif", c.get("referral_code", ""), _num(c.get("points_available")), _num(c.get("points_earned"))] for c in custs]
+    return xlsx_response(build_xlsx([("Pelanggan", headers, rows)]), "pelanggan.xlsx")
+
+@api_router.get("/admin/export/accounts")
+async def export_accounts(admin: dict = Depends(require_owner())):
+    admins = await db.admins.find({}).to_list(500)
+    a_headers = ["ID", "Nama", "Email", "Role", "Status", "Izin", "Dibuat", "Total Upah", "Upah Tahun Ini", "Jumlah Transaksi Upah"]
+    a_rows, w_rows = [], []
+    w_headers = ["Karyawan", "Tanggal", "Jumlah", "Mata Uang", "Kategori", "Deskripsi", "Dicatat oleh", "ID Transaksi"]
+    now = datetime.now(timezone.utc); ykey = now.strftime("%Y")
+    for a in admins:
+        aid = str(a["_id"])
+        perms = a.get("permissions") or {}
+        perm_str = ", ".join(k for k, v in perms.items() if v)
+        wages = await db.employee_wages.find({"employee_id": aid}).sort("date", -1).to_list(1000)
+        tot, ytot = {}, {}
+        for w in wages:
+            c = w.get("currency", "EGP"); amt = _num(w.get("amount"))
+            tot[c] = tot.get(c, 0) + amt
+            if (w.get("date") or "")[:4] == ykey:
+                ytot[c] = ytot.get(c, 0) + amt
+            w_rows.append([a.get("name", ""), (w.get("date") or "")[:19], amt, c, w.get("category", ""), w.get("description", ""), w.get("recorded_by_name", ""), w.get("transaction_id", "")])
+        a_rows.append([aid, a.get("name", ""), a.get("email", ""), a.get("role", ""), a.get("status", "active"), perm_str,
+                       (a.get("created_at") or "")[:19], "; ".join(f"{v} {c}" for c, v in tot.items()),
+                       "; ".join(f"{v} {c}" for c, v in ytot.items()), len(wages)])
+    return xlsx_response(build_xlsx([("Akun", a_headers, a_rows), ("Riwayat Upah", w_headers, w_rows)]), "akun_dan_upah.xlsx")
+
+@api_router.get("/admin/export/product-prices")
+async def export_product_prices(admin: dict = Depends(require_perm("modify_products"))):
+    hist = await db.price_history.find({}).sort("changed_at", -1).to_list(10000)
+    headers = ["Tanggal Ubah", "Produk", "Kategori", "Harga Mulai Lama (LE)", "Harga Mulai Baru (LE)", "Diubah oleh"]
+    rows = [[(h.get("changed_at") or "")[:19], h.get("product_name", ""), h.get("category", ""),
+             _num(h.get("old_starting_price_le")), _num(h.get("new_starting_price_le")), h.get("changed_by_name", "")] for h in hist]
+    cur_headers = ["Produk", "Kategori", "Harga Mulai (LE)", "Konfigurasi Harga (JSON)"]
+    cur_rows = []
+    for p in await db.products.find({}).to_list(500):
+        cur_rows.append([p.get("name", ""), p.get("category", ""), _num(p.get("starting_price_le")), json.dumps(p.get("pricing") or {}, ensure_ascii=False)[:32000]])
+    return xlsx_response(build_xlsx([("Riwayat Perubahan Harga", headers, rows), ("Harga Saat Ini", cur_headers, cur_rows)]), "harga_produk.xlsx")
 
 app.include_router(api_router)
 

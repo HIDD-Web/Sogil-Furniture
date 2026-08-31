@@ -31,6 +31,8 @@ import AdminProductEdit from "./pages/admin/AdminProductEdit";
 import AdminSettings from "./pages/admin/AdminSettings";
 import AdminAnalytics from "./pages/admin/AdminAnalytics";
 import AdminFinance from "./pages/admin/AdminFinance";
+import AdminFinanceStats from "./pages/admin/AdminFinanceStats";
+import AdminExport from "./pages/admin/AdminExport";
 import AdminAdmins from "./pages/admin/AdminAdmins";
 import AdminDiscounts from "./pages/admin/AdminDiscounts";
 import AdminReferrals from "./pages/admin/AdminReferrals";
@@ -63,6 +65,8 @@ function Layout() {
           <Route path="products/:id" element={<AdminProductEdit />} />
           <Route path="analytics" element={<AdminAnalytics />} />
           <Route path="finance" element={<AdminFinance />} />
+          <Route path="finance/statistics" element={<AdminFinanceStats />} />
+          <Route path="export" element={<AdminExport />} />
           <Route path="discounts" element={<AdminDiscounts />} />
           <Route path="referrals" element={<AdminReferrals />} />
           <Route path="customers" element={<AdminCustomers />} />

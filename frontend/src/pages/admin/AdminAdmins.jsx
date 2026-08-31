@@ -17,10 +17,25 @@ const ROLES = [["manager", "Manager"], ["admin", "Admin"], ["employee", "Employe
 
 export default function AdminAdmins() {
   const [admins, setAdmins] = useState([]);
+  const [wageMap, setWageMap] = useState({});
   const [form, setForm] = useState({ name: "", email: "", password: "", role: "admin", permissions: {} });
 
-  const load = () => api.get("/admin/admins").then((r) => setAdmins(r.data));
+  const load = () => {
+    api.get("/admin/admins").then((r) => setAdmins(r.data));
+    api.get("/admin/employees/wages").then((r) => { const m = {}; r.data.forEach((w) => { m[w.id] = w; }); setWageMap(m); }).catch(() => {});
+  };
   useEffect(() => { load(); }, []);
+
+  const resetPw = async (a) => {
+    const np = window.prompt(`Set kata sandi baru untuk ${a.name} (min 6 karakter). Admin tidak melihat sandi lama.`);
+    if (!np) return;
+    try { await api.put(`/admin/admins/${a.id}`, { password: np }); toast.success("Kata sandi direset"); }
+    catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
+  };
+  const toggleStatus = async (a) => {
+    const ns = a.status === "inactive" ? "active" : "inactive";
+    await api.put(`/admin/admins/${a.id}`, { status: ns }); toast.success(ns === "inactive" ? "Akun dinonaktifkan" : "Akun diaktifkan"); load();
+  };
 
   const create = async () => {
     if (!form.name || !form.email || !form.password) return toast.error("Lengkapi nama, email, kata sandi");
@@ -57,8 +72,15 @@ export default function AdminAdmins() {
         {admins.map((a) => (
           <div key={a.id} className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid={`admin-account-${a.id}`}>
             <div className="flex items-center justify-between">
-              <div><div className="font-heading font-semibold text-[#2C1E16]">{a.name} <span className="ml-1 rounded-full bg-[#EFE6D5] px-2 py-0.5 text-xs text-[#8B5A2B]">{a.role}</span></div><div className="text-xs text-[#8B7355]">{a.email}</div></div>
-              {a.role !== "owner" && <button onClick={() => del(a)} data-testid={`del-admin-${a.id}`} className="p-2 text-red-500"><Trash2 size={16} /></button>}
+              <div><div className="font-heading font-semibold text-[#2C1E16]">{a.name} <span className="ml-1 rounded-full bg-[#EFE6D5] px-2 py-0.5 text-xs text-[#8B5A2B]">{a.role}</span></div><div className="text-xs text-[#8B7355]">{a.email}</div>{a.role === "employee" && wageMap[a.id] && <div className="mt-0.5 text-xs text-[#8B5A2B]" data-testid={`admin-wage-${a.id}`}>Upah: {Object.entries(wageMap[a.id].totals || {}).map(([c, v]) => `${Math.round(v).toLocaleString("de-DE")} ${c}`).join(" · ") || "—"} ({wageMap[a.id].count || 0}x)</div>}</div>
+              {a.role !== "owner" && (
+                <div className="flex items-center gap-1">
+                  <span className={`rounded-full px-2 py-0.5 text-xs ${a.status === "inactive" ? "bg-red-100 text-red-700" : "bg-green-100 text-green-700"}`} data-testid={`admin-status-${a.id}`}>{a.status === "inactive" ? "Nonaktif" : "Aktif"}</span>
+                  <Button variant="outline" size="sm" onClick={() => resetPw(a)} data-testid={`reset-admin-${a.id}`} className="h-7 rounded-lg text-xs">Reset Sandi</Button>
+                  <Button variant="outline" size="sm" onClick={() => toggleStatus(a)} data-testid={`toggle-admin-${a.id}`} className="h-7 rounded-lg text-xs">{a.status === "inactive" ? "Aktifkan" : "Nonaktifkan"}</Button>
+                  <button onClick={() => del(a)} data-testid={`del-admin-${a.id}`} className="p-1.5 text-red-500"><Trash2 size={16} /></button>
+                </div>
+              )}
             </div>
             {a.role !== "owner" ? (
               <div className="mt-3 flex flex-wrap gap-4 border-t border-[#F1EBE0] pt-3">

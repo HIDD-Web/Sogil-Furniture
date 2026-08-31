@@ -19,6 +19,10 @@ export default function CustomerAccount() {
   const [orders, setOrders] = useState([]);
   const [points, setPoints] = useState(null);
   const [claim, setClaim] = useState({ order_number: "", phone: "" });
+  const [showRecover, setShowRecover] = useState(false);
+  const [recoverPhone, setRecoverPhone] = useState("");
+  const [recoverResult, setRecoverResult] = useState(null);
+  const [pw, setPw] = useState({ current_password: "", new_password: "", confirm: "" });
 
   useEffect(() => {
     if (customer) {
@@ -38,6 +42,18 @@ export default function CustomerAccount() {
   };
 
   if (!checked) return <div className="py-20 text-center text-[#8B7355]">Memuat...</div>;
+
+  const findUsername = async () => {
+    if (!recoverPhone) return toast.error("Isi No HP terdaftar");
+    try { const r = await api.post("/customer/find-username", { phone: recoverPhone }); setRecoverResult(r.data.username); }
+    catch (e) { setRecoverResult(null); toast.error(formatApiError(e.response?.data?.detail)); }
+  };
+  const changePw = async () => {
+    if (!pw.current_password || !pw.new_password) return toast.error("Lengkapi sandi");
+    if (pw.new_password !== pw.confirm) return toast.error("Konfirmasi sandi tidak cocok");
+    try { await api.post("/customer/change-password", { current_password: pw.current_password, new_password: pw.new_password }); toast.success("Kata sandi diperbarui"); setPw({ current_password: "", new_password: "", confirm: "" }); }
+    catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
+  };
 
   if (!customer) {
     const submit = async (e) => {
@@ -67,6 +83,20 @@ export default function CustomerAccount() {
           <button onClick={() => setMode(mode === "register" ? "login" : "register")} className="mt-3 w-full text-center text-sm text-[#8B5A2B]" data-testid="toggle-mode">
             {mode === "register" ? "Sudah punya akun? Masuk" : "Belum punya akun? Daftar"}
           </button>
+          <div className="mt-4 border-t border-[#F1EBE0] pt-3">
+            <button type="button" onClick={() => setShowRecover(!showRecover)} data-testid="forgot-toggle" className="text-xs text-[#8B7355] underline">Lupa username / kata sandi?</button>
+            {showRecover && (
+              <div className="mt-2 space-y-2 rounded-xl bg-[#FBF9F4] p-3" data-testid="recover-panel">
+                <Label className="block text-xs text-[#5C4A3D]">Masukkan No HP terdaftar untuk menemukan username kamu.</Label>
+                <div className="flex gap-2">
+                  <Input value={recoverPhone} onChange={(e) => setRecoverPhone(e.target.value)} placeholder="+201234567890" data-testid="recover-phone" className="bg-white" />
+                  <Button type="button" onClick={findUsername} data-testid="recover-submit" className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Cari</Button>
+                </div>
+                {recoverResult && <div className="text-sm text-[#2C1E16]" data-testid="recover-result">Username kamu: <b>{recoverResult}</b></div>}
+                <p className="text-xs text-[#8B7355]">Lupa kata sandi? Hubungi admin/toko via WhatsApp untuk reset yang aman — admin tidak pernah bisa melihat sandi lama, hanya menyetel sandi baru.</p>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -106,6 +136,16 @@ export default function CustomerAccount() {
           <Input value={claim.phone} onChange={(e) => setClaim({ ...claim, phone: e.target.value })} placeholder="+201234567890" data-testid="claim-phone" className="bg-white" />
         </div>
         <Button onClick={claimOrder} data-testid="claim-submit" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Klaim Pesanan</Button>
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="change-password-card">
+        <div className="font-heading font-bold text-[#2C1E16]">Ubah Kata Sandi</div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+          <Input type="password" value={pw.current_password} onChange={(e) => setPw({ ...pw, current_password: e.target.value })} placeholder="Sandi saat ini" data-testid="pw-current" className="bg-white" />
+          <Input type="password" value={pw.new_password} onChange={(e) => setPw({ ...pw, new_password: e.target.value })} placeholder="Sandi baru (min 6)" data-testid="pw-new" className="bg-white" />
+          <Input type="password" value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} placeholder="Konfirmasi sandi baru" data-testid="pw-confirm" className="bg-white" />
+        </div>
+        <Button onClick={changePw} data-testid="pw-submit" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Simpan Sandi Baru</Button>
       </div>
 
       <h2 className="mt-8 font-heading text-lg font-bold text-[#2C1E16]">Riwayat Pesanan</h2>

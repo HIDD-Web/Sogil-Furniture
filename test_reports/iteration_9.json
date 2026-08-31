@@ -1,0 +1,53 @@
+{
+  "summary": "V8 targeted maintenance pass: finance category classification (revenue/cost/transfer effects on stats + balance), transfer endpoint, custom-category soft-delete, employee wage tracking (create + delete linkage), customer find-username, owner-only reset-password (+RBAC 403 for non-owner), and order_revenue regression. 19/19 backend pytest cases pass. Frontend testids verified on /admin/finance (xfer-from/to auto-opposite works, cat-classification, custom-cat-*, wage-emp-*), /akun (forgot-toggle -> recover-panel/phone/submit), and header /lacak nav link. No existing/historical data was deleted (all TEST_ artifacts cleaned up in TestZzzCleanup).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "scenarios": {
+    "income_revenue_increases_revenue_and_balance": "PASS",
+    "income_transfer_no_revenue_only_balance": "PASS - transfer-classified income does NOT leak into Revenue; balance increases",
+    "expense_cost_increases_cost_and_decreases_balance": "PASS",
+    "expense_transfer_no_cost_only_balance_down": "PASS - owner-withdrawal/prive pattern verified",
+    "transfer_endpoint_same_account_400": "PASS",
+    "transfer_endpoint_moves_balance_not_revenue_or_cost": "PASS - IDR->EGP moves both balances, revenue/cost unchanged",
+    "soft_delete_hides_from_selectable_but_keeps_txn_history": "PASS - GET /admin/finance/categories excludes inactive; historical txn keeps snapshot category + classification",
+    "put_reactivate_and_change_classification": "PASS",
+    "wage_expense_creates_linked_employee_wage_record": "PASS - recipient_employee_id/name on txn + employee_wages row with recorded_by_name",
+    "delete_wage_txn_removes_linked_wage_no_orphan": "PASS - no double-count, no orphan history",
+    "find_username_success_returns_only_username_no_leak": "PASS - {username} only, no password/password_hash/other fields",
+    "find_username_404_unknown_phone": "PASS",
+    "find_username_400_invalid_phone": "PASS",
+    "reset_password_short_400": "PASS - min 6 chars enforced",
+    "reset_password_success_old_fails_new_works_no_password_in_response": "PASS",
+    "reset_password_non_owner_403": "PASS - non-owner admin (with access_finance+manage_orders) is 403 for reset AND for DELETE customer",
+    "order_revenue_paid_order_increments_revenue": "PASS - order.total_le added to EGP.revenue on payment_status=lunas",
+    "order_revenue_delete_paid_order_reverses": "PASS - deleting paid order removes the order_revenue txn",
+    "ui_header_lacak_nav_link": "PASS - a[href='/lacak'] present in desktop header",
+    "ui_customer_forgot_recover_panel": "PASS - forgot-toggle expands recover-panel with recover-phone/recover-submit",
+    "ui_admin_finance_testids": "PASS - xfer-from/xfer-to/xfer-from-amount/xfer-to-amount/cat-classification present; selecting IDR/EGP on one side auto-sets opposite on the other",
+    "ui_wage_summary_cards": "PASS - wage-emp-{id} cards render",
+    "ui_custom_cat_rows": "PASS - custom-cat-{id} rows render"
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v8_features.py",
+    "/app/test_reports/pytest/v8_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now ~1968 lines — split into routers (finance/customers/orders/admin) recommended for maintainability.",
+    "finance_update recomputes classification but only propagates amount/currency/date to linked wage; it does NOT re-link when category changes to/from wage or when recipient_employee_id changes on update. Minor: safe for current UI (create-only wage recipient), but PUT could leave stale wage rows if a wage txn's category is edited to non-wage or vice-versa. Consider syncing employee_wages on update (delete+insert when wage-ness/recipient changes).",
+    "_compute_balances treats order_revenue as increasing balance even though order-linked revenue may or may not correspond to actual cash-in yet. Not part of this pass but worth reviewing later.",
+    "txn-recipient select is intentionally conditional on wage category on the frontend — matches spec; no issue.",
+    "AdminFinance.jsx: xfer 'Dari'/'Ke' auto-set opposite is duplicated on both onValueChange handlers; small helper could DRY it."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v8_features.py",
+    "/app/test_reports/pytest/v8_results.xml"
+  ],
+  "success_rate": {"backend": "100% (19/19)", "frontend": "100% (all V8 testids present and interactive)"},
+  "test_credentials": "owner admin: syahid.mujahid02@gmail.com / 0LFOCWU9_V3k; existing employee 'Azka' (role employee).",
+  "seed_data_creation": "Ephemeral TEST_ customers/categories/txns/orders/admins created with UNIQUE+PHONE_STAMP and cleaned up in TestZzzCleanup. No pre-existing V1-V7 data was modified or deleted.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Use /app/backend/tests/test_v8_features.py for V8 regression (run with -n 0). Wage tests target existing 'Azka' employee. Reset-password non-owner test creates+deletes a throwaway admin with access_finance+manage_orders. Order regression test uses a pickup rak-kayu order (config type B, length 60, level 2, finishing melamine).",
+  "rca of the issue": "n/a - no bugs found in V8 scope."
+}

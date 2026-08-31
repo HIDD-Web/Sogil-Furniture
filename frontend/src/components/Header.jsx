@@ -19,6 +19,7 @@ export const Header = ({ storeInfo }) => {
     { to: "/", label: t("nav.beranda") },
     { to: "/produk", label: t("nav.produk") },
     { to: "/cara-pesan", label: t("nav.cara_pesan") },
+    { to: "/lacak", label: "Lacak Pesanan" },
     { to: "/kontak", label: t("nav.kontak") },
   ];
 

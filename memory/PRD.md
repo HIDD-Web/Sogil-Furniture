@@ -84,5 +84,16 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - NO schema migration; array order is the persisted ordering. Referral/points and order-privacy rules verified intact.
 - Tests: /app/backend/tests/test_v7_features.py 12/12 PASS (iteration_8.json). Scenarios A-T all PASS.
 
+### Phase 1 — production update (2026-06): accounts, RBAC, finance, wage, XLSX export
+- Canonical Owner: single owner renamed to sogil.furniture@gmail.com (ADMIN_EMAIL in backend/.env updated; old syahid.mujahid02@gmail.com rejected). Stale duplicate owner ownersogil@gmail.com demoted to manager+inactive (no deletion). Seed no longer recreates a duplicate.
+- Account mgmt/RBAC: owner edits name/role/permissions/status via PUT /admin/admins/{id} (same id, no new account); non-owner cannot create/promote owner; owner-only endpoints 403 for others.
+- Passwords: admin self change-password (existing) + owner reset admin password via update_admin (bcrypt, no leak); customer self POST /customer/change-password; owner reset customer password (prior round). No plaintext/hash ever exposed.
+- Admin status: PUT /admin/admins/{id} {status} activate/deactivate; deactivated employees excluded from wage-recipient list; wage history preserved. UI: AdminAdmins status badge/toggle/reset + employee wage totals.
+- Employee↔wage: employee account = single identity + wage recipient. Recording an expense in a wage category (Pekerja/Upah/Wage) with recipient creates ONE finance txn (source of truth) + linked employee_wages row (category/description/recorded_by). employee_wages_summary adds month/year/count. finance_update fully re-syncs wage link on edit (category/recipient/wage-ness change); delete removes linked wage. No duplicate money/identity.
+- Finance categories: income=[Penjualan, Pendapatan Lain] (removed Penyesuaian); 14 new expense categories incl Pekerja. Historical txn snapshots preserved. Custom categories: create/edit/soft-delete/reactivate with classification (revenue|cost|transfer). Classification integrity in stats+balances (transfers move balance only, never revenue/cost; order_revenue always revenue).
+- Finance transfer IDR↔EGP (Akun labels + auto-opposite, same-account blocked). Transaction search GET /admin/finance/transactions?q= (description/category/type/classification/created_by/recipient/amount). Statistics page /admin/finance/statistics (category rankings + count/pct + revenue/transfer/cost totals + operating profit; presets incl last_3_months). Monthly charts refetch on every mutation (no refresh).
+- XLSX exports (openpyxl) at /admin/export: Keuangan, Pesanan, Analitik Konfigurasi, Pelanggan, Akun+Upah (owner-only, 2 sheets), Harga Produk (history+current). RBAC-gated, read-only, NO passwords/hashes/tokens/secrets (verified by openpyxl cell scan). Product price-history recorded forward-only on product edit; historical order prices immutable.
+- Tests: /app/backend/tests/test_v9_features.py 26/26 PASS (iteration_10.json). No historical data deleted; single canonical owner.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

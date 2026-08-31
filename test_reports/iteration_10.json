@@ -1,0 +1,66 @@
+{
+  "summary": "V9 Phase-1 backend + UI verification. 26/26 pytest cases pass in /app/backend/tests/test_v9_features.py. Verified: canonical owner login (sogil.furniture@gmail.com OK, old syahid.mujahid02@gmail.com -> 401), exactly ONE owner in GET /api/admin/admins with all permissions; RBAC (POST role=owner -> 400, non-owner 403 on POST/PUT/DELETE /admin/admins and /admin/export/accounts); owner reset-password sets bcrypt, response never leaks password/hash, old fails, new works; admin status inactive hides employee from /admin/employees while wage history preserved in /admin/employees/wages; wage auto-link on category 'Pekerja' with recipient (single finance txn + one employee_wages row with category/description/recorded_by_name), delete txn removes wage; finance categories (income=Penjualan+Pendapatan Lain, no Penyesuaian; 14 expense incl Pekerja/Material/Air & Listrik/Marketing/Pengembangan Aplikasi Web); GET /admin/finance/transactions?q= matches description & numeric amount; /admin/finance/statistics returns income[]/expense[] with count/pct/classification and totals {revenue, transfer_income, cost, transfer_expense, operating_profit} — transfers never in revenue/cost, operating_profit = revenue-cost; last_3_months period supported; /admin/finance/monthly 200; XLSX exports (finance, orders, config-analytics, customers, accounts[2 sheets], product-prices) valid content-type + non-zero + NO bcrypt/password/token/hash keys anywhere in cells or headers (openpyxl scan); accounts export owner-only 403 for non-owner; product PUT records price_history visible in export/product-prices; customer /customer/change-password enforces current+min6 + immediate effect; paid-order revenue + delete-reverse regression intact. UI: /admin/finance/statistics renders stat-totals + stat-period; /admin/export shows all 6 export buttons + export-period; AdminAdmins has reset-admin-{id}/toggle-admin-{id}/admin-status-{id} on every row; AdminFinance shows txn-search + txn-search-btn (txn-search-clear appears only when a search is active — expected UX).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "/admin/finance", "issues": ["Recharts warning: 'width(-1) and height(-1) of chart should be greater than 0' — chart container size race on initial render; visual only, not blocking."]}
+    ]
+  },
+  "scenarios": {
+    "owner_new_email_login_200": "PASS",
+    "owner_old_email_login_401": "PASS",
+    "exactly_one_owner_in_db": "PASS",
+    "owner_has_all_permissions": "PASS",
+    "post_role_owner_400": "PASS",
+    "put_edit_role_keeps_same_id": "PASS",
+    "non_owner_403_on_admin_endpoints": "PASS",
+    "owner_reset_admin_password_no_leak_old_fails_new_works": "PASS",
+    "admin_status_inactive_hides_from_employee_list_wages_preserved": "PASS",
+    "wage_link_create_and_delete_sync": "PASS",
+    "finance_categories_defaults": "PASS (no Penyesuaian; 14 expense incl requested five)",
+    "finance_txn_search_q": "PASS (description + amount)",
+    "finance_statistics_totals_and_transfer_isolation": "PASS",
+    "finance_statistics_last_3_months": "PASS",
+    "finance_monthly_endpoint_200": "PASS",
+    "xlsx_finance": "PASS (no secrets)",
+    "xlsx_orders": "PASS (no secrets)",
+    "xlsx_config_analytics": "PASS (no secrets)",
+    "xlsx_customers": "PASS (no password fields, no bcrypt)",
+    "xlsx_accounts_two_sheets": "PASS (Akun + Riwayat Upah; no secrets)",
+    "xlsx_product_prices": "PASS (Riwayat Perubahan Harga + Harga Saat Ini)",
+    "xlsx_accounts_owner_only_403": "PASS",
+    "product_price_history_recorded": "PASS",
+    "customer_change_password_wrong_400_short_400_success_login_flip": "PASS",
+    "order_revenue_paid_and_delete_reverse": "PASS",
+    "ui_statistics_page_renders": "PASS",
+    "ui_export_page_all_buttons": "PASS",
+    "ui_admin_admins_status_toggle_reset_testids": "PASS"
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_v9_features.py",
+    "/app/test_reports/pytest/v9_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 2194 lines — split into routers (auth, finance, admin_admins, exports, customers, orders) is overdue for maintainability.",
+    "finance_update (PUT /admin/finance/transactions/{id}) still propagates only amount/currency/date to employee_wages; it does NOT re-link when category flips wage/non-wage or when recipient_employee_id changes on edit — leftover from V8 comment. Low likelihood but recommend delete+insert on wage-ness/recipient change.",
+    "Recharts container reports width/height(-1) briefly on /admin/finance — wrap chart in ResponsiveContainer with explicit min height, or defer render until layout ready to silence warnings.",
+    "employee_wages_summary iterates over all employees and does a per-employee find on employee_wages — N+1 pattern; consider single $group aggregation for scale.",
+    "export_customers/export_accounts do not filter deleted/inactive customers — acceptable but consider a status filter param for the UI.",
+    "xdist parallel run: module-level `_created_*` lists in test files are per-worker; TestZzzCleanup only sees its own worker's list. Left over from prior iterations too. I manually swept leaked TEST_ txns/admins/categories after this run; recommend switching to a query-based cleanup (`?q=TEST_`) or `-n 0` for these files.",
+    "AdminFinance.jsx txn-search-clear renders only when txnSearch truthy — matches UX; not a bug, but worth adding data-testid on a persistent placeholder if E2E scripts need to assert its absence."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_v9_features.py",
+    "/app/test_reports/pytest/v9_results.xml"
+  ],
+  "success_rate": {"backend": "100% (26/26)", "frontend": "100% (all new testids present, both new pages render, admin admins CRUD testids ok)"},
+  "test_credentials": "owner: sogil.furniture@gmail.com / 0LFOCWU9_V3k (old syahid.mujahid02@gmail.com rejected). Existing employee 'Azka' used for wage tests.",
+  "seed_data_creation": "Ephemeral TEST_V9<ts>_* admins/customers/txns/custom-categories created with UNIQUE+PHONE_STAMP and cleaned up in TestZzzCleanup. Manually swept leaked entries from an aborted -x first run to keep the DB clean (see cleanup script output).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Use /app/backend/tests/test_v9_features.py for V9 Phase-1 regression (works with xdist). Customer login payload uses 'identifier' not 'username'. Orders API requires customer_address + payment_method and item key is 'config' not 'configuration'. Owner login is sogil.furniture@gmail.com / 0LFOCWU9_V3k. Export security check scans workbook cells for bcrypt regex $2[aby]$ and header keys password/password_hash/token/hash/secret — leverage the helper `_assert_no_secrets` for any future export test.",
+  "rca of the issue": "n/a - all Phase-1 review scenarios pass."
+}

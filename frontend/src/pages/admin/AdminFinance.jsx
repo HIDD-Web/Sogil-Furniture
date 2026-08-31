@@ -19,46 +19,58 @@ export default function AdminFinance() {
   const [cats, setCats] = useState({ income: [], expense: [] });
   const [period, setPeriod] = useState("this_month");
   const [range, setRange] = useState({ start: "", end: "" });
-  const [form, setForm] = useState({ type: "expense", category: "", amount: "", currency: "EGP", description: "", date: "" });
+  const [form, setForm] = useState({ type: "expense", category: "", amount: "", currency: "EGP", description: "", date: "", recipient_employee_id: "" });
   const [xfer, setXfer] = useState({ from_account: "IDR", to_account: "EGP", from_amount: "", to_amount: "", exchange_rate: "", description: "", date: "" });
   const [adj, setAdj] = useState({ account: "EGP", new_balance: "", description: "" });
-  const [newCat, setNewCat] = useState({ name: "", type: "expense" });
+  const [newCat, setNewCat] = useState({ name: "", type: "expense", classification: "cost" });
   const [chart, setChart] = useState({ currency: "EGP", year: new Date().getFullYear(), data: [] });
+  const [customCats, setCustomCats] = useState([]);
+  const [employees, setEmployees] = useState([]);
+  const [wages, setWages] = useState([]);
+  const [txnSearch, setTxnSearch] = useState("");
+  const [txnInput, setTxnInput] = useState("");
 
   const loadStats = () => {
     const p = { period };
     if (period === "custom") { p.start = range.start; p.end = range.end; }
     api.get("/admin/finance/stats", { params: p }).then((r) => setStats(r.data));
   };
-  const loadTxns = () => api.get("/admin/finance/transactions").then((r) => setTxns(r.data));
-  useEffect(() => { api.get("/admin/finance/categories").then((r) => setCats(r.data)); loadTxns(); }, []);
+  const loadTxns = () => api.get("/admin/finance/transactions", { params: txnSearch ? { q: txnSearch } : {} }).then((r) => setTxns(r.data));
+  const loadChart = () => api.get("/admin/finance/monthly", { params: { year: chart.year, currency: chart.currency } })
+    .then((r) => setChart((c) => ({ ...c, data: r.data.months.map((m) => ({ name: m.label.slice(5), Revenue: Math.round(m.revenue), Profit: Math.round(m.profit) })) })));
+  const loadConfig = () => {
+    api.get("/admin/finance/categories").then((r) => setCats(r.data));
+    api.get("/admin/finance/custom-categories").then((r) => setCustomCats(r.data)).catch(() => {});
+    api.get("/admin/employees").then((r) => setEmployees(r.data)).catch(() => {});
+    api.get("/admin/employees/wages").then((r) => setWages(r.data)).catch(() => {});
+  };
+  useEffect(() => { loadConfig(); }, []);
+  useEffect(() => { loadTxns(); }, [txnSearch]);
   useEffect(() => { loadStats(); }, [period, range.start, range.end]);
-  useEffect(() => {
-    api.get("/admin/finance/monthly", { params: { year: chart.year, currency: chart.currency } })
-      .then((r) => setChart((c) => ({ ...c, data: r.data.months.map((m) => ({ name: m.label.slice(5), Revenue: Math.round(m.revenue), Profit: Math.round(m.profit) })) })));
-  }, [chart.currency, chart.year]);
+  useEffect(() => { loadChart(); }, [chart.currency, chart.year]);
 
   const addTxn = async () => {
     if (!form.category || !form.amount) return toast.error("Lengkapi kategori & jumlah");
-    try { await api.post("/admin/finance/transactions", { ...form, amount: Number(form.amount) }); toast.success("Transaksi ditambahkan"); setForm({ ...form, amount: "", description: "" }); loadTxns(); loadStats(); }
+    try { await api.post("/admin/finance/transactions", { ...form, amount: Number(form.amount) }); toast.success("Transaksi ditambahkan"); setForm({ ...form, amount: "", description: "", recipient_employee_id: "" }); loadTxns(); loadStats(); loadConfig(); loadChart(); }
     catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
   };
   const addXfer = async () => {
     if (!xfer.from_amount || !xfer.to_amount) return toast.error("Lengkapi jumlah transfer");
-    try { await api.post("/admin/finance/transfer", { ...xfer, from_amount: Number(xfer.from_amount), to_amount: Number(xfer.to_amount), exchange_rate: xfer.exchange_rate ? Number(xfer.exchange_rate) : null }); toast.success("Transfer dicatat"); setXfer({ ...xfer, from_amount: "", to_amount: "", exchange_rate: "" }); loadTxns(); loadStats(); }
+    try { await api.post("/admin/finance/transfer", { ...xfer, from_amount: Number(xfer.from_amount), to_amount: Number(xfer.to_amount), exchange_rate: xfer.exchange_rate ? Number(xfer.exchange_rate) : null }); toast.success("Transfer dicatat"); setXfer({ ...xfer, from_amount: "", to_amount: "", exchange_rate: "" }); loadTxns(); loadStats(); loadChart(); }
     catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
   };
-  const del = async (id) => { if (!window.confirm("Hapus transaksi?")) return; await api.delete(`/admin/finance/transactions/${id}`); loadTxns(); loadStats(); };
+  const del = async (id) => { if (!window.confirm("Hapus transaksi?")) return; await api.delete(`/admin/finance/transactions/${id}`); loadTxns(); loadStats(); loadConfig(); loadChart(); };
   const setBalance = async () => {
     if (adj.new_balance === "") return toast.error("Isi saldo baru");
-    try { await api.post("/admin/finance/balance-adjust", { ...adj, new_balance: Number(adj.new_balance) }); toast.success("Saldo disesuaikan"); setAdj({ ...adj, new_balance: "", description: "" }); loadStats(); loadTxns(); }
+    try { await api.post("/admin/finance/balance-adjust", { ...adj, new_balance: Number(adj.new_balance) }); toast.success("Saldo disesuaikan"); setAdj({ ...adj, new_balance: "", description: "" }); loadStats(); loadTxns(); loadChart(); }
     catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
   };
   const addCat = async () => {
     if (!newCat.name) return toast.error("Isi nama kategori");
-    try { await api.post("/admin/finance/custom-categories", newCat); toast.success("Kategori ditambahkan"); setNewCat({ name: "", type: "expense" }); api.get("/admin/finance/categories").then((r) => setCats(r.data)); }
+    try { await api.post("/admin/finance/custom-categories", newCat); toast.success("Kategori ditambahkan"); setNewCat({ name: "", type: "expense", classification: "cost" }); loadConfig(); }
     catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
   };
+  const delCat = async (c) => { if (!window.confirm(`Nonaktifkan kategori "${c.name}"? Transaksi lama tetap tersimpan dengan kategorinya.`)) return; await api.delete(`/admin/finance/custom-categories/${c.id}`); toast.success("Kategori dinonaktifkan"); loadConfig(); };
 
   const Cmp = ({ v }) => v == null ? null : (
     <span className={`ml-2 inline-flex items-center text-xs font-medium ${v >= 0 ? "text-green-600" : "text-red-600"}`}>{v >= 0 ? <TrendingUp size={12} /> : <TrendingDown size={12} />} {v >= 0 ? "+" : ""}{v}%</span>
@@ -115,6 +127,9 @@ export default function AdminFinance() {
             <Select value={form.currency} onValueChange={(v) => setForm({ ...form, currency: v })}><SelectTrigger data-testid="txn-currency" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="EGP">EGP</SelectItem><SelectItem value="IDR">IDR</SelectItem></SelectContent></Select>
           </div>
           <Select value={form.category} onValueChange={(v) => setForm({ ...form, category: v })}><SelectTrigger data-testid="txn-category" className="mt-2 bg-white"><SelectValue placeholder="Kategori" /></SelectTrigger><SelectContent>{(cats[form.type] || []).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent></Select>
+          {form.type === "expense" && /upah|wage/i.test(form.category) && (
+            <Select value={form.recipient_employee_id} onValueChange={(v) => setForm({ ...form, recipient_employee_id: v })}><SelectTrigger data-testid="txn-recipient" className="mt-2 bg-white"><SelectValue placeholder="Penerima (Karyawan) — opsional" /></SelectTrigger><SelectContent>{employees.length ? employees.map((e) => <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>) : <div className="px-2 py-1.5 text-xs text-[#8B7355]">Belum ada akun karyawan</div>}</SelectContent></Select>
+          )}
           <Input type="number" placeholder="Jumlah" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} data-testid="txn-amount" className="mt-2 bg-white" />
           <Textarea placeholder="Deskripsi (opsional)" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="mt-2 bg-white" />
           <Button onClick={addTxn} data-testid="txn-save" className="mt-2 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Simpan Transaksi</Button>
@@ -123,8 +138,8 @@ export default function AdminFinance() {
         <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm">
           <div className="mb-3 flex items-center gap-2 font-heading font-bold text-[#2C1E16]"><ArrowRightLeft size={18} /> Transfer / Konversi</div>
           <div className="grid grid-cols-2 gap-2">
-            <Select value={xfer.from_account} onValueChange={(v) => setXfer({ ...xfer, from_account: v })}><SelectTrigger data-testid="xfer-from" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="IDR">Dari IDR</SelectItem><SelectItem value="EGP">Dari EGP</SelectItem></SelectContent></Select>
-            <Select value={xfer.to_account} onValueChange={(v) => setXfer({ ...xfer, to_account: v })}><SelectTrigger data-testid="xfer-to" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="EGP">Ke EGP</SelectItem><SelectItem value="IDR">Ke IDR</SelectItem></SelectContent></Select>
+            <div><Label className="mb-1 block text-xs text-[#8B7355]">Dari</Label><Select value={xfer.from_account} onValueChange={(v) => setXfer({ ...xfer, from_account: v, to_account: v === "IDR" ? "EGP" : "IDR" })}><SelectTrigger data-testid="xfer-from" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="IDR">Akun IDR</SelectItem><SelectItem value="EGP">Akun EGP</SelectItem></SelectContent></Select></div>
+            <div><Label className="mb-1 block text-xs text-[#8B7355]">Ke</Label><Select value={xfer.to_account} onValueChange={(v) => setXfer({ ...xfer, to_account: v, from_account: v === "IDR" ? "EGP" : "IDR" })}><SelectTrigger data-testid="xfer-to" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="IDR">Akun IDR</SelectItem><SelectItem value="EGP">Akun EGP</SelectItem></SelectContent></Select></div>
           </div>
           <Input type="number" placeholder="Jumlah keluar" value={xfer.from_amount} onChange={(e) => setXfer({ ...xfer, from_amount: e.target.value })} data-testid="xfer-from-amount" className="mt-2 bg-white" />
           <Input type="number" placeholder="Jumlah diterima" value={xfer.to_amount} onChange={(e) => setXfer({ ...xfer, to_amount: e.target.value })} data-testid="xfer-to-amount" className="mt-2 bg-white" />
@@ -172,15 +187,59 @@ export default function AdminFinance() {
           <div className="mb-3 font-heading font-bold text-[#2C1E16]">Kategori Transaksi Kustom</div>
           <div className="grid grid-cols-2 gap-2">
             <Input placeholder="Nama kategori" value={newCat.name} onChange={(e) => setNewCat({ ...newCat, name: e.target.value })} data-testid="cat-name" className="bg-white" />
-            <Select value={newCat.type} onValueChange={(v) => setNewCat({ ...newCat, type: v })}><SelectTrigger data-testid="cat-type" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="expense">Pengeluaran</SelectItem><SelectItem value="income">Pemasukan</SelectItem></SelectContent></Select>
+            <Select value={newCat.type} onValueChange={(v) => setNewCat({ ...newCat, type: v, classification: v === "income" ? "revenue" : "cost" })}><SelectTrigger data-testid="cat-type" className="bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="expense">Pengeluaran</SelectItem><SelectItem value="income">Pemasukan</SelectItem></SelectContent></Select>
           </div>
+          <Select value={newCat.classification} onValueChange={(v) => setNewCat({ ...newCat, classification: v })}><SelectTrigger data-testid="cat-classification" className="mt-2 bg-white"><SelectValue /></SelectTrigger><SelectContent>
+            {newCat.type === "income" ? (<><SelectItem value="revenue">Revenue (masuk laba)</SelectItem><SelectItem value="transfer">Transfer / Non-Revenue (mis. modal)</SelectItem></>) : (<><SelectItem value="cost">Cost (masuk laba)</SelectItem><SelectItem value="transfer">Transfer / Non-Cost (mis. prive)</SelectItem></>)}
+          </SelectContent></Select>
           <Button onClick={addCat} data-testid="cat-save" className="mt-2 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Tambah Kategori</Button>
+          {customCats.filter((c) => c.status !== "inactive").length > 0 && (
+            <div className="mt-3 space-y-1.5 border-t border-[#F1EBE0] pt-3">
+              {customCats.filter((c) => c.status !== "inactive").map((c) => (
+                <div key={c.id} className="flex items-center justify-between text-sm" data-testid={`custom-cat-${c.id}`}>
+                  <span className="text-[#5C4A3D]">{c.name} <span className="text-xs text-[#8B7355]">· {c.type === "income" ? "Pemasukan" : "Pengeluaran"} · {c.classification === "transfer" ? "Transfer" : c.classification === "revenue" ? "Revenue" : "Cost"}</span></span>
+                  <button onClick={() => delCat(c)} data-testid={`custom-cat-del-${c.id}`} className="p-1 text-red-500"><Trash2 size={14} /></button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
+      {/* Employee wages */}
+      {wages.length > 0 && (
+        <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="wage-summary">
+          <div className="mb-3 font-heading font-bold text-[#2C1E16]">Upah Karyawan</div>
+          <div className="space-y-3">
+            {wages.map((w) => (
+              <div key={w.id} className="rounded-xl border border-[#F1EBE0] p-3" data-testid={`wage-emp-${w.id}`}>
+                <div className="flex items-center justify-between">
+                  <div className="font-medium text-[#2C1E16]">{w.name}</div>
+                  <div className="text-sm font-semibold text-[#8B5A2B]">{Object.entries(w.totals).map(([c, v]) => money(v, c)).join(" · ") || "—"}</div>
+                </div>
+                {w.history.length > 0 && (
+                  <div className="mt-2 space-y-1 text-xs text-[#8B7355]">
+                    {w.history.slice(0, 5).map((h) => (
+                      <div key={h.id} className="flex justify-between"><span>{(h.date || "").slice(0, 10)} · dicatat oleh {h.recorded_by_name || "-"}</span><span className="font-medium text-[#5C4A3D]">{money(h.amount, h.currency)}</span></div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Transactions list */}
       <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm">
-        <div className="mb-3 font-heading font-bold text-[#2C1E16]">Riwayat Transaksi</div>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <span className="font-heading font-bold text-[#2C1E16]">Riwayat Transaksi</span>
+          <div className="flex gap-2">
+            <Input value={txnInput} onChange={(e) => setTxnInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && setTxnSearch(txnInput.trim())} placeholder="Cari deskripsi, kategori, jumlah, penerima..." data-testid="txn-search" className="w-64 bg-white" />
+            <Button onClick={() => setTxnSearch(txnInput.trim())} data-testid="txn-search-btn" className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Cari</Button>
+            {txnSearch && <Button variant="outline" onClick={() => { setTxnInput(""); setTxnSearch(""); }} data-testid="txn-search-clear" className="rounded-xl">Reset</Button>}
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="text-left text-xs uppercase text-[#8B7355]"><tr><th className="py-2">Tanggal</th><th>Tipe</th><th>Kategori</th><th>Jumlah</th><th>Oleh</th><th></th></tr></thead>

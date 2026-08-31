@@ -29,6 +29,12 @@ export default function AdminCustomers() {
     try { await api.delete(`/admin/customers/${detail.customer.id}`); toast.success("Akun dihapus permanen"); setDetail(null); load(); }
     catch (e) { toast.error(e.response?.data?.detail || "Gagal menghapus"); }
   };
+  const resetPassword = async () => {
+    const np = window.prompt(`Set kata sandi baru untuk ${detail.customer.username} (min 6 karakter). Admin tidak melihat sandi lama.`);
+    if (!np) return;
+    try { await api.post(`/admin/customers/${detail.customer.id}/reset-password`, { new_password: np }); toast.success("Kata sandi pelanggan direset"); }
+    catch (e) { toast.error(e.response?.data?.detail || "Gagal reset sandi"); }
+  };
   const doAdjust = async () => {
     if (!adj.amount || !adj.reason) return toast.error("Isi jumlah & alasan");
     try { await api.post(`/admin/customers/${detail.customer.id}/adjust-points`, { amount: Number(adj.amount), reason: adj.reason }); toast.success("Poin disesuaikan"); setAdj({ amount: "", reason: "" }); open({ id: detail.customer.id }); }
@@ -68,6 +74,7 @@ export default function AdminCustomers() {
             {isOwner && (
               <Button variant="outline" onClick={toggleActive} data-testid="toggle-customer-active" className={`mt-3 rounded-xl ${detail.customer.active !== false ? "border-red-300 text-red-600 hover:bg-red-50" : "border-green-300 text-green-700 hover:bg-green-50"}`}>{detail.customer.active !== false ? "Nonaktifkan Akun" : "Aktifkan Akun"}</Button>
             )}
+            {isOwner && <Button variant="outline" onClick={resetPassword} data-testid="reset-customer-password" className="mt-2 ml-2 rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B]">Reset Sandi</Button>}
             {isOwner && detail.orders.length === 0 && (
               <Button variant="ghost" onClick={permanentDelete} data-testid="delete-customer-permanent" className="mt-2 ml-2 rounded-xl text-xs text-red-600 hover:bg-red-50">Hapus Permanen (akun uji/spam)</Button>
             )}
