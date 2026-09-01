@@ -34,7 +34,7 @@ export default function Home() {
             </div>
           </div>
           <div className="grid grid-cols-2 gap-4">
-            {[0, 1, 2, 3].map((i) => (
+            {[0, 1, 2].map((i) => (
               <div key={i} className={`rounded-2xl border border-[#E5DCC5] bg-white p-3 shadow-sm ${i % 2 ? "mt-6" : ""}`}>
                 <ProductImage url={featured[i]?.display_image} ratio="aspect-square" />
               </div>

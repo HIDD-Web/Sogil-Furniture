@@ -110,5 +110,12 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - Zero data touched: rak restored to canonical (pricing byte-intact, priority length>level>type>finishing, note preserved); meja_rak untouched; extra-photos round-trip verified then cleaned up.
 - DEFERRED to Phase 2B-cont (budget): Tasks D–G multilingual completion (footer/checkout/order-summary/confirmation i18n audit), WhatsApp message language, admin language switcher (default id), Arabic location/store-address fields with fallback, dark-mode audit, broader mobile audit. No data model changes made for these yet; order already has a `language` field to reuse.
 
+### Phase 2A-1 — dynamic JSON-driven product configuration (2026-06) — V1 LAUNCH FINAL
+- ProductConfigure.jsx renders configuration option groups generically from `product.pricing.groups` (groups.map → Section + Chips). Legacy category branches (rak/meja/meja_rak) retained as fallback when `groups` is absent. `canAdd()` validates dynamic products via `groups.every(x => config[x.key])`. NO product/category-specific frontend branch is needed for new configurable products.
+- Homepage: unused 4th hero image slot removed (Home.jsx restricted to 3 slots).
+- Verified END-TO-END (PASS): temp `groups` injected on papan-tulis (category papan_tulis has NO code branch) → API returned groups → /produk/papan-tulis rendered Ukuran/Jenis Frame/Finishing with options → selecting options updated config state (active highlight) → NO new frontend code required. Temp `groups` key then unset; papan-tulis restored to canonical legacy pricing (lengths/levels/types/finishings/base_prices intact).
+- Regression: rak-kayu, meja, meja-rak all load, configurable, legacy pricing keys intact. Frontend compiled successfully.
+- HOW A FUTURE ADMIN ADDS A CONFIGURABLE PRODUCT WITHOUT CODING: in AdminProductEdit → "Konfigurasi Lanjutan (JSON)", add a `groups` array to pricing, e.g. `{"groups":[{"key":"size","label":"Ukuran","options":["60x90","90x120"]},{"key":"surface","label":"Surface","options":[...]}]}`, save → customer page auto-renders the groups; pricing/photo-matching receive the selected values via existing engines.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.
