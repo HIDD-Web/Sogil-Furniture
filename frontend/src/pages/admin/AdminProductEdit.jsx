@@ -20,6 +20,17 @@ const PHOTO_ATTRS = {
   meja_rak: [["variant", "variants"], ["type", "types"], ["finishing", "finishings"]],
 };
 
+const LEGACY_LABELS = { length: "Panjang", level: "Jumlah Tingkat", type: "Tipe", finishing: "Finishing", size: "Ukuran Meja", height: "Tinggi Meja", variant: "Varian/Tingkat" };
+
+// Derive selectable photo-config options from the product's CURRENT config schema:
+// prefer additive `pricing.groups` (size/levels/height/finishing, mount, pilihan, desain, ...),
+// fall back to the legacy category-based flat arrays for Rak/Meja backward compatibility.
+function getOptionDefs(prod) {
+  const pr = prod?.pricing || {};
+  if (Array.isArray(pr.groups)) return pr.groups.map((g) => ({ key: g.key, options: g.options || [], label: g.label || g.key }));
+  return (PHOTO_ATTRS[prod?.category] || []).map(([key, arr]) => ({ key, options: pr[arr] || [], label: LEGACY_LABELS[key] || key }));
+}
+
 export default function AdminProductEdit() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -37,9 +48,9 @@ export default function AdminProductEdit() {
       const prod = r.data.find((x) => x.id === id);
       if (prod) {
         prod.photos = prod.photos || []; setP(prod); setPricingText(JSON.stringify(prod.pricing || {}, null, 2));
-        const defs = PHOTO_ATTRS[prod.category] || [];
+        const defs = getOptionDefs(prod);
         const w = prod.photo_weights || {};
-        const ordered = Object.keys(w).length ? [...defs.map((d) => d[0])].sort((a, b) => (w[b] || 0) - (w[a] || 0)) : defs.map((d) => d[0]);
+        const ordered = Object.keys(w).length ? defs.map((d) => d.key).sort((a, b) => (w[b] || 0) - (w[a] || 0)) : defs.map((d) => d.key);
         setPriority(ordered); setNotes(prod.option_notes || {});
       }
     });
@@ -89,7 +100,8 @@ export default function AdminProductEdit() {
 
   if (!p) return <div className="text-[#8B7355]">Memuat...</div>;
   const basePrices = p.pricing?.base_prices || {};
-  const attrDefs = PHOTO_ATTRS[p.category] || [];
+  const optDefs = getOptionDefs(p);
+  const labelOf = Object.fromEntries(optDefs.map((d) => [d.key, d.label]));
 
   return (
     <div className="max-w-3xl">
@@ -169,10 +181,10 @@ export default function AdminProductEdit() {
               <div key={ph.id} className="rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] p-3" data-testid={`photo-set-${ph.id}`}>
                 <div className="flex items-center justify-between">
                   <div className="flex flex-wrap gap-2">
-                    {attrDefs.map(([key, arr]) => (
-                      <Select key={key} value={ph.attributes[key] || ""} onValueChange={(v) => updPhotoAttr(ph.id, key, v)}>
-                        <SelectTrigger className="h-9 w-28 bg-white text-xs" data-testid={`photo-attr-${ph.id}-${key}`}><SelectValue placeholder={key} /></SelectTrigger>
-                        <SelectContent>{(p.pricing?.[arr] || []).map((o) => <SelectItem key={o} value={String(o)}>{o}</SelectItem>)}</SelectContent>
+                    {optDefs.map((d) => (
+                      <Select key={d.key} value={ph.attributes[d.key] || ""} onValueChange={(v) => updPhotoAttr(ph.id, d.key, v)}>
+                        <SelectTrigger className="h-9 w-40 bg-white text-xs" data-testid={`photo-attr-${ph.id}-${d.key}`}><SelectValue placeholder={d.label} /></SelectTrigger>
+                        <SelectContent>{(d.options || []).map((o) => <SelectItem key={o} value={String(o)}>{o}</SelectItem>)}</SelectContent>
                       </Select>
                     ))}
                   </div>
@@ -233,7 +245,7 @@ export default function AdminProductEdit() {
             <div className="space-y-1.5">
               {priority.map((k, i) => (
                 <div key={k} className="flex items-center justify-between rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] px-3 py-2" data-testid={`priority-${k}`}>
-                  <span className="text-sm text-[#2C1E16]"><b className="mr-1 text-[#8B5A2B]">{i + 1}.</b> {KEY_LABELS[k] || k}</span>
+                  <span className="text-sm text-[#2C1E16]"><b className="mr-1 text-[#8B5A2B]">{i + 1}.</b> {labelOf[k] || KEY_LABELS[k] || k}</span>
                   <div className="flex gap-1">
                     <button onClick={() => movePriority(i, -1)} disabled={i === 0} data-testid={`priority-up-${k}`} className="rounded border border-[#E5DCC5] p-1 text-[#8B5A2B] disabled:opacity-30"><ArrowUp size={14} /></button>
                     <button onClick={() => movePriority(i, 1)} disabled={i === priority.length - 1} data-testid={`priority-down-${k}`} className="rounded border border-[#E5DCC5] p-1 text-[#8B5A2B] disabled:opacity-30"><ArrowDown size={14} /></button>
@@ -245,15 +257,15 @@ export default function AdminProductEdit() {
           </div>
         )}
 
-        {p.configurable && attrDefs.length > 0 && (
+        {p.configurable && optDefs.length > 0 && (
           <div className="border-t border-[#F1EBE0] pt-4">
             <Label className="mb-1 block font-heading text-sm font-semibold">Catatan Opsi (Notes)</Label>
             <p className="mb-2 text-xs text-[#8B7355]">Catatan opsional per grup opsi (mis. "Jarak per tingkat ± 28 cm"). Kosongkan bila tidak perlu — tidak akan tampil.</p>
             <div className="space-y-2">
-              {attrDefs.map(([key]) => (
-                <div key={key}>
-                  <Label className="mb-0.5 block text-xs text-[#8B7355]">{KEY_LABELS[key] || key}</Label>
-                  <Input value={notes[key] || ""} onChange={(e) => setNotes((prev) => ({ ...prev, [key]: e.target.value }))} data-testid={`note-${key}`} placeholder="Catatan (opsional)" className="bg-white" />
+              {optDefs.map((d) => (
+                <div key={d.key}>
+                  <Label className="mb-0.5 block text-xs text-[#8B7355]">{d.label}</Label>
+                  <Input value={notes[d.key] || ""} onChange={(e) => setNotes((prev) => ({ ...prev, [d.key]: e.target.value }))} data-testid={`note-${d.key}`} placeholder="Catatan (opsional)" className="bg-white" />
                 </div>
               ))}
             </div>

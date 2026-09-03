@@ -128,5 +128,10 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - OWNER PASSWORD SECURITY FIX: seed() no longer resets an existing Owner's password on env mismatch (removed verify/reset block). Seed only creates Owner when none exists; restart/deploy can never overwrite the manually-set password. Verified Owner login still works.
 - Verified: 25/25 backend price cases PASS; custom order e2e (price 2750, details in WhatsApp); Rak legacy price 565 intact; option notes isolated (rak note only on rak); frontend smoke on all 6 products PASS.
 
+### V1 Launch — admin photo-config schema fix (2026-06)
+- Root cause: `AdminProductEdit.jsx` derived photo-config attribute selectors from a hardcoded `PHOTO_ATTRS[category]` map (predated the additive `groups` schema) → wrong for meja_rak (variant/type) and empty for papan_tulis/blockboard/custom.
+- Fix: added `getOptionDefs(prod)` — prefers the product's CURRENT `pricing.groups` ([{key,options,label}]), falls back to legacy `PHOTO_ATTRS` for Rak/Meja. Photo attribute selectors, photo-priority list, notes editor, and priority default ordering all now derive from it. No new photo architecture; matching engine untouched.
+- Verified (targeted, no testing_agent): admin save→persist→match round-trip PASS for papan-tulis (mount/size) & pesanan-custom (desain) with full data restore; meja-rak's 5 migrated photos still match on size/levels/height/finishing; admin UI screenshots confirm meja-rak shows size/levels/height/finishing (old Varian/Tingkat gone) and Pesanan Custom lists all 5 designs as mappable options. Rak/Meja legacy photo config unchanged. Owner auth untouched.
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.
