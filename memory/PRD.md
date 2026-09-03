@@ -133,5 +133,14 @@ Cairo-based furniture business. Customer ordering + price-estimation web app (NO
 - Fix: added `getOptionDefs(prod)` — prefers the product's CURRENT `pricing.groups` ([{key,options,label}]), falls back to legacy `PHOTO_ATTRS` for Rak/Meja. Photo attribute selectors, photo-priority list, notes editor, and priority default ordering all now derive from it. No new photo architecture; matching engine untouched.
 - Verified (targeted, no testing_agent): admin save→persist→match round-trip PASS for papan-tulis (mount/size) & pesanan-custom (desain) with full data restore; meja-rak's 5 migrated photos still match on size/levels/height/finishing; admin UI screenshots confirm meja-rak shows size/levels/height/finishing (old Varian/Tingkat gone) and Pesanan Custom lists all 5 designs as mappable options. Rak/Meja legacy photo config unchanged. Owner auth untouched.
 
+### V1 Launch — pre-deployment security fix (2026-06)
+- SECURITY (fixed): removed the real Owner password (and stale admin email) hardcoded across all 10 backend test files (backend_test.py, test_v2–v10). Now read via `os.environ.get("ADMIN_EMAIL"/"ADMIN_PASSWORD")`. Test coverage preserved. No production credential changed; Owner password/account untouched (login still works).
+- Added `/app/backend/.env.example` and `/app/frontend/.env.example` with PLACEHOLDER values only (no real secrets).
+- REVIEWED, no change (documented as safe/intentional):
+  - React hook deps (AdminProductEdit, ProductConfigure, AdminFinance, AdminSettings, AdminOrders): omissions are intentional — effect deps are the actual state values (period/range/search/status/etc.). Adding the handler functions (loadTxns/loadStats/…) without useCallback would risk render→fetch loops. No infinite loops present; left as-is per safety.
+  - localStorage (CartContext `sogil_cart`, LanguageContext `sogil_lang`): non-sensitive client cart + language pref only. Auth uses httpOnly cookie — NO token/password/hash in localStorage. V1 guest cart flow kept.
+- POST-LAUNCH BACKLOG (not V1 blockers): exhaustive-deps lint cleanup w/ useCallback, high-complexity function refactors (compute_item_price/create_order/etc.), index-as-key, context memoization, console cleanup, file splitting.
+- Verified: no residual hardcoded secret in tests; .env.example has no real values; Owner login OK; Meja Premium still 1650; frontend compiles (1 benign warning).
+
 ## Backlog (not built)
 - P2: full i18n coverage for new V4 customer/referral/admin strings (currently Indonesian; ID/EN/AR system intact for prior text) — KNOWN LIMITATION; split server.py into routers; automatic FX; payment gateway; inventory.

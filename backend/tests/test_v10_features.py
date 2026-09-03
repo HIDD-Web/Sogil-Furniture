@@ -19,8 +19,8 @@ if not BASE_URL:
                 BASE_URL = line.split("=", 1)[1].strip().rstrip("/")
 API = f"{BASE_URL}/api"
 
-OWNER_EMAIL = "sogil.furniture@gmail.com"
-OWNER_PASSWORD = "0LFOCWU9_V3k"
+OWNER_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@sogil.com")
+OWNER_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 RAK_ID = "6a8fc3c6d7ae98fcf9f4590a"       # rak-kayu
 MEJA_RAK_ID = "6a8fc3c6d7ae98fcf9f4590c"  # meja_rak
