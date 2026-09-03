@@ -1,4 +1,5 @@
 export function config_summary_client(category, cfg = {}) {
+  if (cfg._summary) return cfg._summary;
   const parts = [];
   if (category === "rak") {
     if (cfg.length) parts.push(`${cfg.length} cm`);

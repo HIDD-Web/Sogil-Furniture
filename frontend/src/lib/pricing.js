@@ -19,6 +19,27 @@ export function computeBreakdown(product, config, quantity) {
     return bd;
   }
 
+  if (pricing.price_model === "additive") {
+    const baseKeys = pricing.base_keys || [];
+    const basePrices = pricing.base_prices || {};
+    const groups = {};
+    (pricing.groups || []).forEach((g) => { groups[g.key] = g; });
+    if (baseKeys.length) {
+      const key = baseKeys.map((k) => String(config[k] ?? "")).join(" | ");
+      bd.base = num(basePrices[key]);
+      const labelVals = baseKeys.map((k) => config[k]).filter(Boolean).join(", ");
+      bd.lines.push({ label: labelVals || "Harga dasar", value: bd.base });
+    }
+    const adjSpec = pricing.adjust || {};
+    Object.keys(adjSpec).forEach((gkey) => {
+      const amt = num((adjSpec[gkey] || {})[config[gkey]]);
+      if (amt) { bd.adjustments += amt; bd.lines.push({ label: `${groups[gkey]?.label || gkey}: ${config[gkey]}`, value: amt }); }
+    });
+    bd.unit = bd.base + bd.adjustments + bd.finishing;
+    bd.subtotal = bd.unit * qty;
+    return bd;
+  }
+
   if (category === "rak") {
     const { length, level, type = "B", finishing = "Natural" } = config;
     const base = num((pricing.base_prices || {})[`${length}_${level}`]);
@@ -37,7 +58,7 @@ export function computeBreakdown(product, config, quantity) {
     bd.base = base;
     if (size && height) bd.lines.push({ label: `Harga dasar (${size} cm, tinggi ${height} cm)`, value: base });
     const fin = (pricing.finishing || {})[finishing];
-    const finCost = typeof fin === "object" ? 0 : num(fin);
+    const finCost = (fin && typeof fin === "object") ? num(fin[`${size}_${height}`]) : num(fin);
     if (finCost) { bd.finishing = finCost; bd.lines.push({ label: `Finishing ${finishing}`, value: finCost }); }
   } else if (category === "meja_rak") {
     const { variant, type = "B", finishing = "Natural" } = config;

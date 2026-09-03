@@ -307,6 +307,28 @@ def compute_item_price(product: dict, config: dict, quantity: int):
         bd["lines"].append({"label": "Ukuran Custom", "value": 0.0, "note": "Akan dikonfirmasi admin"})
         return bd
 
+    if pricing.get("price_model") == "additive":
+        base_keys = pricing.get("base_keys", []) or []
+        base_prices = pricing.get("base_prices", {}) or {}
+        groups = {g.get("key"): g for g in (pricing.get("groups") or [])}
+        if base_keys:
+            key = " | ".join(str(config.get(k, "")) for k in base_keys)
+            base = _num(base_prices.get(key))
+            bd["base_price_le"] = base
+            label_vals = ", ".join(str(config.get(k, "")) for k in base_keys if config.get(k))
+            bd["lines"].append({"label": label_vals or "Harga dasar", "value": base})
+        for gkey, mapping in (pricing.get("adjust", {}) or {}).items():
+            val = config.get(gkey)
+            amt = _num((mapping or {}).get(val))
+            if amt:
+                bd["adjustments_le"] += amt
+                glabel = (groups.get(gkey) or {}).get("label", gkey)
+                bd["lines"].append({"label": f"{glabel}: {val}", "value": amt})
+        unit = bd["base_price_le"] + bd["adjustments_le"] + bd["finishing_le"]
+        bd["unit_price_le"] = unit
+        bd["subtotal_le"] = unit * quantity
+        return bd
+
     if category == "rak":
         length = str(config.get("length", "")); level = str(config.get("level", ""))
         rtype = config.get("type", "B"); finishing = config.get("finishing", "Natural")
@@ -328,7 +350,7 @@ def compute_item_price(product: dict, config: dict, quantity: int):
         bd["base_price_le"] = base
         bd["lines"].append({"label": f"Harga dasar ({size} cm, tinggi {height} cm)", "value": base})
         fin = (pricing.get("finishing", {}) or {}).get(finishing, 0)
-        fin_cost = _num(fin) if not isinstance(fin, dict) else 0.0
+        fin_cost = _num(fin.get(f"{size}_{height}")) if isinstance(fin, dict) else _num(fin)
         if fin_cost:
             bd["finishing_le"] = fin_cost
             bd["lines"].append({"label": f"Finishing {finishing}", "value": fin_cost})
@@ -752,6 +774,8 @@ def fmt_idr(v):
 
 def config_summary(item):
     cfg = item.get("configuration_snapshot", {}) or {}; cat = item.get("category"); parts = []
+    if cfg.get("_summary"):
+        return str(cfg["_summary"])
     if cat == "rak":
         if cfg.get("length"): parts.append(f"{cfg['length']} cm")
         if cfg.get("level"): parts.append(f"{cfg['level']} Tingkat")
@@ -1898,9 +1922,9 @@ async def seed():
                                     "name": "Owner Sogil", "role": "owner", "permissions": default_permissions("owner"),
                                     "created_at": datetime.now(timezone.utc).isoformat()})
     else:
+        # NEVER reset/overwrite an existing Owner's password — manual changes must persist
+        # across restarts/deploys. Seed only creates the Owner when none exists.
         upd = {}
-        if not verify_password(admin_password, existing["password_hash"]):
-            upd["password_hash"] = hash_password(admin_password)
         if existing.get("role") != "owner":
             upd["role"] = "owner"; upd["permissions"] = default_permissions("owner")
         if upd:

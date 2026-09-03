@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useParams, useLocation, Link } from "react-router-dom";
 import api from "../lib/api";
 import { fmtLE, fmtIDR } from "../lib/format";
+import { config_summary_client } from "../lib/summary";
 import { useLang } from "../context/LanguageContext";
 import { Button } from "../components/ui/button";
 import { CheckCircle2, MessageCircle, Copy, Home } from "lucide-react";
@@ -40,7 +41,7 @@ export default function OrderConfirmation() {
 
         <div className="mt-6 space-y-1.5 rounded-xl bg-[#EFE6D5] p-4 text-left" data-testid="order-breakdown">
           {items.map((it, i) => it && (
-            <div key={i} className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{it.product_name_snapshot} ×{it.quantity}</span><span className="font-medium text-[#2C1E16]">{fmtLE(it.subtotal_le)} LE</span></div>
+            <div key={i} className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{it.product_name_snapshot} ×{it.quantity}<br /><span className="text-xs text-[#8B7355]">{config_summary_client(it.category, it.configuration_snapshot)}</span></span><span className="font-medium text-[#2C1E16]">{fmtLE(it.subtotal_le)} LE</span></div>
           ))}
           <div className="flex justify-between border-t border-dashed border-[#D8C9AD] pt-2 text-sm"><span className="text-[#5C4A3D]">Subtotal</span><span className="font-medium text-[#2C1E16]">{fmtLE(order.subtotal_le)} LE</span></div>
           {order.discount_le > 0 && <div className="flex justify-between text-sm text-green-700" data-testid="conf-discount"><span>Diskon{order.discount_code ? ` (${order.discount_code})` : ""}</span><span>-{fmtLE(order.discount_le)} LE</span></div>}

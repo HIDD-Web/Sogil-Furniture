@@ -36,7 +36,13 @@ export default function ProductConfigure() {
     Promise.all([api.get(`/products/${slug}`), api.get("/store-info")]).then(([p, s]) => {
       setProduct(p.data); setStore(s.data);
       const pr = p.data.pricing || {};
-      if (p.data.category === "rak") setConfig({ length: (pr.lengths || [])[0], level: (pr.levels || [])[0], type: "B", finishing: "Natural", custom_size: false });
+      const grps = Array.isArray(pr.groups) ? pr.groups : null;
+      if (grps) {
+        const init = { custom_size: false };
+        grps.forEach((g) => { if ((g.options || []).length) init[g.key] = g.options[0]; });
+        setConfig(init);
+      }
+      else if (p.data.category === "rak") setConfig({ length: (pr.lengths || [])[0], level: (pr.levels || [])[0], type: "B", finishing: "Natural", custom_size: false });
       else if (p.data.category === "meja") setConfig({ size: (pr.sizes || [])[0], height: (pr.heights || [])[0], finishing: "Natural", custom_size: false });
       else if (p.data.category === "meja_rak") setConfig({ variant: (pr.variants || [])[0], type: "B", finishing: "Natural", custom_size: false });
       else setConfig({ custom_size: false });
@@ -62,11 +68,24 @@ export default function ProductConfigure() {
     return true;
   };
 
-  const buildItem = () => ({
-    product: { id: product.id, slug: product.slug, name: product.name, category: product.category, image: photoMatch.photo ? (photoMatch.photo.main_url || photoMatch.photo.front_url) : product.display_image },
-    config: config.custom_size ? { ...config, custom_note: customNote } : config,
-    quantity, breakdown: { ...breakdown }, label: product.name,
-  });
+  const buildItem = () => {
+    const p = product.pricing || {};
+    const grps = Array.isArray(p.groups) ? p.groups : null;
+    let cfg = config.custom_size ? { ...config, custom_note: customNote } : { ...config };
+    if (grps && !config.custom_size) {
+      const g0 = grps[0];
+      if (p.design_details && g0 && p.design_details[config[g0.key]]) {
+        cfg._summary = `${config[g0.key]} — ${p.design_details[config[g0.key]].join(" · ")}`;
+      } else {
+        cfg._summary = grps.map((g) => config[g.key]).filter(Boolean).join(", ");
+      }
+    }
+    return {
+      product: { id: product.id, slug: product.slug, name: product.name, category: product.category, image: photoMatch.photo ? (photoMatch.photo.main_url || photoMatch.photo.front_url) : product.display_image },
+      config: cfg,
+      quantity, breakdown: { ...breakdown }, label: product.name,
+    };
+  };
 
   const addToCart = (thenCheckout) => {
     if (!canAdd()) { toast.error(config.custom_size ? t("err.custom_note") : t("err.cfg")); return; }
@@ -78,6 +97,7 @@ export default function ProductConfigure() {
   if (!product) return <div className="py-20 text-center text-[#8B7355]">Memuat...</div>;
   const pr = product.pricing || {};
   const groups = Array.isArray(pr.groups) ? pr.groups : null;
+  const isFixed = pr.price_model === "additive";
   const ph = photoMatch.photo;
   const photoSlots = ph ? [ph.main_url, ph.front_url, ph.side_url, ...(ph.images || [])].filter(Boolean) : [];
   const gi = Math.min(gidx, Math.max(0, photoSlots.length - 1));
@@ -132,6 +152,7 @@ export default function ProductConfigure() {
 
           {isConfigurable && (
             <>
+              {!isFixed && (
               <div>
                 <Label className="mb-2 block font-heading text-sm font-semibold text-[#2C1E16]">{t("cfg.jenis_pesanan")}</Label>
                 <div className="flex flex-wrap gap-2">
@@ -139,6 +160,7 @@ export default function ProductConfigure() {
                   <Chip active={config.custom_size} onClick={() => set("custom_size", true)} testid="opt-custom">{t("cfg.ukuran_custom")}</Chip>
                 </div>
               </div>
+              )}
 
               {config.custom_size ? (
                 <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5">
@@ -153,6 +175,14 @@ export default function ProductConfigure() {
                       {(g.options || []).map((o) => <Chip key={o} active={config[g.key] === o} onClick={() => set(g.key, o)} testid={`opt-${g.key}-${o}`}>{o}</Chip>)}
                     </Section>
                   ))}
+                  {pr.design_details && groups && groups[0] && pr.design_details[config[groups[0].key]] && (
+                    <div className="rounded-2xl border border-[#E5DCC5] bg-[#FBF9F4] p-4" data-testid="custom-design-details">
+                      <div className="mb-2 font-heading text-sm font-semibold text-[#2C1E16]">Spesifikasi Desain</div>
+                      <ul className="space-y-1 text-sm text-[#5C4A3D]">
+                        {pr.design_details[config[groups[0].key]].map((d, i) => <li key={i} className="flex gap-2"><span className="text-[#8B5A2B]">•</span><span>{d}</span></li>)}
+                      </ul>
+                    </div>
+                  )}
                   {!groups && product.category === "rak" && (<>
                     <Section title={t("cfg.pilih_ukuran")} note={product.option_notes?.length}>{(pr.lengths || []).map((l) => <Chip key={l} active={config.length === l} onClick={() => set("length", l)} testid={`opt-length-${l}`}>{l} cm</Chip>)}</Section>
                     <Section title={t("cfg.jumlah_tingkat")} note={product.option_notes?.level}>{(pr.levels || []).map((l) => <Chip key={l} active={config.level === l} onClick={() => set("level", l)} testid={`opt-level-${l}`}>{l} {t("cfg.tingkat")}</Chip>)}</Section>

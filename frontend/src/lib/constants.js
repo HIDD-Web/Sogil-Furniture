@@ -18,7 +18,7 @@ export const CATEGORY_LABELS = {
   meja: "Meja",
   meja_rak: "Meja Rak",
   papan_tulis: "Papan Tulis",
-  blockboard: "Blockboard",
+  blockboard: "BlackBoard",
   rak_tempel: "Rak Tempel",
   rak_gantung: "Rak Gantung",
   gantungan_baju: "Gantungan Baju",
