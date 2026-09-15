@@ -18,6 +18,7 @@ import re
 import jwt
 import bcrypt
 import requests
+import boto3
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -42,42 +43,68 @@ def oid(v: str) -> ObjectId:
     except (InvalidId, TypeError):
         raise HTTPException(status_code=404, detail="Data tidak ditemukan")
 
+def id_query(v) -> dict:
+    values = [v]
+
+    if isinstance(v, str):
+        try:
+            values.append(ObjectId(v))
+        except (InvalidId, TypeError):
+            pass
+
+    return {"$in": values}
+
 # --------------------------------------------------------------------------
 # Object storage
 # --------------------------------------------------------------------------
-STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
-STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
-EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
+R2_ENDPOINT = os.environ["R2_ENDPOINT"]
+R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+R2_BUCKET = os.environ.get("R2_BUCKET", "sogil-furniture")
 APP_NAME = "sogil-furniture"
 storage_key = None
 MIME_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 
-def init_storage(force: bool = False):
-    global storage_key
-    if storage_key and not force:
-        return storage_key
-    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
-    resp.raise_for_status()
-    storage_key = resp.json()["storage_key"]
-    return storage_key
+def get_r2_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        region_name="auto",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    )
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
-    key = init_storage()
-    resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
-    if resp.status_code == 404:
-        key = init_storage(force=True)
-        resp = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
-    resp.raise_for_status()
-    return resp.json()
+    s3 = get_r2_client()
+
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=path,
+        Body=data,
+        ContentType=content_type,
+    )
+
+    return {
+        "storage_path": path,
+        "size": len(data),
+        "content_type": content_type,
+    }
 
 def get_object(path: str):
-    key = init_storage()
-    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
-    if resp.status_code == 404:
-        key = init_storage(force=True)
-        resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+    s3 = get_r2_client()
+
+    response = s3.get_object(
+        Bucket=R2_BUCKET,
+        Key=path,
+    )
+
+    content = response["Body"].read()
+    content_type = response.get(
+        "ContentType",
+        "application/octet-stream",
+    )
+
+    return content, content_type
 
 # --------------------------------------------------------------------------
 # Auth & permissions
@@ -119,9 +146,15 @@ async def get_current_admin(request: Request) -> dict:
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Token tidak valid")
-        user = await db.admins.find_one({"_id": oid(payload["sub"])})
+        admin_id = oid(payload["sub"])
+
+        user = await db.admins.find_one(
+            {"_id": {"$in": [payload["sub"], admin_id]}}
+        )
+
         if not user:
             raise HTTPException(status_code=401, detail="Pengguna tidak ditemukan")
+
         user["id"] = str(user.pop("_id"))
         user.pop("password_hash", None)
         if user.get("role") == "owner":
@@ -164,7 +197,7 @@ async def get_optional_customer(request: Request):
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "customer":
             return None
-        c = await db.customers.find_one({"_id": oid(payload["sub"])})
+        c = await db.customers.find_one({"_id": id_query(payload["sub"])})
         if c and c.get("active") is False:
             return None
         return c
@@ -471,17 +504,17 @@ async def me(admin: dict = Depends(get_current_admin)):
 
 @api_router.post("/auth/change-password")
 async def change_password(data: ChangePasswordInput, admin: dict = Depends(get_current_admin)):
-    user = await db.admins.find_one({"_id": oid(admin["id"])})
+    user = await db.admins.find_one({"_id": id_query(admin["id"])})
     if not verify_password(data.current_password, user["password_hash"]):
         raise HTTPException(status_code=400, detail="Kata sandi saat ini salah")
     if len(data.new_password) < 6:
         raise HTTPException(status_code=400, detail="Kata sandi baru minimal 6 karakter")
-    await db.admins.update_one({"_id": oid(admin["id"])}, {"$set": {"password_hash": hash_password(data.new_password)}})
+    await db.admins.update_one({"_id": id_query(admin["id"])}, {"$set": {"password_hash": hash_password(data.new_password)}})
     return {"ok": True}
 
 @api_router.post("/auth/change-email")
 async def change_email(data: ChangeEmailInput, response: Response, admin: dict = Depends(get_current_admin)):
-    user = await db.admins.find_one({"_id": oid(admin["id"])})
+    user = await db.admins.find_one({"_id": id_query(admin["id"])})
     if not verify_password(data.current_password, user["password_hash"]):
         raise HTTPException(status_code=400, detail="Kata sandi salah")
     new_email = data.new_email.strip().lower()
@@ -489,7 +522,7 @@ async def change_email(data: ChangeEmailInput, response: Response, admin: dict =
         raise HTTPException(status_code=400, detail="Format email tidak valid")
     if await db.admins.find_one({"email": new_email, "_id": {"$ne": oid(admin["id"])}}):
         raise HTTPException(status_code=400, detail="Email sudah digunakan")
-    await db.admins.update_one({"_id": oid(admin["id"])}, {"$set": {"email": new_email}})
+    await db.admins.update_one({"_id": id_query(admin["id"])}, {"$set": {"email": new_email}})
     token = create_access_token(admin["id"], new_email)
     response.set_cookie("access_token", token, httponly=True, secure=True, samesite="none", max_age=43200, path="/")
     return {"ok": True, "email": new_email}
@@ -563,7 +596,7 @@ async def list_products(admin_view: bool = False):
 
 @api_router.get("/admin/products/{product_id}/cover-preview")
 async def admin_cover_preview(product_id: str, admin: dict = Depends(get_current_admin)):
-    product = await db.products.find_one({"_id": oid(product_id)})
+    product = await db.products.find_one({"_id": id_query(product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
     product = clean(product)
@@ -583,14 +616,14 @@ async def get_product(slug: str):
 
 @api_router.post("/calculate-price")
 async def calculate_price(data: OrderItemInput):
-    product = await db.products.find_one({"_id": oid(data.product_id)})
+    product = await db.products.find_one({"_id": id_query(data.product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
     return compute_item_price(product, data.config, data.quantity)
 
 @api_router.post("/match-photo")
 async def match_photo_endpoint(data: OrderItemInput):
-    product = await db.products.find_one({"_id": oid(data.product_id)})
+    product = await db.products.find_one({"_id": id_query(data.product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Produk tidak ditemukan")
     return match_photo(product, data.config)
@@ -671,7 +704,7 @@ async def create_order(request: Request, data: OrderInput):
     if data.delivery_method == "delivery":
         if not data.delivery_zone_id:
             raise HTTPException(status_code=400, detail="Silakan pilih zona pengiriman.")
-        zone = await db.delivery_zones.find_one({"_id": oid(data.delivery_zone_id)})
+        zone = await db.delivery_zones.find_one({"_id": id_query(data.delivery_zone_id)})
         if not zone or not zone.get("active"):
             raise HTTPException(status_code=400, detail="Zona pengiriman tidak valid.")
         delivery_fee = _num(zone["fee_le"]); zone_name = zone["name"]; zone_id = str(zone["_id"])
@@ -680,7 +713,7 @@ async def create_order(request: Request, data: OrderInput):
     for it in items_input:
         if it.quantity < 1:
             raise HTTPException(status_code=400, detail="Jumlah minimal 1.")
-        product = await db.products.find_one({"_id": oid(it.product_id)})
+        product = await db.products.find_one({"_id": id_query(it.product_id)})
         if not product or not product.get("active"):
             raise HTTPException(status_code=400, detail="Produk tidak tersedia.")
         bd = compute_item_price(product, it.config, it.quantity)
@@ -708,7 +741,7 @@ async def create_order(request: Request, data: OrderInput):
         if rerr:
             raise HTTPException(status_code=400, detail=rerr)
         discount_le = rdisc
-        owner = await db.customers.find_one({"_id": oid(rdoc["customer_id"])})
+        owner = await db.customers.find_one({"_id": id_query(rdoc["customer_id"])})
         referral_snap = {"code": rdoc.get("code"), "owner_id": str(rdoc["customer_id"]),
                          "owner_name": owner.get("username") if owner else "", "percentage": _num(rdoc.get("discount_percentage")),
                          "discount_le": rdisc, "points_per_order": _num(rdoc.get("points_per_order"))}
@@ -757,7 +790,7 @@ async def create_order(request: Request, data: OrderInput):
         await db.referrals.update_one({"code": referral_snap["code"]}, {"$inc": {"claims": 1}})
     if points_redeemed > 0 and buyer_id:
         newb = _num(buyer.get("points_available")) - points_redeemed
-        await db.customers.update_one({"_id": oid(buyer_id)}, {"$inc": {"points_available": -points_redeemed, "points_redeemed": points_redeemed}})
+        await db.customers.update_one({"_id": id_query(buyer_id)}, {"$inc": {"points_available": -points_redeemed, "points_redeemed": points_redeemed}})
         await db.point_transactions.insert_one({"customer_id": buyer_id, "type": "redeem", "amount": -points_redeemed,
             "order_id": str(result.inserted_id), "reason": "Penukaran poin", "balance_after": newb,
             "created_at": datetime.now(timezone.utc).isoformat()})
@@ -833,7 +866,7 @@ def build_whatsapp_message(order):
 
 @api_router.get("/orders/{order_id}")
 async def get_order_public(order_id: str, request: Request):
-    order = await db.orders.find_one({"_id": oid(order_id)})
+    order = await db.orders.find_one({"_id": id_query(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
     # Orders tied to a customer account are private to that customer.
@@ -918,7 +951,7 @@ async def admin_top_configs(category: Optional[str] = None, group_by: str = "ful
 
 @api_router.get("/admin/orders/{order_id}")
 async def admin_get_order(order_id: str, admin: dict = Depends(require_perm("manage_orders"))):
-    order = await db.orders.find_one({"_id": oid(order_id)})
+    order = await db.orders.find_one({"_id": id_query(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
     order = clean(order)
@@ -953,8 +986,8 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
         update["payment_status"] = data.payment_status
     if data.admin_note is not None:
         update["admin_note"] = data.admin_note
-    await db.orders.update_one({"_id": oid(order_id)}, {"$set": update})
-    order = await db.orders.find_one({"_id": oid(order_id)})
+    await db.orders.update_one({"_id": id_query(order_id)}, {"$set": update})
+    order = await db.orders.find_one({"_id": id_query(order_id)})
     if data.payment_status == "lunas":
         await record_order_revenue(order)
         await award_referral_points(order)
@@ -965,11 +998,11 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
 
 @api_router.delete("/admin/orders/{order_id}")
 async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("delete_data"))):
-    order = await db.orders.find_one({"_id": oid(order_id)})
+    order = await db.orders.find_one({"_id": id_query(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
     await reverse_referral_points(order)
-    await db.orders.delete_one({"_id": oid(order_id)})
+    await db.orders.delete_one({"_id": id_query(order_id)})
     await db.finance_transactions.delete_many({"related_order_id": order_id, "type": "order_revenue"})
     return {"ok": True}
 
@@ -1003,7 +1036,7 @@ async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: 
     allowed = ["name", "category", "description", "image_url", "active", "configurable",
                "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug",
                "category_cover_image", "cover_mode", "photo_weights", "option_notes"]
-    existing = await db.products.find_one({"_id": oid(product_id)})
+    existing = await db.products.find_one({"_id": id_query(product_id)})
     upd = {k: payload[k] for k in allowed if k in payload}
     if "pricing" in upd and not isinstance(upd["pricing"], dict):
         raise HTTPException(status_code=400, detail="Konfigurasi (pricing) harus berupa objek JSON")
@@ -1021,12 +1054,12 @@ async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: 
                 "category": existing.get("category"), "old_pricing": old_p, "new_pricing": new_p,
                 "old_starting_price_le": old_s, "new_starting_price_le": new_s,
                 "changed_by_name": admin.get("name"), "changed_at": datetime.now(timezone.utc).isoformat()})
-    await db.products.update_one({"_id": oid(product_id)}, {"$set": upd})
-    return clean(await db.products.find_one({"_id": oid(product_id)}))
+    await db.products.update_one({"_id": id_query(product_id)}, {"$set": upd})
+    return clean(await db.products.find_one({"_id": id_query(product_id)}))
 
 @api_router.delete("/admin/products/{product_id}")
 async def admin_delete_product(product_id: str, admin: dict = Depends(require_perm("delete_data"))):
-    await db.products.delete_one({"_id": oid(product_id)})
+    await db.products.delete_one({"_id": id_query(product_id)})
     return {"ok": True}
 
 # --------------------------------------------------------------------------
@@ -1064,10 +1097,10 @@ async def admin_upload(file: UploadFile = File(...), admin: dict = Depends(get_c
         ctype = MIME_TYPES[ext]
     path = f"{APP_NAME}/uploads/{uuid.uuid4()}.{ext}"
     result = put_object(path, data, ctype)
-    await db.files.insert_one({"storage_path": result["path"], "original_filename": file.filename,
+    await db.files.insert_one({"storage_path": result["storage_path"], "original_filename": file.filename,
                                "content_type": ctype, "size": result.get("size", len(data)),
                                "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat()})
-    return {"path": result["path"], "url": f"/api/files/{result['path']}"}
+    return {"path": result["storage_path"], "url": f"/api/files/{result['storage_path']}"}
 
 @api_router.get("/files/{path:path}")
 async def download_file(path: str):
@@ -1089,12 +1122,12 @@ async def admin_create_zone(data: DeliveryZoneInput, admin: dict = Depends(requi
 
 @api_router.put("/admin/delivery-zones/{zone_id}")
 async def admin_update_zone(zone_id: str, data: DeliveryZoneInput, admin: dict = Depends(require_perm("manage_settings"))):
-    await db.delivery_zones.update_one({"_id": oid(zone_id)}, {"$set": {"name": data.name, "fee_le": _num(data.fee_le), "active": data.active}})
-    return clean(await db.delivery_zones.find_one({"_id": oid(zone_id)}))
+    await db.delivery_zones.update_one({"_id": id_query(zone_id)}, {"$set": {"name": data.name, "fee_le": _num(data.fee_le), "active": data.active}})
+    return clean(await db.delivery_zones.find_one({"_id": id_query(zone_id)}))
 
 @api_router.delete("/admin/delivery-zones/{zone_id}")
 async def admin_delete_zone(zone_id: str, admin: dict = Depends(require_perm("manage_settings"))):
-    await db.delivery_zones.delete_one({"_id": oid(zone_id)})
+    await db.delivery_zones.delete_one({"_id": id_query(zone_id)})
     return {"ok": True}
 
 # --------------------------------------------------------------------------
@@ -1165,7 +1198,7 @@ async def create_admin(data: AdminCreateInput, admin: dict = Depends(require_own
 
 @api_router.put("/admin/admins/{admin_id}")
 async def update_admin(admin_id: str, data: AdminUpdateInput, admin: dict = Depends(require_owner())):
-    target = await db.admins.find_one({"_id": oid(admin_id)})
+    target = await db.admins.find_one({"_id": id_query(admin_id)})
     if not target:
         raise HTTPException(status_code=404, detail="Akun tidak ditemukan")
     if target.get("role") == "owner":
@@ -1195,17 +1228,17 @@ async def update_admin(admin_id: str, data: AdminUpdateInput, admin: dict = Depe
                 perms[k] = bool(data.permissions[k])
         perms["manage_admins"] = False
         upd["permissions"] = perms
-    await db.admins.update_one({"_id": oid(admin_id)}, {"$set": upd})
-    return clean(await db.admins.find_one({"_id": oid(admin_id)}))
+    await db.admins.update_one({"_id": id_query(admin_id)}, {"$set": upd})
+    return clean(await db.admins.find_one({"_id": id_query(admin_id)}))
 
 @api_router.delete("/admin/admins/{admin_id}")
 async def delete_admin(admin_id: str, admin: dict = Depends(require_owner())):
-    target = await db.admins.find_one({"_id": oid(admin_id)})
+    target = await db.admins.find_one({"_id": id_query(admin_id)})
     if not target:
         raise HTTPException(status_code=404, detail="Akun tidak ditemukan")
     if target.get("role") == "owner":
         raise HTTPException(status_code=400, detail="Akun Owner tidak dapat dihapus")
-    await db.admins.delete_one({"_id": oid(admin_id)})
+    await db.admins.delete_one({"_id": id_query(admin_id)})
     return {"ok": True}
 
 # --------------------------------------------------------------------------
@@ -1304,7 +1337,7 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
            "updated_by_name": admin.get("name"), "created_at": now, "updated_at": now}
     is_wage = data.type == "expense" and _is_wage_category(data.category)
     if is_wage and data.recipient_employee_id:
-        emp = await db.admins.find_one({"_id": oid(data.recipient_employee_id)})
+        emp = await db.admins.find_one({"_id": id_query(data.recipient_employee_id)})
         if not emp:
             raise HTTPException(status_code=400, detail="Karyawan penerima tidak ditemukan")
         doc["recipient_employee_id"] = data.recipient_employee_id
@@ -1319,7 +1352,7 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
 
 @api_router.put("/admin/finance/transactions/{txn_id}")
 async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depends(require_perm("access_finance"))):
-    t = await db.finance_transactions.find_one({"_id": oid(txn_id)})
+    t = await db.finance_transactions.find_one({"_id": id_query(txn_id)})
     if not t:
         raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
     if t.get("type") == "order_revenue":
@@ -1334,24 +1367,24 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     upd["recipient_employee_id"] = None
     upd["recipient_employee_name"] = None
     if is_wage and data.recipient_employee_id:
-        emp = await db.admins.find_one({"_id": oid(data.recipient_employee_id)})
+        emp = await db.admins.find_one({"_id": id_query(data.recipient_employee_id)})
         if not emp:
             raise HTTPException(status_code=400, detail="Karyawan penerima tidak ditemukan")
         upd["recipient_employee_id"] = data.recipient_employee_id
         upd["recipient_employee_name"] = emp.get("name")
-    await db.finance_transactions.update_one({"_id": oid(txn_id)}, {"$set": upd})
+    await db.finance_transactions.update_one({"_id": id_query(txn_id)}, {"$set": upd})
     await db.employee_wages.delete_many({"transaction_id": txn_id})
     if upd["recipient_employee_id"]:
         await db.employee_wages.insert_one({"employee_id": upd["recipient_employee_id"], "employee_name": upd["recipient_employee_name"],
             "amount": _num(data.amount), "currency": data.currency, "date": upd["date"], "category": data.category,
             "description": data.description or "", "transaction_id": txn_id, "recorded_by_name": admin.get("name"),
             "created_at": datetime.now(timezone.utc).isoformat()})
-    return clean(await db.finance_transactions.find_one({"_id": oid(txn_id)}))
+    return clean(await db.finance_transactions.find_one({"_id": id_query(txn_id)}))
 
 @api_router.delete("/admin/finance/transactions/{txn_id}")
 async def finance_delete(txn_id: str, admin: dict = Depends(require_perm("access_finance"))):
     await db.employee_wages.delete_many({"transaction_id": txn_id})
-    await db.finance_transactions.delete_one({"_id": oid(txn_id)})
+    await db.finance_transactions.delete_one({"_id": id_query(txn_id)})
     return {"ok": True}
 
 @api_router.post("/admin/finance/transfer")
@@ -1505,12 +1538,12 @@ async def update_discount(did: str, payload: Dict[str, Any], admin: dict = Depen
     if "percentage" in upd:
         upd["percentage"] = max(0.0, min(100.0, upd["percentage"]))
     upd["updated_by_name"] = admin.get("name")
-    await db.discounts.update_one({"_id": oid(did)}, {"$set": upd})
-    return clean(await db.discounts.find_one({"_id": oid(did)}))
+    await db.discounts.update_one({"_id": id_query(did)}, {"$set": upd})
+    return clean(await db.discounts.find_one({"_id": id_query(did)}))
 
 @api_router.delete("/admin/discounts/{did}")
 async def delete_discount(did: str, admin: dict = Depends(require_perm("manage_settings"))):
-    await db.discounts.delete_one({"_id": oid(did)})
+    await db.discounts.delete_one({"_id": id_query(did)})
     return {"ok": True}
 
 @api_router.get("/admin/finance/custom-categories")
@@ -1540,13 +1573,13 @@ async def update_custom_category(cid: str, payload: Dict[str, Any], admin: dict 
     if payload.get("status") in ("active", "inactive"):
         upd["status"] = payload["status"]
     if upd:
-        await db.finance_categories.update_one({"_id": oid(cid)}, {"$set": upd})
-    return clean(await db.finance_categories.find_one({"_id": oid(cid)}))
+        await db.finance_categories.update_one({"_id": id_query(cid)}, {"$set": upd})
+    return clean(await db.finance_categories.find_one({"_id": id_query(cid)}))
 
 @api_router.delete("/admin/finance/custom-categories/{cid}")
 async def delete_custom_category(cid: str, admin: dict = Depends(require_perm("access_finance"))):
     # Soft-delete: historical transactions keep their category/classification; just stop offering it for new txns.
-    await db.finance_categories.update_one({"_id": oid(cid)}, {"$set": {"status": "inactive"}})
+    await db.finance_categories.update_one({"_id": id_query(cid)}, {"$set": {"status": "inactive"}})
     return {"ok": True}
 
 @api_router.get("/admin/employees")
@@ -1627,11 +1660,11 @@ async def award_referral_points(order):
     r = await db.referrals.find_one({"code": ref.get("code")})
     if r and _num(r.get("max_total_points")) > 0 and _num(r.get("points_awarded", 0)) + per > _num(r.get("max_total_points")):
         return
-    cust = await db.customers.find_one({"_id": oid(owner_id)})
+    cust = await db.customers.find_one({"_id": id_query(owner_id)})
     if not cust:
         return
     new_bal = _num(cust.get("points_available")) + per
-    await db.customers.update_one({"_id": oid(owner_id)}, {"$inc": {"points_available": per, "points_earned": per}})
+    await db.customers.update_one({"_id": id_query(owner_id)}, {"$inc": {"points_available": per, "points_earned": per}})
     await db.point_transactions.insert_one({"customer_id": owner_id, "type": "earn", "amount": per,
         "order_id": str(order["_id"]), "reason": f"Referral order {order.get('order_number')}",
         "balance_after": new_bal, "created_at": datetime.now(timezone.utc).isoformat()})
@@ -1642,7 +1675,7 @@ async def reverse_referral_points(order):
     txns = await db.point_transactions.find({"order_id": str(order["_id"]), "type": "earn"}).to_list(50)
     for t in txns:
         amt = _num(t.get("amount"))
-        await db.customers.update_one({"_id": oid(t["customer_id"])}, {"$inc": {"points_available": -amt, "points_earned": -amt}})
+        await db.customers.update_one({"_id": id_query(t["customer_id"])}, {"$inc": {"points_available": -amt, "points_earned": -amt}})
         await db.point_transactions.insert_one({"customer_id": t["customer_id"], "type": "reverse", "amount": -amt,
             "order_id": str(order["_id"]), "reason": f"Reversal (order dihapus/dibatalkan)", "created_at": datetime.now(timezone.utc).isoformat()})
     await db.point_transactions.delete_many({"order_id": str(order["_id"]), "type": "earn"})
@@ -1650,7 +1683,7 @@ async def reverse_referral_points(order):
     redeemed = order.get("points_redeemed_le") or 0
     buyer = order.get("customer_id")
     if redeemed and buyer:
-        await db.customers.update_one({"_id": oid(buyer)}, {"$inc": {"points_available": redeemed, "points_redeemed": -redeemed}})
+        await db.customers.update_one({"_id": id_query(buyer)}, {"$inc": {"points_available": redeemed, "points_redeemed": -redeemed}})
 
 # ---- Customer auth ----
 def gen_referral_code(username):
@@ -1805,7 +1838,7 @@ async def referral_validate(payload: Dict[str, Any], request: Request):
     disc, r, err = await validate_referral(payload.get("code"), _num(payload.get("subtotal")), str(buyer["_id"]) if buyer else None)
     if err:
         return {"valid": False, "message": err, "discount_amount": 0}
-    owner = await db.customers.find_one({"_id": oid(r["customer_id"])})
+    owner = await db.customers.find_one({"_id": id_query(r["customer_id"])})
     return {"valid": True, "discount_amount": disc, "percentage": _num(r.get("discount_percentage")),
             "code": r.get("code"), "owner_name": owner.get("username") if owner else ""}
 
@@ -1815,7 +1848,7 @@ async def admin_referrals(admin: dict = Depends(require_perm("manage_settings"))
     out = []
     for r in await db.referrals.find({}).sort("created_at", -1).to_list(500):
         r = clean(r)
-        owner = await db.customers.find_one({"_id": oid(r["customer_id"])}) if r.get("customer_id") else None
+        owner = await db.customers.find_one({"_id": id_query(r["customer_id"])}) if r.get("customer_id") else None
         r["owner_name"] = owner.get("username") if owner else ""
         out.append(r)
     return out
@@ -1831,8 +1864,8 @@ async def admin_update_referral(rid: str, payload: Dict[str, Any], admin: dict =
             upd[k] = _num(upd[k])
     if "discount_percentage" in upd:
         upd["discount_percentage"] = max(0.0, min(100.0, upd["discount_percentage"]))
-    await db.referrals.update_one({"_id": oid(rid)}, {"$set": upd})
-    return clean(await db.referrals.find_one({"_id": oid(rid)}))
+    await db.referrals.update_one({"_id": id_query(rid)}, {"$set": upd})
+    return clean(await db.referrals.find_one({"_id": id_query(rid)}))
 
 @api_router.get("/admin/customers")
 async def admin_customers(q: Optional[str] = None, admin: dict = Depends(require_perm("manage_orders"))):
@@ -1843,7 +1876,7 @@ async def admin_customers(q: Optional[str] = None, admin: dict = Depends(require
 
 @api_router.get("/admin/customers/{cid}")
 async def admin_customer_detail(cid: str, admin: dict = Depends(require_perm("manage_orders"))):
-    c = await db.customers.find_one({"_id": oid(cid)})
+    c = await db.customers.find_one({"_id": id_query(cid)})
     if not c:
         raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
     orders = await db.orders.find({"customer_id": cid}).sort("created_at", -1).to_list(500)
@@ -1852,17 +1885,17 @@ async def admin_customer_detail(cid: str, admin: dict = Depends(require_perm("ma
 
 @api_router.patch("/admin/customers/{cid}")
 async def admin_update_customer(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_owner())):
-    c = await db.customers.find_one({"_id": oid(cid)})
+    c = await db.customers.find_one({"_id": id_query(cid)})
     if not c:
         raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
     if "active" not in payload:
         raise HTTPException(status_code=400, detail="Tidak ada perubahan")
-    await db.customers.update_one({"_id": oid(cid)}, {"$set": {"active": bool(payload["active"])}})
-    return clean_customer(await db.customers.find_one({"_id": oid(cid)}))
+    await db.customers.update_one({"_id": id_query(cid)}, {"$set": {"active": bool(payload["active"])}})
+    return clean_customer(await db.customers.find_one({"_id": id_query(cid)}))
 
 @api_router.delete("/admin/customers/{cid}")
 async def admin_delete_customer(cid: str, admin: dict = Depends(require_owner())):
-    c = await db.customers.find_one({"_id": oid(cid)})
+    c = await db.customers.find_one({"_id": id_query(cid)})
     if not c:
         raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
     # Block permanent deletion when there is meaningful business history to preserve.
@@ -1874,31 +1907,31 @@ async def admin_delete_customer(cid: str, admin: dict = Depends(require_owner())
     if has_orders or referred_others or has_points_history or ref_active_history or _num(c.get("points_available")) > 0 or _num(c.get("points_earned")) > 0:
         raise HTTPException(status_code=400, detail="Pelanggan memiliki riwayat bisnis (pesanan/keuangan/referral/poin). Gunakan Nonaktifkan Akun agar riwayat tetap utuh.")
     # Safe to hard-delete: no business history. Remove account + its unused referral code.
-    await db.customers.delete_one({"_id": oid(cid)})
+    await db.customers.delete_one({"_id": id_query(cid)})
     if ref:
         await db.referrals.delete_one({"_id": ref["_id"]})
     return {"ok": True, "deleted": True}
 
 @api_router.post("/admin/customers/{cid}/reset-password")
 async def admin_reset_customer_password(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_owner())):
-    c = await db.customers.find_one({"_id": oid(cid)})
+    c = await db.customers.find_one({"_id": id_query(cid)})
     if not c:
         raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
     np = payload.get("new_password") or ""
     if len(np) < 6:
         raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter")
-    await db.customers.update_one({"_id": oid(cid)}, {"$set": {"password_hash": hash_password(np)}})
+    await db.customers.update_one({"_id": id_query(cid)}, {"$set": {"password_hash": hash_password(np)}})
     return {"ok": True}
 
 @api_router.post("/admin/customers/{cid}/adjust-points")
 async def admin_adjust_points(cid: str, data: PointAdjustInput, admin: dict = Depends(require_owner())):
-    c = await db.customers.find_one({"_id": oid(cid)})
+    c = await db.customers.find_one({"_id": id_query(cid)})
     if not c:
         raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
     new_bal = _num(c.get("points_available")) + _num(data.amount)
     if new_bal < 0:
         raise HTTPException(status_code=400, detail="Saldo poin tidak boleh negatif")
-    await db.customers.update_one({"_id": oid(cid)}, {"$inc": {"points_available": _num(data.amount)}})
+    await db.customers.update_one({"_id": id_query(cid)}, {"$inc": {"points_available": _num(data.amount)}})
     await db.point_transactions.insert_one({"customer_id": cid, "type": "adjust", "amount": _num(data.amount),
         "order_id": None, "reason": data.reason, "balance_after": new_bal, "by_name": admin.get("name"),
         "created_at": datetime.now(timezone.utc).isoformat()})
@@ -2024,11 +2057,6 @@ async def seed():
 
 @app.on_event("startup")
 async def startup():
-    try:
-        init_storage()
-        logger.info("Storage initialized")
-    except Exception as e:
-        logger.error(f"Storage init failed: {e}")
     await seed()
 
 @app.on_event("shutdown")
