@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { createPortal } from "react-dom";
 import { Button } from "./ui/button";
 import {
   Smartphone,
@@ -55,8 +56,8 @@ export default function PwaInstallModal({ isOpen, onClose, mode = "customer" }) 
 
   const isAdmin = mode === "admin";
 
-  return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 backdrop-blur-xs p-4 flex items-center justify-center">
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] overflow-y-auto bg-black/60 backdrop-blur-xs p-4 flex items-center justify-center">
       <div className="relative w-full max-w-md my-auto rounded-3xl border border-[#E5DCC5] bg-white p-5 sm:p-7 shadow-2xl max-h-[85vh] overflow-y-auto">
         <button
           onClick={onClose}
@@ -227,6 +228,7 @@ export default function PwaInstallModal({ isOpen, onClose, mode = "customer" }) 
           </Button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

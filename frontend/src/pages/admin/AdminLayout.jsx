@@ -11,9 +11,16 @@ export default function AdminLayout() {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [pwaModalOpen, setPwaModalOpen] = useState(false);
+  const [storeInfo, setStoreInfo] = useState(null);
+
+  React.useEffect(() => {
+    api.get("/store-info").then((r) => setStoreInfo(r.data)).catch(() => {});
+  }, []);
 
   if (!checked || user === null) return <div className="flex min-h-screen items-center justify-center text-[#8B7355]">Memuat...</div>;
   if (!user) return <Navigate to="/admin/login" replace />;
+
+  const currentLogo = storeInfo?.logo_url || user?.logo_url;
 
   const perms = user.permissions || {};
   const isOwner = user.role === "owner";
@@ -44,12 +51,12 @@ export default function AdminLayout() {
   return (
     <div className="min-h-screen bg-[#F9F6F0]">
       <div className="flex items-center justify-between border-b border-[#E5DCC5] bg-white px-4 py-3 lg:hidden">
-        <Logo size={36} logoUrl={user.logo_url} />
+        <Logo size={36} logoUrl={currentLogo} />
         <button onClick={() => setOpen(!open)} data-testid="admin-mobile-toggle" className="p-2">{open ? <X /> : <Menu />}</button>
       </div>
       <div className="flex">
         <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col border-r border-[#E5DCC5] bg-white p-4 lg:flex">
-          <div className="px-2 py-2"><Logo /></div>
+          <div className="px-2 py-2"><Logo logoUrl={currentLogo} /></div>
           <div className="mt-1 px-2 text-xs text-[#8B7355]">{user.name} · {user.role}</div>
           <nav className="mt-4 flex flex-1 flex-col gap-1 overflow-y-auto"><Items /></nav>
           <div className="pt-3 border-t border-[#F1EBE0] space-y-2">

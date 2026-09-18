@@ -14,6 +14,11 @@ export default function AdminLogin() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [storeInfo, setStoreInfo] = useState(null);
+
+  React.useEffect(() => {
+    api.get("/store-info").then((r) => setStoreInfo(r.data)).catch(() => {});
+  }, []);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -32,7 +37,7 @@ export default function AdminLogin() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-[#F9F6F0] px-4">
       <div className="w-full max-w-sm rounded-2xl border border-[#E5DCC5] bg-white p-7 shadow-sm">
-        <div className="flex justify-center"><Logo size={48} /></div>
+        <div className="flex justify-center"><Logo size={48} logoUrl={storeInfo?.logo_url} /></div>
         <h1 className="mt-5 text-center font-heading text-xl font-bold text-[#2C1E16]">Dashboard Admin</h1>
         <p className="mt-1 text-center text-sm text-[#8B7355]">Masuk untuk mengelola pesanan & produk</p>
         <form onSubmit={submit} className="mt-6 space-y-4">
