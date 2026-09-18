@@ -15,6 +15,7 @@ from typing import List, Optional, Dict, Any
 import uuid
 import json
 import re
+import urllib.parse
 import jwt
 import bcrypt
 import requests
@@ -23,8 +24,10 @@ from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
 
+import certifi
+
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+client = AsyncIOMotorClient(mongo_url, tlsCAFile=certifi.where())
 db = client[os.environ['DB_NAME']]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -258,6 +261,37 @@ class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
     payment_status: Optional[str] = None
     admin_note: Optional[str] = None
+    subtotal_le: Optional[float] = None
+    delivery_fee_le: Optional[float] = None
+    discount_le: Optional[float] = None
+    total_le: Optional[float] = None
+    items: Optional[List[dict]] = None
+
+class CustomRequestInput(BaseModel):
+    customer_name: str
+    customer_phone: str
+    customer_address: Optional[str] = ""
+    furniture_type: str
+    dimensions: Optional[Dict[str, Any]] = None
+    material: Optional[str] = ""
+    reference_photos: Optional[List[str]] = []
+    budget_estimation_le: Optional[float] = None
+    notes: Optional[str] = ""
+
+class CustomRequestUpdate(BaseModel):
+    status: Optional[str] = None
+    admin_notes: Optional[str] = None
+    estimated_price_le: Optional[float] = None
+
+class ConvertCustomToOrderInput(BaseModel):
+    subtotal_le: float
+    delivery_fee_le: Optional[float] = 0.0
+    delivery_method: str = "pickup"
+    delivery_zone_id: Optional[str] = None
+    payment_method: str = "transfer"
+    customer_address: Optional[str] = None
+    customer_maps_url: Optional[str] = None
+    notes: Optional[str] = None
 
 class AdminCreateInput(BaseModel):
     name: str
@@ -582,6 +616,74 @@ async def resolve_display_photo(product):
         if auto:
             return auto
     return product.get("category_cover_image") or product.get("image_url") or ""
+
+# --------------------------------------------------------------------------
+# Categories (Dynamic Categories)
+# --------------------------------------------------------------------------
+@api_router.get("/categories")
+async def list_categories():
+    cats = await db.categories.find({"active": True}).sort("sort_order", 1).to_list(100)
+    return [clean(c) for c in cats]
+
+@api_router.get("/admin/categories")
+async def list_admin_categories(admin: dict = Depends(require_perm("modify_products"))):
+    cats = await db.categories.find({}).sort("sort_order", 1).to_list(100)
+    return [clean(c) for c in cats]
+
+@api_router.post("/admin/categories")
+async def create_category(payload: dict, admin: dict = Depends(require_perm("modify_products"))):
+    key = str(payload.get("key", "")).strip().lower().replace(" ", "_")
+    name = str(payload.get("name", "")).strip()
+    if not key or not name:
+        raise HTTPException(status_code=400, detail="Key dan Nama kategori wajib diisi")
+    existing = await db.categories.find_one({"key": key})
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Kategori dengan key '{key}' sudah ada")
+    count = await db.categories.count_documents({})
+    doc = {
+        "key": key,
+        "name": name,
+        "description": str(payload.get("description", "")).strip(),
+        "sort_order": int(payload.get("sort_order", count + 1)),
+        "active": bool(payload.get("active", True)),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    res = await db.categories.insert_one(doc)
+    doc["id"] = str(res.inserted_id)
+    return clean(doc)
+
+@api_router.put("/admin/categories/{category_id}")
+async def update_category(category_id: str, payload: dict, admin: dict = Depends(require_perm("modify_products"))):
+    cat = await db.categories.find_one({"_id": id_query(category_id)})
+    if not cat:
+        raise HTTPException(status_code=404, detail="Kategori tidak ditemukan")
+    upd = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    for field in ["name", "description", "sort_order", "active", "featured_preview_ids", "price_list_image_url"]:
+        if field in payload:
+            upd[field] = payload[field]
+    if "key" in payload:
+        new_key = str(payload["key"]).strip().lower().replace(" ", "_")
+        if new_key and new_key != cat.get("key"):
+            existing = await db.categories.find_one({"key": new_key, "_id": {"$ne": cat["_id"]}})
+            if existing:
+                raise HTTPException(status_code=400, detail=f"Key '{new_key}' sudah digunakan")
+            upd["key"] = new_key
+    await db.categories.update_one({"_id": cat["_id"]}, {"$set": upd})
+    updated = await db.categories.find_one({"_id": cat["_id"]})
+    return clean(updated)
+
+@api_router.delete("/admin/categories/{category_id}")
+async def delete_category(category_id: str, admin: dict = Depends(require_perm("modify_products"))):
+    cat = await db.categories.find_one({"_id": id_query(category_id)})
+    if not cat:
+        raise HTTPException(status_code=404, detail="Kategori tidak ditemukan")
+    has_products = await db.products.count_documents({"category": cat.get("key")})
+    if has_products > 0:
+        await db.categories.update_one({"_id": cat["_id"]}, {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}})
+        return {"status": "deactivated", "message": "Kategori dinonaktifkan"}
+    await db.categories.delete_one({"_id": cat["_id"]})
+    return {"status": "deleted"}
 
 @api_router.get("/products")
 async def list_products(admin_view: bool = False):
@@ -976,6 +1078,11 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
     update = audit_fields(admin)
     valid_status = {"pesanan_masuk", "dikonfirmasi", "diproses", "siap", "selesai", "dibatalkan"}
     valid_pay = {"belum_dibayar", "dp", "lunas"}
+
+    existing_order = await db.orders.find_one({"_id": id_query(order_id)})
+    if not existing_order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
     if data.order_status is not None:
         if data.order_status not in valid_status:
             raise HTTPException(status_code=400, detail="Status tidak valid")
@@ -986,14 +1093,61 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
         update["payment_status"] = data.payment_status
     if data.admin_note is not None:
         update["admin_note"] = data.admin_note
+
+    has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
+    if has_price_change:
+        perms = admin.get("permissions") or {}
+        if admin.get("role") != "owner" and not perms.get("access_finance"):
+            raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat mengubah harga pesanan")
+
+        if data.items is not None:
+            update["items"] = data.items
+            if len(data.items) > 0:
+                update["item"] = data.items[0]
+        if data.subtotal_le is not None:
+            update["subtotal_le"] = float(data.subtotal_le)
+        if data.delivery_fee_le is not None:
+            update["delivery_fee_le"] = float(data.delivery_fee_le)
+        if data.discount_le is not None:
+            update["discount_le"] = float(data.discount_le)
+
+        if data.total_le is not None:
+            update["total_le"] = float(data.total_le)
+        else:
+            cur_sub = update.get("subtotal_le", existing_order.get("subtotal_le", 0))
+            cur_del = update.get("delivery_fee_le", existing_order.get("delivery_fee_le", 0))
+            cur_disc = update.get("discount_le", existing_order.get("discount_le", 0))
+            cur_ref = existing_order.get("referral_discount_le", 0)
+            cur_pts = existing_order.get("points_redeemed_le", 0)
+            update["total_le"] = max(0.0, float(cur_sub) - float(cur_disc) - float(cur_ref) - float(cur_pts) + float(cur_del))
+
+        rate = existing_order.get("exchange_rate_idr_per_le") or 357
+        update["estimated_total_idr"] = round(update["total_le"] * rate)
+
     await db.orders.update_one({"_id": id_query(order_id)}, {"$set": update})
     order = await db.orders.find_one({"_id": id_query(order_id)})
-    if data.payment_status == "lunas":
-        await record_order_revenue(order)
-        await award_referral_points(order)
-    elif data.payment_status in ("belum_dibayar", "dp"):
+    effective_pay = data.payment_status if data.payment_status is not None else order.get("payment_status")
+
+    if effective_pay == "lunas":
+        now_iso = datetime.now(timezone.utc).isoformat()
+        txn = await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
+        if txn:
+            if has_price_change:
+                await db.finance_transactions.update_one(
+                    {"_id": txn["_id"]},
+                    {"$set": {
+                        "amount": _num(order.get("total_le")),
+                        "updated_at": now_iso,
+                        "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
+                    }}
+                )
+        else:
+            await record_order_revenue(order)
+            await award_referral_points(order)
+    elif effective_pay in ("belum_dibayar", "dp"):
         await db.finance_transactions.delete_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
         await reverse_referral_points(order)
+
     return clean(order)
 
 @api_router.delete("/admin/orders/{order_id}")
@@ -1035,7 +1189,7 @@ async def admin_create_product(payload: Dict[str, Any], admin: dict = Depends(re
 async def admin_update_product(product_id: str, payload: Dict[str, Any], admin: dict = Depends(require_perm("modify_products"))):
     allowed = ["name", "category", "description", "image_url", "active", "configurable",
                "starting_price_le", "pricing", "photos", "representative_photo_id", "sort_order", "slug",
-               "category_cover_image", "cover_mode", "photo_weights", "option_notes"]
+               "category_cover_image", "cover_mode", "photo_weights", "option_notes", "featured_preview_ids"]
     existing = await db.products.find_one({"_id": id_query(product_id)})
     upd = {k: payload[k] for k in allowed if k in payload}
     if "pricing" in upd and not isinstance(upd["pricing"], dict):
@@ -1110,6 +1264,266 @@ async def download_file(path: str):
     data, content_type = get_object(path)
     return StarletteResponse(content=data, media_type=record.get("content_type", content_type),
                              headers={"Cache-Control": "public, max-age=86400"})
+
+@api_router.post("/upload-reference")
+async def upload_reference(file: UploadFile = File(...)):
+    ext = (file.filename.rsplit(".", 1)[-1] if "." in file.filename else "bin").lower()
+    if ext not in MIME_TYPES:
+        raise HTTPException(status_code=400, detail="Format gambar tidak didukung (jpg, png, webp)")
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Ukuran gambar maksimal 10MB")
+    opt = optimize_image(data)
+    if opt:
+        data, ext, ctype = opt
+    else:
+        ctype = MIME_TYPES[ext]
+    path = f"{APP_NAME}/custom-references/{uuid.uuid4()}.{ext}"
+    result = put_object(path, data, ctype)
+    await db.files.insert_one({
+        "storage_path": result["storage_path"], "original_filename": file.filename,
+        "content_type": ctype, "size": result.get("size", len(data)),
+        "is_deleted": False, "category": "custom_reference",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"path": result["storage_path"], "url": f"/api/files/{result['storage_path']}"}
+
+# --------------------------------------------------------------------------
+# Custom Requests
+# --------------------------------------------------------------------------
+@api_router.post("/custom-requests")
+async def create_custom_request(data: CustomRequestInput):
+    if not data.customer_name or not data.customer_name.strip():
+        raise HTTPException(status_code=400, detail="Nama customer wajib diisi")
+    phone = normalize_phone(data.customer_phone)
+    if not phone.startswith("+"):
+        if phone.startswith("08"):
+            phone = "+62" + phone[1:]
+        elif phone.startswith("62"):
+            phone = "+" + phone
+        elif phone.startswith("01"):
+            phone = "+20" + phone[1:]
+        elif phone.startswith("20"):
+            phone = "+" + phone
+        elif phone:
+            phone = "+" + phone
+    if not valid_intl_phone(phone):
+        raise HTTPException(status_code=400, detail="Nomor telepon WhatsApp tidak valid (format internasional e.g. +62... atau +20...)")
+    if not data.furniture_type or not data.furniture_type.strip():
+        raise HTTPException(status_code=400, detail="Jenis furniture wajib diisi")
+
+    now = datetime.now(timezone.utc)
+    yymm = now.strftime("%y%m")
+    count = await db.custom_requests.count_documents({"ticket_number": {"$regex": f"^REQ-{yymm}-"}})
+    ticket_number = f"REQ-{yymm}-{count + 1:04d}"
+
+    doc = {
+        "ticket_number": ticket_number,
+        "customer_name": data.customer_name.strip(),
+        "customer_phone": phone,
+        "customer_address": (data.customer_address or "").strip(),
+        "furniture_type": data.furniture_type.strip(),
+        "dimensions": data.dimensions or {},
+        "material": (data.material or "").strip(),
+        "reference_photos": data.reference_photos or [],
+        "budget_estimation_le": float(data.budget_estimation_le) if data.budget_estimation_le is not None else None,
+        "notes": (data.notes or "").strip(),
+        "status": "baru",
+        "admin_notes": "",
+        "estimated_price_le": None,
+        "converted_order_id": None,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+    result = await db.custom_requests.insert_one(doc)
+
+    wa_num = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+    dims_parts = []
+    if data.dimensions:
+        if data.dimensions.get("length"): dims_parts.append(f"P: {data.dimensions['length']} cm")
+        if data.dimensions.get("width"): dims_parts.append(f"L: {data.dimensions['width']} cm")
+        if data.dimensions.get("height"): dims_parts.append(f"T: {data.dimensions['height']} cm")
+    dims_str = " × ".join(dims_parts) if dims_parts else (data.dimensions.get("notes") if data.dimensions else "")
+
+    lines = [
+        "Halo Sogil Furniture, saya ingin mengajukan *Request Custom Furniture*:",
+        f"Nomor Tiket: *{ticket_number}*",
+        f"Jenis: *{data.furniture_type.strip()}*",
+    ]
+    if dims_str:
+        lines.append(f"Ukuran: {dims_str}")
+    if data.material:
+        lines.append(f"Pilihan Bahan/Finishing: {data.material.strip()}")
+    if data.budget_estimation_le:
+        lines.append(f"Estimasi Budget: {fmt_le(data.budget_estimation_le)} LE")
+    if data.notes:
+        lines.append(f"Catatan: {data.notes.strip()}")
+    if data.reference_photos:
+        lines.append(f"Foto Referensi: {len(data.reference_photos)} foto terlampir")
+    lines.append(f"Nama: {data.customer_name.strip()}")
+    lines.append(f"No. WA: {phone}")
+    lines.append("\nMohon informasi ketersediaan dan estimasi biayanya. Terima kasih!")
+
+    wa_message = "\n".join(lines)
+    clean_num = re.sub(r"[^0-9]", "", wa_num)
+    wa_url = f"https://wa.me/{clean_num}?text={urllib.parse.quote(wa_message)}"
+
+    saved = await db.custom_requests.find_one({"_id": result.inserted_id})
+    res = clean(saved)
+    res["whatsapp_url"] = wa_url
+    res["whatsapp_message"] = wa_message
+    return res
+
+@api_router.get("/admin/custom-requests")
+async def admin_list_custom_requests(
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    query = {}
+    if status and status != "all":
+        query["status"] = status
+    if q:
+        regex = {"$regex": re.escape(q), "$options": "i"}
+        query["$or"] = [
+            {"ticket_number": regex},
+            {"customer_name": regex},
+            {"customer_phone": regex},
+            {"furniture_type": regex},
+        ]
+    cursor = db.custom_requests.find(query).sort("created_at", -1)
+    items = []
+    async for doc in cursor:
+        items.append(clean(doc))
+    return items
+
+@api_router.get("/admin/custom-requests/{req_id}")
+async def admin_get_custom_request(req_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    doc = await db.custom_requests.find_one({"_id": id_query(req_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Request custom tidak ditemukan")
+    return clean(doc)
+
+@api_router.patch("/admin/custom-requests/{req_id}")
+async def admin_update_custom_request(
+    req_id: str,
+    data: CustomRequestUpdate,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    update = audit_fields(admin)
+    if data.status is not None:
+        valid_status = {"baru", "diskusi", "disetujui", "dipesan", "ditolak"}
+        if data.status not in valid_status:
+            raise HTTPException(status_code=400, detail="Status tidak valid")
+        update["status"] = data.status
+    if data.admin_notes is not None:
+        update["admin_notes"] = data.admin_notes
+    if data.estimated_price_le is not None:
+        update["estimated_price_le"] = float(data.estimated_price_le)
+
+    await db.custom_requests.update_one({"_id": id_query(req_id)}, {"$set": update})
+    doc = await db.custom_requests.find_one({"_id": id_query(req_id)})
+    return clean(doc)
+
+@api_router.post("/admin/custom-requests/{req_id}/convert-to-order")
+async def admin_convert_custom_to_order(
+    req_id: str,
+    data: ConvertCustomToOrderInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    custom_req = await db.custom_requests.find_one({"_id": id_query(req_id)})
+    if not custom_req:
+        raise HTTPException(status_code=404, detail="Request custom tidak ditemukan")
+
+    order_num = await generate_order_number()
+    rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    now = datetime.now(timezone.utc).isoformat()
+    subtotal = float(data.subtotal_le)
+    delivery_fee = float(data.delivery_fee_le or 0.0)
+    total_le = max(0.0, subtotal + delivery_fee)
+
+    zone_name = None
+    if data.delivery_zone_id:
+        z = await db.delivery_zones.find_one({"_id": id_query(data.delivery_zone_id)})
+        if z:
+            zone_name = z.get("name")
+
+    item_snapshot = {
+        "product_id": str(custom_req["_id"]),
+        "product_name_snapshot": f"Custom: {custom_req.get('furniture_type', 'Furniture')}",
+        "category": "custom",
+        "configuration_snapshot": {
+            "custom_size": True,
+            "ticket_number": custom_req.get("ticket_number"),
+            "furniture_type": custom_req.get("furniture_type"),
+            "dimensions": custom_req.get("dimensions", {}),
+            "material": custom_req.get("material", ""),
+            "reference_photos": custom_req.get("reference_photos", []),
+            "custom_note": custom_req.get("notes", ""),
+        },
+        "quantity": 1,
+        "unit_price_le": subtotal,
+        "subtotal_le": subtotal,
+    }
+
+    order_doc = {
+        "order_number": order_num,
+        "customer_name": custom_req.get("customer_name"),
+        "customer_phone": custom_req.get("customer_phone"),
+        "customer_address": data.customer_address or custom_req.get("customer_address") or "Dikonfirmasi via WA",
+        "customer_maps_url": data.customer_maps_url or "",
+        "delivery_method": data.delivery_method,
+        "delivery_zone_id": data.delivery_zone_id,
+        "delivery_zone_name": zone_name,
+        "delivery_fee_le": delivery_fee,
+        "payment_method": data.payment_method,
+        "payment_status": "belum_dibayar",
+        "order_status": "dikonfirmasi",
+        "notes": f"[Tiket {custom_req.get('ticket_number')}] {data.notes or custom_req.get('notes', '')}",
+        "admin_note": f"Dikonversi dari tiket {custom_req.get('ticket_number')} oleh {admin.get('name')}",
+        "items": [item_snapshot],
+        "item": item_snapshot,
+        "subtotal_le": subtotal,
+        "discount_code": None,
+        "discount_percentage": 0,
+        "discount_le": 0,
+        "referral": None,
+        "referral_discount_le": 0,
+        "points_redeemed_le": 0,
+        "customer_id": None,
+        "customer_username": None,
+        "total_le": total_le,
+        "exchange_rate_idr_per_le": rate,
+        "estimated_total_idr": round(total_le * rate),
+        "rate_timestamp": now,
+        "requires_admin_confirmation": False,
+        "custom_request_id": str(custom_req["_id"]),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    order_result = await db.orders.insert_one(order_doc)
+    order_id = str(order_result.inserted_id)
+
+    await db.custom_requests.update_one(
+        {"_id": custom_req["_id"]},
+        {"$set": {
+            "status": "dipesan",
+            "converted_order_id": order_id,
+            "estimated_price_le": subtotal,
+            "updated_at": now,
+        }}
+    )
+
+    created_order = await db.orders.find_one({"_id": order_result.inserted_id})
+    return clean(created_order)
+
+@api_router.delete("/admin/custom-requests/{req_id}")
+async def admin_delete_custom_request(req_id: str, admin: dict = Depends(require_perm("delete_data"))):
+    res = await db.custom_requests.delete_one({"_id": id_query(req_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Request custom tidak ditemukan")
+    return {"ok": True}
 
 # --------------------------------------------------------------------------
 # Admin: delivery zones
@@ -2002,9 +2416,8 @@ async def seed():
         rak_pricing = {
             "lengths": ["60", "80", "120"], "levels": ["2", "3", "4", "5", "6", "7"],
             "base_prices": dict(RAK_TYPE_B_PRICES),
-            "types": ["B", "A", "B+", "A+"],
-            "type_adjustments": {"B": {"60": 0, "80": 0, "120": 0}, "A": {"60": 60, "80": 80, "120": 120},
-                                 "B+": {"60": 120, "80": 120, "120": 120}, "A+": {"60": 180, "80": 200, "120": 240}},
+            "types": ["B", "A"],
+            "type_adjustments": {"B": {"60": 0, "80": 0, "120": 0}, "A": {"60": 60, "80": 80, "120": 120}},
             "finishings": ["Natural", "Pernis", "Cat Warna"],
             "finishing": {"Natural": 0, "Pernis": {"60": 15, "80": 20, "120": 30}, "Cat Warna": {"60": 20, "80": 25, "120": 35}},
         }
@@ -2012,9 +2425,8 @@ async def seed():
                         "base_prices": {"40x80_30": 700, "40x80_75": 800, "50x80_30": 800, "50x80_75": 900},
                         "finishings": ["Natural", "Pernis", "Cat Warna"], "finishing": {"Natural": 0, "Pernis": 40, "Cat Warna": 50}}
         mrv = ["Meja 40x80 + Rak 3 Tingkat", "Meja 50x80 + Rak 3 Tingkat"]
-        mr_pricing = {"variants": mrv, "base_prices": {mrv[0]: 2200, mrv[1]: 2400}, "types": ["B", "A", "B+", "A+"],
-                      "type_adjustments": {"B": {mrv[0]: 0, mrv[1]: 0}, "A": {mrv[0]: 80, mrv[1]: 80},
-                                           "B+": {mrv[0]: 120, mrv[1]: 120}, "A+": {mrv[0]: 200, mrv[1]: 200}},
+        mr_pricing = {"variants": mrv, "base_prices": {mrv[0]: 2200, mrv[1]: 2400}, "types": ["B", "A"],
+                      "type_adjustments": {"B": {mrv[0]: 0, mrv[1]: 0}, "A": {mrv[0]: 80, mrv[1]: 80}},
                       "finishings": ["Natural", "Pernis", "Cat Warna"], "finishing": {"Natural": 0, "Pernis": 60, "Cat Warna": 75}}
         products = [
             {"name": "Rak Kayu", "slug": "rak-kayu", "category": "rak", "configurable": True,
@@ -2028,12 +2440,6 @@ async def seed():
              "starting_price_le": 2200, "pricing": mr_pricing, "sort_order": 3},
             {"name": "Papan Tulis", "slug": "papan-tulis", "category": "papan_tulis", "configurable": False,
              "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 4},
-            {"name": "Blockboard", "slug": "blockboard", "category": "blockboard", "configurable": False,
-             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 5},
-            {"name": "Rak Tempel", "slug": "rak-tempel", "category": "rak_tempel", "configurable": False,
-             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 6},
-            {"name": "Rak Gantung", "slug": "rak-gantung", "category": "rak_gantung", "configurable": False,
-             "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 7},
             {"name": "Gantungan Baju", "slug": "gantungan-baju", "category": "gantungan_baju", "configurable": False,
              "description": "Detail pemesanan akan dikonfirmasi melalui WhatsApp.", "starting_price_le": 0, "pricing": {}, "sort_order": 8},
             {"name": "Pesanan Custom", "slug": "pesanan-custom", "category": "custom", "configurable": False,
@@ -2052,8 +2458,33 @@ async def seed():
             await db.products.update_one({"_id": rak["_id"]}, {"$set": {"pricing": pricing, "starting_price_le": RAK_TYPE_B_PRICES["60_2"]}})
         await set_setting("migration_rak_typeB_v2", True)
 
+    # Ensure types in pricing do not contain deprecated A+ and B+
+    await db.products.update_many(
+        {"pricing.types": {"$in": ["A+", "B+"]}},
+        {"$pull": {"pricing.types": {"$in": ["A+", "B+"]}}}
+    )
+
     # Ensure photos field exists on all products
     await db.products.update_many({"photos": {"$exists": False}}, {"$set": {"photos": [], "representative_photo_id": None}})
+
+    # Seed default categories if not present
+    if await db.categories.count_documents({}) == 0:
+        now = datetime.now(timezone.utc).isoformat()
+        default_cats = [
+            {"key": "rak", "name": "Rak", "description": "Rapikan kitab, buku, dan barang dengan lebih teratur.", "sort_order": 1, "active": True, "created_at": now, "updated_at": now},
+            {"key": "meja", "name": "Meja", "description": "Meja praktis untuk belajar atau kerja.", "sort_order": 2, "active": True, "created_at": now, "updated_at": now},
+            {"key": "meja_rak", "name": "Meja Rak", "description": "Kombinasi meja dengan rak di atasnya. Hemat ruang, multifungsi.", "sort_order": 3, "active": True, "created_at": now, "updated_at": now},
+            {"key": "papan_tulis", "name": "Papan Tulis", "description": "Cocok untuk belajar, mengajar, dan berbagai kebutuhan.", "sort_order": 4, "active": True, "created_at": now, "updated_at": now},
+            {"key": "blockboard", "name": "BlackBoard", "description": "Pilihan papan tulis untuk kebutuhan belajar dan aktivitasmu.", "sort_order": 5, "active": True, "created_at": now, "updated_at": now},
+            {"key": "gantungan_baju", "name": "Gantungan Baju", "description": "Gantungan baju kokoh dan hemat tempat.", "sort_order": 6, "active": True, "created_at": now, "updated_at": now},
+            {"key": "custom", "name": "Koleksi Custom", "description": "Kumpulan karya dan desain custom pilihan dari Sogil Furniture.", "sort_order": 7, "active": True, "created_at": now, "updated_at": now},
+        ]
+        await db.categories.insert_many(default_cats)
+
+    await db.products.update_many(
+        {"category": "custom"},
+        {"$set": {"name": "Koleksi Custom"}}
+    )
 
 @app.on_event("startup")
 async def startup():

@@ -22,5 +22,13 @@ export const CATEGORY_LABELS = {
   rak_tempel: "Rak Tempel",
   rak_gantung: "Rak Gantung",
   gantungan_baju: "Gantungan Baju",
-  custom: "Pesanan Custom",
+  custom: "Koleksi Custom",
+};
+
+export const CATEGORY_PRICELISTS = {
+  rak: "/pricelists/rak.jpg",
+  meja: "/pricelists/meja.jpg",
+  meja_rak: "/pricelists/meja_rak.jpg",
+  papan_tulis: "/pricelists/papan_tulis.jpg",
+  blockboard: "/pricelists/blockboard.jpg",
 };

@@ -29,6 +29,8 @@ import AdminOrders from "./pages/admin/AdminOrders";
 import AdminOrderDetail from "./pages/admin/AdminOrderDetail";
 import AdminProducts from "./pages/admin/AdminProducts";
 import AdminProductEdit from "./pages/admin/AdminProductEdit";
+import AdminCategories from "./pages/admin/AdminCategories";
+import AdminCustomRequests from "./pages/admin/AdminCustomRequests";
 import AdminSettings from "./pages/admin/AdminSettings";
 import AdminAnalytics from "./pages/admin/AdminAnalytics";
 import AdminFinance from "./pages/admin/AdminFinance";
@@ -38,6 +40,7 @@ import AdminAdmins from "./pages/admin/AdminAdmins";
 import AdminDiscounts from "./pages/admin/AdminDiscounts";
 import AdminReferrals from "./pages/admin/AdminReferrals";
 import AdminCustomers from "./pages/admin/AdminCustomers";
+import CustomOrderPage from "./pages/CustomOrderPage";
 
 function CustomerShell({ children }) {
   const [store, setStore] = useState(null);
@@ -64,6 +67,8 @@ function Layout() {
           <Route path="orders/:id" element={<AdminOrderDetail />} />
           <Route path="products" element={<AdminProducts />} />
           <Route path="products/:id" element={<AdminProductEdit />} />
+          <Route path="categories" element={<AdminCategories />} />
+          <Route path="custom-requests" element={<AdminCustomRequests />} />
           <Route path="analytics" element={<AdminAnalytics />} />
           <Route path="finance" element={<AdminFinance />} />
           <Route path="finance/statistics" element={<AdminFinanceStats />} />
@@ -89,6 +94,8 @@ function Layout() {
         />
         
         <Route path="/produk/:slug" element={<ProductConfigure />} />
+        <Route path="/request-custom" element={<CustomOrderPage />} />
+        <Route path="/custom-order" element={<CustomOrderPage />} />
         <Route path="/keranjang" element={<Cart />} />
         <Route path="/checkout" element={<Checkout />} />
         <Route path="/pesanan/:id" element={<OrderConfirmation />} />

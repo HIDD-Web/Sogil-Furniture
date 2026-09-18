@@ -11,6 +11,7 @@ const api = axios.create({
 export const imgUrl = (path) => {
   if (!path) return "";
   if (path.startsWith("http")) return path;
+  if (path.startsWith("/pricelists/")) return path;
   return `${BACKEND_URL}${path}`;
 };
 

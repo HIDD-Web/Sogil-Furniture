@@ -10,8 +10,8 @@ import { useLang } from "../context/LanguageContext";
 import { Button } from "../components/ui/button";
 import { Textarea } from "../components/ui/textarea";
 import { Label } from "../components/ui/label";
-import { toast } from "sonner";
-import { Minus, Plus, ChevronLeft, Info, ShoppingCart, Zap } from "lucide-react";
+import { Minus, Plus, ChevronLeft, ChevronRight, Info, ShoppingCart, Zap, MessageCircle } from "lucide-react";
+import { CATEGORY_PRICELISTS } from "../lib/constants";
 
 const CATEGORY_KEYS = {
   rak: "cat.rak",
@@ -94,6 +94,33 @@ export default function ProductConfigure() {
   const [gidx, setGidx] = useState(0);
   useEffect(() => { setGidx(0); }, [photoMatch.photo?.id]);
 
+  const ph = photoMatch.photo;
+  const priceListUrl = product ? CATEGORY_PRICELISTS[product.category] : null;
+
+  const photoSlots = useMemo(() => {
+    if (!product) return [];
+    let slots = [];
+    if (ph) {
+      slots = [ph.main_url, ph.front_url, ph.side_url, ...(ph.images || [])].filter(Boolean);
+    }
+    // If no matching photo but product has display_image and it's not a price list, include it
+    if (slots.length === 0 && product.display_image && !product.display_image.includes("pricelists")) {
+      slots.push(product.display_image);
+    }
+    // The official Price List is ALWAYS the last photo of the gallery
+    if (priceListUrl && !slots.includes(priceListUrl)) {
+      slots.push(priceListUrl);
+    }
+    return slots;
+  }, [ph, product, priceListUrl]);
+
+  const gi = Math.min(gidx, Math.max(0, photoSlots.length - 1));
+
+  // Touch swipe support for smooth mobile photo navigation
+  const [touchStart, setTouchStart] = useState(null);
+  const [touchEnd, setTouchEnd] = useState(null);
+  const minSwipeDistance = 45;
+
   const canAdd = () => {
     if (!isConfigurable) return true;
     const g = product.pricing?.groups;
@@ -135,36 +162,120 @@ export default function ProductConfigure() {
   const pr = product.pricing || {};
   const groups = Array.isArray(pr.groups) ? pr.groups : null;
   const isFixed = pr.price_model === "additive";
-  const ph = photoMatch.photo;
-  const photoSlots = ph ? [ph.main_url, ph.front_url, ph.side_url, ...(ph.images || [])].filter(Boolean) : [];
-  const gi = Math.min(gidx, Math.max(0, photoSlots.length - 1));
+
+  const onTouchStart = (e) => {
+    setTouchEnd(null);
+    setTouchStart(e.targetTouches[0].clientX);
+  };
+
+  const onTouchMove = (e) => {
+    setTouchEnd(e.targetTouches[0].clientX);
+  };
+
+  const onTouchEnd = () => {
+    if (!touchStart || !touchEnd) return;
+    const distance = touchStart - touchEnd;
+    if (distance > minSwipeDistance && gi < photoSlots.length - 1) {
+      setGidx(gi + 1);
+    } else if (distance < -minSwipeDistance && gi > 0) {
+      setGidx(gi - 1);
+    }
+  };
+
+  const handlePrevPhoto = (e) => {
+    e.stopPropagation();
+    setGidx((prev) => (prev > 0 ? prev - 1 : photoSlots.length - 1));
+  };
+
+  const handleNextPhoto = (e) => {
+    e.stopPropagation();
+    setGidx((prev) => (prev < photoSlots.length - 1 ? prev + 1 : 0));
+  };
 
   return (
     <div className="mx-auto max-w-6xl px-3 py-3 pb-36 sm:px-6 sm:py-6 lg:pb-10">
-      <button onClick={() => navigate("/produk")} className="mb-2.5 inline-flex items-center gap-1 text-xs sm:text-sm font-medium text-[#8B5A2B]" data-testid="back-to-catalog">
+      <button onClick={() => navigate("/")} className="mb-2.5 inline-flex items-center gap-1 text-xs sm:text-sm font-medium text-[#8B5A2B] hover:underline" data-testid="back-to-home">
         <ChevronLeft size={16} /> {t("cfg.kembali_produk")}
       </button>
 
       <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
         <div className="space-y-3.5 sm:space-y-6" data-testid="step-config">
-          {/* Photo preview */}
+          {/* Photo preview with touch swipe and arrows */}
           <div>
             <div className="overflow-hidden rounded-2xl border border-[#E5DCC5] bg-white shadow-sm">
               {photoSlots.length ? (
-                <div className="relative h-[210px] xs:h-[230px] sm:h-[280px] lg:h-[380px] w-full overflow-hidden bg-[#FBF9F4] flex items-center justify-center p-2">
-                  <img src={imgUrl(photoSlots[gi])} alt={product.name} className="h-full w-full object-contain transition-all duration-300" data-testid="config-photo-main" />
+                <div
+                  className="relative h-[290px] xs:h-[320px] sm:h-[380px] lg:h-[440px] w-full overflow-hidden bg-[#FBF9F4] flex items-center justify-center p-3 select-none touch-pan-y"
+                  onTouchStart={onTouchStart}
+                  onTouchMove={onTouchMove}
+                  onTouchEnd={onTouchEnd}
+                >
+                  <img
+                    src={imgUrl(photoSlots[gi])}
+                    alt={product.name}
+                    className="h-full w-full object-contain transition-all duration-300 drop-shadow-sm pointer-events-none"
+                    data-testid="config-photo-main"
+                  />
+
+                  {/* Left / Right navigation arrows */}
+                  {photoSlots.length > 1 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handlePrevPhoto}
+                        data-testid="btn-photo-prev"
+                        aria-label="Foto sebelumnya"
+                        className="absolute left-2.5 top-1/2 -translate-y-1/2 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-full bg-white/90 text-[#2C1E16] shadow-md backdrop-blur-xs transition-transform hover:scale-105 active:scale-95 hover:bg-white"
+                      >
+                        <ChevronLeft size={20} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleNextPhoto}
+                        data-testid="btn-photo-next"
+                        aria-label="Foto berikutnya"
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-full bg-white/90 text-[#2C1E16] shadow-md backdrop-blur-xs transition-transform hover:scale-105 active:scale-95 hover:bg-white"
+                      >
+                        <ChevronRight size={20} />
+                      </button>
+
+                      {/* Photo counter / Price List badge */}
+                      <div className="absolute bottom-3 right-3 flex items-center gap-1.5 rounded-full bg-black/65 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-xs pointer-events-none">
+                        {photoSlots[gi] === priceListUrl ? (
+                          <span className="font-semibold text-amber-300">Price List</span>
+                        ) : (
+                          <span>{gi + 1} / {photoSlots.length}</span>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </div>
               ) : (
-                <ProductImage url={product.display_image} alt={product.name} ratio="aspect-[16/10] sm:aspect-[4/3]" />
+                <ProductImage url={product.display_image} alt={product.name} ratio="aspect-[4/5] sm:aspect-[4/3]" />
               )}
             </div>
             {photoSlots.length > 1 && (
               <div className="mt-1.5 flex gap-1.5 overflow-x-auto pb-1" data-testid="gallery-thumbs">
-                {photoSlots.map((u, i) => (
-                  <button key={i} onClick={() => setGidx(i)} data-testid={`gallery-thumb-${i}`} className={`h-11 w-10 sm:h-14 sm:w-12 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${i === gi ? "border-[#8B5A2B]" : "border-[#E5DCC5]"}`}>
-                    <img src={imgUrl(u)} alt="" className="h-full w-full object-cover" />
-                  </button>
-                ))}
+                {photoSlots.map((u, i) => {
+                  const isPriceList = u === priceListUrl;
+                  return (
+                    <button
+                      key={i}
+                      onClick={() => setGidx(i)}
+                      data-testid={`gallery-thumb-${i}`}
+                      className={`relative h-11 w-10 sm:h-14 sm:w-12 shrink-0 overflow-hidden rounded-lg border-2 transition-colors ${
+                        i === gi ? "border-[#8B5A2B] ring-1 ring-[#8B5A2B]" : "border-[#E5DCC5]"
+                      }`}
+                    >
+                      <img src={imgUrl(u)} alt="" className="h-full w-full object-cover" />
+                      {isPriceList && (
+                        <span className="absolute bottom-0 inset-x-0 bg-[#8B5A2B]/95 text-[8px] sm:text-[9px] font-bold text-white text-center py-0.5 leading-tight uppercase">
+                          P.List
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             )}
             <div className="mt-1.5 flex items-center justify-between">
@@ -193,7 +304,47 @@ export default function ProductConfigure() {
             )}
           </div>
 
-          {!isConfigurable && (
+          {product.category === "custom" ? (
+            <div className="rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 space-y-4 shadow-xs">
+              <div className="flex items-start gap-3">
+                <Info className="mt-0.5 text-[#8B5A2B] shrink-0" size={20} />
+                <div>
+                  <div className="font-heading font-semibold text-[#2C1E16]">
+                    Karya Pesanan Custom
+                  </div>
+                  <p className="mt-1 text-xs sm:text-sm text-[#5C4A3D]">
+                    Produk ini adalah portofolio pesanan custom yang pernah diproduksi oleh Sogil Furniture. Anda dapat memesan desain serupa dengan ukuran, bahan, dan finishing yang disesuaikan dengan ruangan Anda.
+                  </p>
+                </div>
+              </div>
+
+              {/* WhatsApp direct consultation CTA */}
+              <a
+                href={`https://wa.me/${(store?.whatsapp_number || "201016843442").replace(/[^0-9]/g, "")}?text=${encodeURIComponent(
+                  `Halo Sogil Furniture, saya tertarik dengan Koleksi Custom "${product.name}". Apakah bisa dibuatkan dengan spesifikasi saya?`
+                )}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="btn-custom-wa"
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#25D366] py-3 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#1EBE5D] transition-colors"
+              >
+                <MessageCircle size={18} />
+                Konsultasikan Desain Ini via WhatsApp
+              </a>
+
+              <div className="border-t border-[#F1EBE0] pt-3">
+                <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                  Atau tulis catatan spesifikasi untuk dipesan online:
+                </Label>
+                <Textarea
+                  value={customNote}
+                  onChange={(e) => setCustomNote(e.target.value)}
+                  placeholder="Tuliskan ukuran, model, atau catatan khusus yang Anda inginkan..."
+                  className="mt-1.5 min-h-[80px] bg-[#FBF9F4] text-xs sm:text-sm"
+                />
+              </div>
+            </div>
+          ) : !isConfigurable && (
             <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
               <div className="flex items-start gap-3"><Info className="mt-0.5 text-amber-600" size={20} />
                 <div><div className="font-heading font-semibold text-amber-800">{t("cfg.segera_t")}</div>
@@ -219,6 +370,16 @@ export default function ProductConfigure() {
                   <p className="text-sm text-[#5C4A3D]">{t("cfg.custom_info")}</p>
                   <Textarea value={customNote} onChange={(e) => setCustomNote(e.target.value)} data-testid="custom-note" placeholder={t("cfg.custom_ph")} className="mt-3 min-h-[100px] bg-[#FBF9F4]" />
                   <p className="mt-2 text-xs text-amber-700">{t("cfg.custom_note")}</p>
+                  <div className="mt-3 flex items-center justify-between border-t border-[#F1EBE0] pt-2.5">
+                    <span className="text-xs text-[#8B7355]">Punya foto referensi / sketsa sendiri?</span>
+                    <button
+                      type="button"
+                      onClick={() => navigate("/request-custom")}
+                      className="text-xs font-semibold text-[#8B5A2B] hover:underline"
+                    >
+                      Buka Form Request Custom ↗
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <>

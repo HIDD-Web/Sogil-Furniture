@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, Package, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound } from "lucide-react";
 import { Button } from "../../components/ui/button";
 
 export default function AdminLayout() {
@@ -18,8 +18,10 @@ export default function AdminLayout() {
   const LINKS = [
     { to: "/admin", label: "Overview", icon: LayoutDashboard, end: true, show: true },
     { to: "/admin/orders", label: "Pesanan", icon: ShoppingBag, show: perms.manage_orders || isOwner },
+    { to: "/admin/custom-requests", label: "Request Custom", icon: Sparkles, show: perms.manage_orders || isOwner },
     { to: "/admin/analytics", label: "Analitik", icon: BarChart3, show: perms.manage_orders || isOwner },
     { to: "/admin/products", label: "Produk", icon: Package, show: perms.modify_products || isOwner },
+    { to: "/admin/categories", label: "Kategori", icon: Layers, show: perms.modify_products || isOwner },
     { to: "/admin/finance", label: "Keuangan", icon: Wallet, show: perms.access_finance || isOwner },
     { to: "/admin/finance/statistics", label: "Statistik", icon: BarChart3, show: perms.access_finance || isOwner },
     { to: "/admin/export", label: "Export Data", icon: Wallet, show: perms.access_finance || perms.manage_orders || isOwner },

@@ -156,7 +156,7 @@ export default function Checkout() {
             <div className="mt-3 space-y-2">
               {items.map((it) => (
                 <div key={it.cartId} className="flex justify-between gap-3 text-sm">
-                  <span className="text-[#5C4A3D]">{it.product.name} <span className="text-[#8B7355]">×{it.quantity}</span><br /><span className="text-xs text-[#8B7355]">{config_summary_client(it.product.category, it.config)}</span></span>
+                  <span className="text-[#5C4A3D]">{it.product.name} <span className="text-[#8B7355]">×{it.quantity}</span><br /><span className="text-xs text-[#8B7355]">{config_summary_client(it.product.category, it.config, t)}</span></span>
                   <span className="font-medium text-[#2C1E16]">{it.breakdown?.requiresConfirm ? "—" : `${fmtLE(it.breakdown?.subtotal || 0)} LE`}</span>
                 </div>
               ))}

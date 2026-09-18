@@ -33,11 +33,11 @@ export default function ProductCard({ product, preview }) {
       className="group flex flex-col justify-between overflow-hidden rounded-2xl border border-[#E5DCC5] bg-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
     >
       <div>
-        <div className="overflow-hidden">
+        <div className="overflow-hidden bg-[#FBF9F4]">
           <ProductImage
             url={imageUrl}
             alt={subtitle ? `${title} - ${subtitle}` : title}
-            ratio="aspect-[4/3]"
+            ratio="aspect-[4/5]"
             className="transition-transform duration-300 group-hover:scale-[1.02]"
           />
         </div>
@@ -47,14 +47,11 @@ export default function ProductCard({ product, preview }) {
             {CATEGORY_LABELS[category] || category}
           </div>
 
-          <h3 className="mt-1 font-heading text-base font-semibold leading-snug text-[#2C1E16]">
-            {title}
+          <h3 className="mt-1 font-heading text-sm sm:text-base font-semibold leading-snug text-[#2C1E16] line-clamp-2">
+            {category === "custom" ? title : (subtitle || title)}
           </h3>
-
-          {subtitle && (
-            <p className="mt-0.5 line-clamp-1 text-xs font-medium text-[#5C4A3D]">
-              {subtitle}
-            </p>
+          {category === "custom" && subtitle && (
+            <p className="mt-0.5 text-xs text-[#8B7355] line-clamp-1">{subtitle}</p>
           )}
 
           {price > 0 && (

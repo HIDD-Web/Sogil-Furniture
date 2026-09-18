@@ -32,17 +32,20 @@ export default function AdminOverview() {
     <div>
       <h1 className="font-heading text-2xl font-bold text-[#2C1E16]">Overview</h1>
       <p className="mt-1 text-sm text-[#8B7355]">Klik kartu untuk melihat pesanan terkait.</p>
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="mt-4 sm:mt-6 grid grid-cols-2 gap-2.5 sm:gap-4 lg:grid-cols-4">
         {CARDS.map((c) => (
           <button key={c.key} onClick={() => go(c.filter)} data-testid={`stat-${c.key}`}
-            className="rounded-2xl border border-[#E5DCC5] bg-white p-5 text-left shadow-sm transition-shadow hover:shadow-md">
-            <div className="flex items-center justify-between"><span className="text-sm text-[#5C4A3D]">{c.label}</span><c.icon size={20} className={c.color} /></div>
-            <div className="mt-2 font-heading text-3xl font-bold text-[#2C1E16]">{stats?.[c.key] ?? "-"}</div>
+            className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3 sm:p-5 text-left shadow-xs transition-shadow hover:shadow-md">
+            <div className="flex items-center justify-between gap-1">
+              <span className="text-xs sm:text-sm font-medium text-[#5C4A3D] line-clamp-1">{c.label}</span>
+              <c.icon size={18} className={`${c.color} shrink-0`} />
+            </div>
+            <div className="mt-1.5 sm:mt-2 font-heading text-xl sm:text-3xl font-bold text-[#2C1E16]">{stats?.[c.key] ?? "-"}</div>
           </button>
         ))}
-        <div className="rounded-2xl border border-[#E5DCC5] bg-[#8B5A2B] p-5 text-white shadow-sm sm:col-span-2 lg:col-span-4" data-testid="stat-revenue">
-          <div className="flex items-center justify-between"><span className="text-sm text-white/80">Estimasi Pendapatan (non-batal)</span><Wallet size={20} /></div>
-          <div className="mt-2 font-heading text-3xl font-bold">{fmtLE(stats?.estimated_revenue_le || 0)} LE</div>
+        <div className="col-span-2 sm:col-span-2 lg:col-span-4 rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-[#8B5A2B] p-3.5 sm:p-5 text-white shadow-xs" data-testid="stat-revenue">
+          <div className="flex items-center justify-between"><span className="text-xs sm:text-sm text-white/80">Estimasi Pendapatan (non-batal)</span><Wallet size={18} className="shrink-0" /></div>
+          <div className="mt-1 sm:mt-2 font-heading text-xl sm:text-3xl font-bold">{fmtLE(stats?.estimated_revenue_le || 0)} LE</div>
         </div>
       </div>
     </div>

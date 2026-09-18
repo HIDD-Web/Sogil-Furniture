@@ -34,7 +34,7 @@ function ProductGridSkeleton() {
           key={item}
           className="overflow-hidden rounded-2xl border border-[#E5DCC5] bg-white p-3"
         >
-          <Skeleton className="aspect-[4/3] w-full rounded-xl" />
+          <Skeleton className="aspect-[4/5] w-full rounded-xl" />
           <Skeleton className="mt-3 h-3 w-16 rounded" />
           <Skeleton className="mt-2 h-5 w-3/4 rounded" />
           <Skeleton className="mt-2 h-4 w-1/2 rounded" />
@@ -49,16 +49,23 @@ export default function CategoryPage() {
   const { t } = useLang();
 
   const [products, setProducts] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [store, setStore] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let mounted = true;
 
-    api
-      .get("/products")
-      .then((response) => {
+    Promise.all([
+      api.get("/products"),
+      api.get("/categories").catch(() => ({ data: [] })),
+      api.get("/store-info").catch(() => ({ data: null })),
+    ])
+      .then(([prodRes, catRes, storeRes]) => {
         if (mounted) {
-          setProducts(Array.isArray(response.data) ? response.data : []);
+          setProducts(Array.isArray(prodRes.data) ? prodRes.data : []);
+          if (Array.isArray(catRes?.data)) setCategories(catRes.data);
+          if (storeRes?.data) setStore(storeRes.data);
         }
       })
       .catch(() => {
@@ -93,22 +100,25 @@ export default function CategoryPage() {
     [categoryProducts]
   );
 
-  const hasCategory = Object.prototype.hasOwnProperty.call(
-    CATEGORY_LABELS,
-    category
+  const categoryDoc = useMemo(
+    () => categories.find((c) => c.key === category),
+    [categories, category]
   );
 
-  const title = hasCategory
-    ? t(CATEGORY_KEYS[category])
-    : category;
+  const hasCategory = Boolean(categoryDoc) || Object.prototype.hasOwnProperty.call(CATEGORY_LABELS, category);
 
-  const description = hasCategory
-    ? t(CATEGORY_DESCRIPTION_KEYS[category])
-    : t("cat.default_desc");
+  const title = categoryDoc?.name || (CATEGORY_KEYS[category] ? t(CATEGORY_KEYS[category]) : (CATEGORY_LABELS[category] || category));
+
+  const description = categoryDoc?.description || (CATEGORY_DESCRIPTION_KEYS[category] ? t(CATEGORY_DESCRIPTION_KEYS[category]) : t("cat.default_desc"));
+
+  const whatsappNumber = (store?.whatsapp_number || "201016843442").replace(/[^0-9]/g, "");
+  const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(
+    "Halo Sogil Furniture, saya ingin konsultasi pemesanan furnitur custom."
+  )}`;
 
   return (
     <main className="min-h-[60vh] bg-[#F9F6F0]">
-      <section className="mx-auto max-w-6xl px-4 pb-8 pt-7 sm:px-6 sm:pb-10 sm:pt-9">
+      <section className="mx-auto max-w-6xl px-4 pb-6 pt-7 sm:px-6 sm:pb-8 sm:pt-9">
         <Link
           to="/"
           data-testid="category-back-home"
@@ -134,6 +144,36 @@ export default function CategoryPage() {
             {description}
           </p>
         </div>
+
+        {/* Custom Consultation Banner */}
+        {category === "custom" && (
+          <div className="mt-6 rounded-2xl border border-[#E5DCC5] bg-[#F4EFE6] p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xs">
+            <div>
+              <h3 className="font-heading font-bold text-base text-[#2C1E16]">
+                Punya Ide atau Kebutuhan Furnitur Custom?
+              </h3>
+              <p className="mt-1 text-xs sm:text-sm text-[#5C4A3D] max-w-xl">
+                Sogil Furniture melayani pembuatan furnitur dengan bentuk, ukuran, dan spesifikasi sesuai keinginanmu. Hubungi admin untuk konsultasi desain dan estimasi harga.
+              </p>
+            </div>
+            <div className="flex flex-wrap sm:flex-nowrap gap-2 shrink-0">
+              <Link
+                to="/request-custom"
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#8B5A2B] px-4 py-2.5 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#6B4423] transition-colors"
+              >
+                Isi Form Request
+              </Link>
+              <a
+                href={whatsappUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#25D366] px-4 py-2.5 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#1EBE5D] transition-colors"
+              >
+                Konsultasi via WA
+              </a>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="mx-auto max-w-6xl px-4 pb-14 sm:px-6">

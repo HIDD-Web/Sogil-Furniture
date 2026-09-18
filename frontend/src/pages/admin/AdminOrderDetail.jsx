@@ -5,10 +5,11 @@ import { fmtLE, fmtIDR } from "../../lib/format";
 import { config_summary_client } from "../../lib/summary";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../../lib/constants";
 import { Button } from "../../components/ui/button";
+import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2 } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 
@@ -17,8 +18,16 @@ export default function AdminOrderDetail() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
+  const canEditPrice = user?.role === "owner" || user?.permissions?.access_finance;
   const [order, setOrder] = useState(null);
   const [note, setNote] = useState("");
+  const [priceModalOpen, setPriceModalOpen] = useState(false);
+  const [priceForm, setPriceForm] = useState({
+    subtotal_le: 0,
+    delivery_fee_le: 0,
+    discount_le: 0,
+    reason: "",
+  });
 
   const load = () => api.get(`/admin/orders/${id}`).then((r) => { setOrder(r.data); setNote(r.data.admin_note || ""); });
   useEffect(() => { load(); }, [id]);
@@ -26,6 +35,48 @@ export default function AdminOrderDetail() {
   const update = async (patch) => {
     try { const { data } = await api.patch(`/admin/orders/${id}`, patch); setOrder((o) => ({ ...o, ...data })); toast.success("Pesanan diperbarui"); }
     catch { toast.error("Gagal memperbarui"); }
+  };
+
+  const openPriceModal = () => {
+    setPriceForm({
+      subtotal_le: order.subtotal_le || 0,
+      delivery_fee_le: order.delivery_fee_le || 0,
+      discount_le: order.discount_le || 0,
+      reason: "",
+    });
+    setPriceModalOpen(true);
+  };
+
+  const savePrice = async () => {
+    const sub = Number(priceForm.subtotal_le) || 0;
+    const del = Number(priceForm.delivery_fee_le) || 0;
+    const disc = Number(priceForm.discount_le) || 0;
+    const refDisc = Number(order.referral_discount_le) || 0;
+    const pts = Number(order.points_redeemed_le) || 0;
+    const newTotal = Math.max(0, sub - disc - refDisc - pts + del);
+
+    const payload = {
+      subtotal_le: sub,
+      delivery_fee_le: del,
+      discount_le: disc,
+      total_le: newTotal,
+    };
+
+    if (priceForm.reason) {
+      const timeStr = new Date().toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
+      const noteEntry = `[${timeStr}] Penyesuaian harga: ${priceForm.reason}`;
+      payload.admin_note = order.admin_note ? `${order.admin_note}\n${noteEntry}` : noteEntry;
+    }
+
+    try {
+      const { data } = await api.patch(`/admin/orders/${id}`, payload);
+      setOrder((o) => ({ ...o, ...data }));
+      if (payload.admin_note) setNote(payload.admin_note);
+      setPriceModalOpen(false);
+      toast.success("Harga pesanan & data keuangan berhasil disesuaikan");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal menyesuaikan harga");
+    }
   };
   if (!order) return <div className="text-[#8B7355]">Memuat...</div>;
   const items = order.items || [order.item];
@@ -79,17 +130,35 @@ export default function AdminOrderDetail() {
           {order.notes && <Row k="Catatan" v={order.notes} />}
         </Block>
 
-        <Block title="Rincian Harga">
-          <Row k="Subtotal Produk" v={`${fmtLE(order.subtotal_le)} LE`} />
-          {order.discount_le > 0 && <Row k={`Diskon${order.discount_code ? ` (${order.discount_code})` : ""}`} v={`-${fmtLE(order.discount_le)} LE`} />}
-          {order.referral_discount_le > 0 && <Row k={`Diskon Referral${order.referral?.code ? ` (${order.referral.code})` : ""}`} v={`-${fmtLE(order.referral_discount_le)} LE`} />}
-          {order.points_redeemed_le > 0 && <Row k="Penukaran Poin" v={`-${fmtLE(order.points_redeemed_le)} LE`} />}
-          <Row k="Ongkir" v={`${fmtLE(order.delivery_fee_le)} LE`} />
-          <div className="my-1 border-t border-dashed border-[#E5DCC5]" />
-          <Row k="Total LE" v={<span className="font-bold text-[#8B5A2B]">{fmtLE(order.total_le)} LE</span>} />
-          <Row k="Rate" v={`Rp${fmtLE(order.exchange_rate_idr_per_le)}/LE`} />
-          <Row k="Estimasi IDR" v={fmtIDR(order.estimated_total_idr)} />
-        </Block>
+        <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="font-heading text-sm font-bold uppercase tracking-wide text-[#8B5A2B]">
+              Rincian Harga
+            </span>
+            {canEditPrice && (
+              <button
+                type="button"
+                onClick={openPriceModal}
+                data-testid="btn-edit-order-price"
+                className="flex items-center gap-1 rounded-lg border border-[#E5DCC5] bg-[#FBF9F4] px-2.5 py-1 text-xs font-semibold text-[#8B5A2B] hover:bg-[#EFE6D5] transition-colors"
+                title="Sesuaikan Harga Pesanan"
+              >
+                <Pencil size={12} /> Sesuaikan Harga
+              </button>
+            )}
+          </div>
+          <div className="space-y-1">
+            <Row k="Subtotal Produk" v={`${fmtLE(order.subtotal_le)} LE`} />
+            {order.discount_le > 0 && <Row k={`Diskon${order.discount_code ? ` (${order.discount_code})` : ""}`} v={`-${fmtLE(order.discount_le)} LE`} />}
+            {order.referral_discount_le > 0 && <Row k={`Diskon Referral${order.referral?.code ? ` (${order.referral.code})` : ""}`} v={`-${fmtLE(order.referral_discount_le)} LE`} />}
+            {order.points_redeemed_le > 0 && <Row k="Penukaran Poin" v={`-${fmtLE(order.points_redeemed_le)} LE`} />}
+            <Row k="Ongkir" v={`${fmtLE(order.delivery_fee_le)} LE`} />
+            <div className="my-1 border-t border-dashed border-[#E5DCC5]" />
+            <Row k="Total LE" v={<span className="font-bold text-[#8B5A2B]">{fmtLE(order.total_le)} LE</span>} />
+            <Row k="Rate" v={`Rp${fmtLE(order.exchange_rate_idr_per_le)}/LE`} />
+            <Row k="Estimasi IDR" v={fmtIDR(order.estimated_total_idr)} />
+          </div>
+        </div>
 
         {order.referral && (
           <Block title="Promo & Referral">
@@ -108,6 +177,97 @@ export default function AdminOrderDetail() {
           {order.delivery_zone_name && <Row k="Zona" v={order.delivery_zone_name} />}
         </Block>
       </div>
+
+      {priceModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-xl">
+            <div className="flex items-center justify-between border-b border-[#F1EBE0] pb-3">
+              <div>
+                <h3 className="font-heading text-lg font-bold text-[#2C1E16]">Sesuaikan Harga Pesanan</h3>
+                <p className="text-xs text-[#8B7355]">Ubah harga untuk pesanan custom atau kesepakatan khusus</p>
+              </div>
+              <button onClick={() => setPriceModalOpen(false)} className="rounded-lg p-1 text-[#8B7355] hover:bg-[#F1EBE0]">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Subtotal Produk (LE)</Label>
+                <Input
+                  type="number"
+                  value={priceForm.subtotal_le}
+                  onChange={(e) => setPriceForm({ ...priceForm, subtotal_le: e.target.value })}
+                  className="mt-1"
+                  data-testid="input-edit-subtotal"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs font-semibold text-[#5C4A3D]">Ongkir (LE)</Label>
+                  <Input
+                    type="number"
+                    value={priceForm.delivery_fee_le}
+                    onChange={(e) => setPriceForm({ ...priceForm, delivery_fee_le: e.target.value })}
+                    className="mt-1"
+                    data-testid="input-edit-delivery"
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs font-semibold text-[#5C4A3D]">Diskon (LE)</Label>
+                  <Input
+                    type="number"
+                    value={priceForm.discount_le}
+                    onChange={(e) => setPriceForm({ ...priceForm, discount_le: e.target.value })}
+                    className="mt-1"
+                    data-testid="input-edit-discount"
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[#E5DCC5] bg-[#FBF9F4] p-3 text-xs space-y-1">
+                <div className="flex justify-between text-[#8B7355]">
+                  <span>Total Baru (LE):</span>
+                  <span className="font-bold text-[#8B5A2B] text-sm">
+                    {fmtLE(Math.max(0, (Number(priceForm.subtotal_le) || 0) - (Number(priceForm.discount_le) || 0) - (Number(order.referral_discount_le) || 0) - (Number(order.points_redeemed_le) || 0) + (Number(priceForm.delivery_fee_le) || 0)))} LE
+                  </span>
+                </div>
+                <div className="flex justify-between text-[#8B7355]">
+                  <span>Estimasi IDR:</span>
+                  <span className="font-medium text-[#2C1E16]">
+                    {fmtIDR(Math.round(Math.max(0, (Number(priceForm.subtotal_le) || 0) - (Number(priceForm.discount_le) || 0) - (Number(order.referral_discount_le) || 0) - (Number(order.points_redeemed_le) || 0) + (Number(priceForm.delivery_fee_le) || 0)) * (order.exchange_rate_idr_per_le || 357)))}
+                  </span>
+                </div>
+                {order.payment_status === "lunas" && (
+                  <p className="mt-1.5 text-[11px] font-medium text-emerald-700">
+                    ✓ Transaksi di data Keuangan akan otomatis diperbarui ke total baru ini.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Catatan / Alasan Penyesuaian (Opsional)</Label>
+                <Input
+                  placeholder="Contoh: Kesepakatan ukuran custom meja 100x60"
+                  value={priceForm.reason}
+                  onChange={(e) => setPriceForm({ ...priceForm, reason: e.target.value })}
+                  className="mt-1 text-xs"
+                  data-testid="input-edit-reason"
+                />
+              </div>
+            </div>
+
+            <div className="mt-5 flex gap-2">
+              <Button variant="outline" onClick={() => setPriceModalOpen(false)} className="flex-1 rounded-xl border-[#E5DCC5]">
+                Batal
+              </Button>
+              <Button onClick={savePrice} data-testid="btn-save-custom-price" className="flex-1 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">
+                Simpan Penyesuaian
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
