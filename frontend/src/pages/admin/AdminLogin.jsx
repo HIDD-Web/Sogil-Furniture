@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import api from "../../lib/api";
 import { useAuth } from "../../context/AuthContext";
 import { formatApiError } from "../../lib/format";
 import { Logo } from "../../components/Logo";

@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
+import api from "../../lib/api";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
 import { LayoutDashboard, ShoppingBag, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone } from "lucide-react";
