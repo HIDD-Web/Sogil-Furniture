@@ -56,8 +56,8 @@ export default function PwaInstallModal({ isOpen, onClose, mode = "customer" }) 
   const isAdmin = mode === "admin";
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs animate-in fade-in">
-      <div className="relative w-full max-w-md rounded-3xl border border-[#E5DCC5] bg-white p-5 sm:p-7 shadow-2xl max-h-[92vh] overflow-y-auto">
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 backdrop-blur-xs p-4 flex items-center justify-center">
+      <div className="relative w-full max-w-md my-auto rounded-3xl border border-[#E5DCC5] bg-white p-5 sm:p-7 shadow-2xl max-h-[85vh] overflow-y-auto">
         <button
           onClick={onClose}
           className="absolute right-4 top-4 rounded-full p-1.5 text-[#8B7355] hover:bg-[#FAF5EE] hover:text-[#2C1E16] transition-colors"

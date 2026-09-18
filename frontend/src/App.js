@@ -123,6 +123,16 @@ function Layout() {
   );
 }
 
+function ScrollToTop() {
+  const { pathname } = useLocation();
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, [pathname]);
+
+  return null;
+}
+
 function App() {
   return (
     <div className="App">
@@ -131,6 +141,7 @@ function App() {
           <CartProvider>
             <CustomerProvider>
               <BrowserRouter>
+                <ScrollToTop />
                 <Layout />
                 <Toaster position="top-center" richColors />
               </BrowserRouter>
