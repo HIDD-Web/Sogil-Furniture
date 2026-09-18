@@ -2,13 +2,15 @@ import React, { useState } from "react";
 import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone } from "lucide-react";
 import { Button } from "../../components/ui/button";
+import PwaInstallModal from "../../components/PwaInstallModal";
 
 export default function AdminLayout() {
   const { user, checked, logout } = useAuth();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
+  const [pwaModalOpen, setPwaModalOpen] = useState(false);
 
   if (!checked || user === null) return <div className="flex min-h-screen items-center justify-center text-[#8B7355]">Memuat...</div>;
   if (!user) return <Navigate to="/admin/login" replace />;
@@ -28,7 +30,7 @@ export default function AdminLayout() {
     { to: "/admin/discounts", label: "Diskon", icon: Ticket, show: perms.manage_settings || isOwner },
     { to: "/admin/referrals", label: "Referral", icon: Gift, show: perms.manage_settings || isOwner },
     { to: "/admin/customers", label: "Pelanggan", icon: UserRound, show: perms.manage_orders || isOwner },
-    { to: "/admin/admins", label: "Akun Admin", icon: Users, show: isOwner },
+    { to: "/admin/admins", label: "Akun Tim", icon: Users, show: isOwner },
     { to: "/admin/settings", label: "Pengaturan", icon: Settings, show: perms.manage_settings || isOwner },
   ].filter((l) => l.show);
 
@@ -49,17 +51,41 @@ export default function AdminLayout() {
         <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col border-r border-[#E5DCC5] bg-white p-4 lg:flex">
           <div className="px-2 py-2"><Logo /></div>
           <div className="mt-1 px-2 text-xs text-[#8B7355]">{user.name} · {user.role}</div>
-          <nav className="mt-4 flex flex-1 flex-col gap-1"><Items /></nav>
-          <Button variant="outline" onClick={doLogout} data-testid="admin-logout" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><LogOut size={16} className="mr-2" /> Keluar</Button>
+          <nav className="mt-4 flex flex-1 flex-col gap-1 overflow-y-auto"><Items /></nav>
+          <div className="pt-3 border-t border-[#F1EBE0] space-y-2">
+            <Button
+              variant="outline"
+              onClick={() => setPwaModalOpen(true)}
+              className="w-full justify-start rounded-xl border-[#8B5A2B]/30 bg-[#FAF5EE] text-[#8B5A2B] hover:bg-[#F3ECE0] text-xs font-semibold"
+            >
+              <Smartphone size={15} className="mr-2 text-[#8B5A2B]" /> Pasang di Layar HP
+            </Button>
+            <Button variant="outline" onClick={doLogout} data-testid="admin-logout" className="w-full rounded-xl border-[#E5DCC5] text-[#5C4A3D]">
+              <LogOut size={16} className="mr-2" /> Keluar
+            </Button>
+          </div>
         </aside>
         {open && (
           <div className="absolute z-30 w-full border-b border-[#E5DCC5] bg-white p-4 lg:hidden">
             <nav className="flex flex-col gap-1"><Items /></nav>
+            <Button
+              variant="outline"
+              onClick={() => { setOpen(false); setPwaModalOpen(true); }}
+              className="mt-2 w-full rounded-xl border-[#8B5A2B]/30 bg-[#FAF5EE] text-[#8B5A2B] hover:bg-[#F3ECE0] text-xs font-semibold"
+            >
+              <Smartphone size={15} className="mr-2 text-[#8B5A2B]" /> Pasang di Layar HP
+            </Button>
             <Button variant="outline" onClick={doLogout} className="mt-2 w-full rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><LogOut size={16} className="mr-2" /> Keluar</Button>
           </div>
         )}
         <main className="min-w-0 flex-1 p-4 sm:p-6 lg:p-8"><Outlet /></main>
       </div>
+
+      <PwaInstallModal
+        isOpen={pwaModalOpen}
+        onClose={() => setPwaModalOpen(false)}
+        mode="admin"
+      />
     </div>
   );
 }

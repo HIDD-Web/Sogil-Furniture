@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import {
   HelpCircle,
   Check,
@@ -6,6 +6,7 @@ import {
   SlidersHorizontal,
   Tag,
   MessageCircle,
+  Smartphone,
 } from "lucide-react";
 import {
   Sheet,
@@ -18,6 +19,7 @@ import {
 } from "./ui/sheet";
 import { Button } from "./ui/button";
 import { useLang } from "../context/LanguageContext";
+import PwaInstallModal from "./PwaInstallModal";
 
 const STEPS = [
   {
@@ -49,6 +51,7 @@ const STEPS = [
 
 export default function HelpSheet() {
   const { t } = useLang();
+  const [pwaOpen, setPwaOpen] = useState(false);
 
   return (
     <Sheet>
@@ -111,17 +114,35 @@ export default function HelpSheet() {
           })}
         </div>
 
-        <SheetClose asChild>
+        <div className="mt-6 pt-4 border-t border-[#E5DCC5] space-y-2">
           <Button
             type="button"
-            data-testid="help-close-button"
-            className="mt-7 h-11 w-full rounded-xl bg-[#8B5A2B] text-sm font-semibold hover:bg-[#6B4423]"
+            variant="outline"
+            onClick={() => setPwaOpen(true)}
+            className="h-11 w-full rounded-xl border-[#8B5A2B]/40 bg-white text-sm font-semibold text-[#8B5A2B] hover:bg-[#FAF5EE]"
           >
-            <Check size={17} className="mr-2" />
-            {t("help.done")}
+            <Smartphone size={17} className="mr-2 text-[#8B5A2B]" />
+            Pasang Aplikasi di Layar HP
           </Button>
-        </SheetClose>
+
+          <SheetClose asChild>
+            <Button
+              type="button"
+              data-testid="help-close-button"
+              className="h-11 w-full rounded-xl bg-[#8B5A2B] text-sm font-semibold hover:bg-[#6B4423]"
+            >
+              <Check size={17} className="mr-2" />
+              {t("help.done")}
+            </Button>
+          </SheetClose>
+        </div>
       </SheetContent>
+
+      <PwaInstallModal
+        isOpen={pwaOpen}
+        onClose={() => setPwaOpen(false)}
+        mode="customer"
+      />
     </Sheet>
   );
 }

@@ -9,9 +9,10 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
+import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
 
 export default function AdminOrderDetail() {
   const { id } = useParams();
@@ -19,9 +20,11 @@ export default function AdminOrderDetail() {
   const { user } = useAuth();
   const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
   const canEditPrice = user?.role === "owner" || user?.permissions?.access_finance;
+  const canModifyProducts = user?.role === "owner" || user?.permissions?.modify_products;
   const [order, setOrder] = useState(null);
   const [note, setNote] = useState("");
   const [priceModalOpen, setPriceModalOpen] = useState(false);
+  const [publishModalOpen, setPublishModalOpen] = useState(false);
   const [priceForm, setPriceForm] = useState({
     subtotal_le: 0,
     delivery_fee_le: 0,
@@ -113,6 +116,22 @@ export default function AdminOrderDetail() {
             <a href={`https://wa.me/${phoneNum}`} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#25D366] text-[#25D366]"><MessageCircle size={16} className="mr-1" /> WhatsApp</Button></a>
             {order.customer_maps_url && <a href={order.customer_maps_url} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><MapPin size={16} className="mr-1" /> Maps</Button></a>}
             <Button variant="outline" onClick={copySummary} data-testid="admin-copy-summary" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><Copy size={16} className="mr-1" /> Salin Ringkasan</Button>
+            {canModifyProducts && (
+              <Button
+                variant="outline"
+                onClick={() => setPublishModalOpen(true)}
+                className={`rounded-xl ${
+                  order.custom_collection_published
+                    ? "border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                    : "border-[#8B5A2B]/40 text-[#8B5A2B] bg-[#FAF5EE] hover:bg-[#F3ECE0]"
+                }`}
+              >
+                <Sparkles size={16} className="mr-1.5" />
+                {order.custom_collection_published
+                  ? `✓ Terbit: ${order.custom_collection_title || "Koleksi Custom"}`
+                  : "Publikasikan ke Koleksi Custom"}
+              </Button>
+            )}
             {canDelete && <Button variant="outline" onClick={doDelete} data-testid="delete-order" className="rounded-xl border-red-300 text-red-600 hover:bg-red-50"><Trash2 size={16} className="mr-1" /> Hapus Pesanan</Button>}
           </div>
         </div>
@@ -268,6 +287,24 @@ export default function AdminOrderDetail() {
           </div>
         </div>
       )}
+
+      {/* Modal Publikasikan ke Koleksi Custom */}
+      <PublishCustomCollectionModal
+        isOpen={publishModalOpen}
+        onClose={() => setPublishModalOpen(false)}
+        initialData={{
+          title: order.custom_collection_title || items[0]?.product_name_snapshot || "Desain Custom Sogil",
+          price_le: order.subtotal_le || 0,
+          spesifikasi: items[0]
+            ? config_summary_client(items[0].category, items[0].configuration_snapshot)
+            : order.notes || "",
+          photo_urls: [],
+          order_id: order.id || order._id,
+        }}
+        onSuccess={() => {
+          load();
+        }}
+      />
     </div>
   );
 }

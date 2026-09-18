@@ -1,13 +1,15 @@
 import React, { useState, useEffect } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { Menu, X, ShoppingCart, Globe, User } from "lucide-react";
+import { Menu, X, ShoppingCart, Globe, User, Smartphone } from "lucide-react";
 import { Logo } from "./Logo";
 import { Button } from "./ui/button";
 import { useCart } from "../context/CartContext";
 import { useLang } from "../context/LanguageContext";
+import PwaInstallModal from "./PwaInstallModal";
 
 export const Header = ({ storeInfo }) => {
   const [open, setOpen] = useState(false);
+  const [pwaOpen, setPwaOpen] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
   const { count } = useCart();
@@ -73,12 +75,28 @@ export const Header = ({ storeInfo }) => {
           {NAV.map((n) => (
             <Link key={n.to} to={n.to} className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${location.pathname === n.to ? "bg-[#EFE6D5] text-[#2C1E16]" : "text-[#5C4A3D] hover:bg-[#EFE6D5]"}`}>{n.label}</Link>
           ))}
+          <button
+            type="button"
+            onClick={() => setPwaOpen(true)}
+            className="flex items-center gap-1.5 rounded-full border border-[#8B5A2B]/30 bg-[#FAF5EE] px-3.5 py-1.5 text-xs font-semibold text-[#8B5A2B] hover:bg-[#F3ECE0] transition-colors"
+            title="Pasang Aplikasi di Layar HP"
+          >
+            <Smartphone size={14} /> Pasang di HP
+          </button>
           <span className="mx-1"><LangSelect /></span>
           <Link to="/akun" data-testid="header-account" className="flex h-10 w-10 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#2C1E16]"><User size={18} /></Link>
           <CartBtn />
         </nav>
 
         <div className="flex shrink-0 items-center gap-1.5 sm:gap-2 md:hidden">
+          <button
+            type="button"
+            onClick={() => setPwaOpen(true)}
+            className="flex h-10 w-10 items-center justify-center rounded-full border border-[#8B5A2B]/40 bg-[#FAF5EE] text-[#8B5A2B]"
+            title="Pasang Aplikasi"
+          >
+            <Smartphone size={18} />
+          </button>
           <LangSelect mobile />
           <Link to="/akun" data-testid="mobile-account" className="flex h-10 w-10 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#2C1E16]"><User size={18} /></Link>
           <CartBtn />
@@ -90,9 +108,22 @@ export const Header = ({ storeInfo }) => {
         <div className="border-t border-[#E5DCC5] bg-[#F9F6F0] md:hidden" data-testid="mobile-menu">
           <nav className="mx-auto flex max-w-6xl flex-col gap-1 px-4 py-3">
             {NAV.map((n) => <Link key={n.to} to={n.to} className="rounded-xl px-4 py-3 text-base font-medium text-[#2C1E16] hover:bg-[#EFE6D5]">{n.label}</Link>)}
+            <button
+              type="button"
+              onClick={() => { setOpen(false); setPwaOpen(true); }}
+              className="flex items-center gap-2 rounded-xl px-4 py-3 text-base font-semibold text-[#8B5A2B] bg-[#FAF5EE] hover:bg-[#EFE6D5] mt-1 text-left"
+            >
+              <Smartphone size={18} /> Pasang Aplikasi di Layar HP
+            </button>
           </nav>
         </div>
       )}
+
+      <PwaInstallModal
+        isOpen={pwaOpen}
+        onClose={() => setPwaOpen(false)}
+        mode="customer"
+      />
     </header>
   );
 };

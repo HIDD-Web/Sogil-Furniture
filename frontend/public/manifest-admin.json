@@ -1,0 +1,29 @@
+{
+  "short_name": "Sogil Tim",
+  "name": "Sogil Tim Dashboard",
+  "description": "Dashboard Manajemen & Operasional Tim Sogil Furniture",
+  "icons": [
+    {
+      "src": "/icons/icon-admin-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/icons/icon-admin-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    },
+    {
+      "src": "/icons/icon-admin-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/admin/login?pwa=admin",
+  "scope": "/admin",
+  "background_color": "#FAF5EE",
+  "theme_color": "#2C1E16",
+  "display": "standalone",
+  "orientation": "portrait"
+}

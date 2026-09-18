@@ -11,6 +11,7 @@ import { fmtLE } from "../../lib/format";
 import { useAuth } from "../../context/AuthContext";
 import { Search, MessageCircle, ExternalLink, ShoppingBag, Eye, Trash2, X, ChevronRight, CheckCircle, Sparkles } from "lucide-react";
 import { toast } from "sonner";
+import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
 
 const STATUS_BADGES = {
   baru: { label: "Baru", bg: "bg-blue-100 text-blue-800 border-blue-200" },
@@ -24,6 +25,7 @@ export default function AdminCustomRequests() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
+  const canModifyProducts = user?.role === "owner" || user?.permissions?.modify_products;
 
   const [requests, setRequests] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -33,6 +35,7 @@ export default function AdminCustomRequests() {
   const [selectedReq, setSelectedReq] = useState(null);
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [convertModalOpen, setConvertModalOpen] = useState(false);
+  const [publishModalOpen, setPublishModalOpen] = useState(false);
 
   const [editStatus, setEditStatus] = useState("baru");
   const [adminNotes, setAdminNotes] = useState("");
@@ -637,6 +640,23 @@ export default function AdminCustomRequests() {
                 Simpan Perubahan
               </Button>
 
+              {canModifyProducts && (
+                <Button
+                  variant="outline"
+                  onClick={() => setPublishModalOpen(true)}
+                  className={`rounded-xl ${
+                    selectedReq.custom_collection_published
+                      ? "border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                      : "border-[#8B5A2B]/40 text-[#8B5A2B] bg-[#FAF5EE] hover:bg-[#F3ECE0]"
+                  }`}
+                >
+                  <Sparkles size={15} className="mr-1" />
+                  {selectedReq.custom_collection_published
+                    ? `✓ Terbit: ${selectedReq.custom_collection_title || "Koleksi Custom"}`
+                    : "Publikasikan ke Koleksi"}
+                </Button>
+              )}
+
               {!selectedReq.converted_order_id && (
                 <Button
                   onClick={() => {
@@ -774,6 +794,24 @@ export default function AdminCustomRequests() {
             </form>
           </div>
         </div>
+      )}
+
+      {/* Modal Publikasikan ke Koleksi Custom */}
+      {selectedReq && (
+        <PublishCustomCollectionModal
+          isOpen={publishModalOpen}
+          onClose={() => setPublishModalOpen(false)}
+          initialData={{
+            title: selectedReq.custom_collection_title || selectedReq.furniture_type || "Desain Custom",
+            price_le: selectedReq.estimated_price_le || 0,
+            spesifikasi: `P ${selectedReq.target_length_cm || "-"} × L ${selectedReq.target_width_cm || "-"} × T ${selectedReq.target_height_cm || "-"} cm · Bahan: ${selectedReq.material_finishing || "-"} · Catatan: ${selectedReq.notes || "-"}`,
+            photo_urls: selectedReq.reference_photos || [],
+            request_id: selectedReq.id || selectedReq._id,
+          }}
+          onSuccess={() => {
+            loadRequests();
+          }}
+        />
       )}
     </div>
   );

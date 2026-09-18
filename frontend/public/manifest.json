@@ -1,0 +1,28 @@
+{
+  "short_name": "Sogil",
+  "name": "Sogil Furniture",
+  "description": "Pemesanan & pembuatan furniture custom berkualitas di Kairo, Mesir",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/?pwa=customer",
+  "background_color": "#FFFFFF",
+  "theme_color": "#8B5A2B",
+  "display": "standalone",
+  "orientation": "portrait"
+}

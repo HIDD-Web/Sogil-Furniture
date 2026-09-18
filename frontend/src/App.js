@@ -57,6 +57,21 @@ function CustomerShell({ children }) {
 function Layout() {
   const location = useLocation();
   const isAdmin = location.pathname.startsWith("/admin");
+
+  useEffect(() => {
+    const link = document.getElementById("manifest-link");
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (!link) return;
+
+    if (isAdmin) {
+      link.setAttribute("href", "/manifest-admin.json");
+      if (themeMeta) themeMeta.setAttribute("content", "#2C1E16");
+    } else {
+      link.setAttribute("href", "/manifest.json");
+      if (themeMeta) themeMeta.setAttribute("content", "#8B5A2B");
+    }
+  }, [isAdmin]);
+
   if (isAdmin) {
     return (
       <Routes>

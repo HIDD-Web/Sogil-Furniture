@@ -119,9 +119,9 @@ def default_permissions(role: str) -> Dict[str, bool]:
     if role == "owner":
         return {k: True for k in PERMISSION_KEYS}
     if role == "manager":
-        return {"manage_orders": True, "modify_products": True, "manage_settings": True, "access_finance": False, "delete_data": False, "manage_admins": False}
+        return {"manage_orders": True, "modify_products": True, "manage_settings": True, "access_finance": True, "delete_data": False, "manage_admins": False}
     if role == "admin":
-        return {"manage_orders": True, "modify_products": False, "manage_settings": False, "access_finance": False, "delete_data": False, "manage_admins": False}
+        return {"manage_orders": True, "modify_products": True, "manage_settings": True, "access_finance": False, "delete_data": False, "manage_admins": False}
     return {"manage_orders": True, "modify_products": False, "manage_settings": False, "access_finance": False, "delete_data": False, "manage_admins": False}
 
 def hash_password(p: str) -> str:
@@ -307,6 +307,14 @@ class AdminUpdateInput(BaseModel):
     role: Optional[str] = None
     permissions: Optional[Dict[str, bool]] = None
     status: Optional[str] = None
+
+class PublishCustomCollectionInput(BaseModel):
+    title: str
+    price_le: float
+    spesifikasi: Optional[str] = ""
+    photo_urls: List[str] = []
+    order_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 class FinanceTxnInput(BaseModel):
     date: Optional[str] = None
@@ -1525,6 +1533,89 @@ async def admin_delete_custom_request(req_id: str, admin: dict = Depends(require
         raise HTTPException(status_code=404, detail="Request custom tidak ditemukan")
     return {"ok": True}
 
+@api_router.post("/admin/custom-collection/publish")
+async def admin_publish_to_custom_collection(data: PublishCustomCollectionInput, admin: dict = Depends(require_perm("modify_products"))):
+    title = data.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Nama desain harus diisi")
+
+    custom_prod = await db.products.find_one({"category": "custom"})
+    if not custom_prod:
+        custom_prod = await db.products.find_one({"slug": {"$in": ["koleksi-custom", "pesanan-custom"]}})
+    if not custom_prod:
+        raise HTTPException(status_code=404, detail="Produk Koleksi Custom tidak ditemukan di database")
+
+    prod_id = custom_prod["_id"]
+    pricing = custom_prod.get("pricing") or {}
+    groups = pricing.get("groups") or []
+    photos = list(custom_prod.get("photos") or [])
+    design_details = dict(custom_prod.get("design_details") or {})
+
+    desain_group = None
+    for g in groups:
+        if g.get("key") == "desain":
+            desain_group = g
+            break
+    if not desain_group:
+        desain_group = {"key": "desain", "label": "Pilih Desain Custom", "options": []}
+        groups.append(desain_group)
+
+    if title not in desain_group.get("options", []):
+        desain_group.setdefault("options", []).append(title)
+
+    for url in data.photo_urls:
+        url_clean = url.strip()
+        if not url_clean:
+            continue
+        exists = any(ph.get("url") == url_clean and ph.get("attributes", {}).get("desain") == title for ph in photos)
+        if not exists:
+            photos.append({
+                "url": url_clean,
+                "file_id": None,
+                "attributes": {"desain": title}
+            })
+
+    design_details[title] = {
+        "price": float(data.price_le),
+        "spesifikasi": data.spesifikasi or "",
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "published_by": admin.get("name") or admin.get("email")
+    }
+
+    pricing["groups"] = groups
+
+    await db.products.update_one(
+        {"_id": prod_id},
+        {"$set": {
+            "pricing": pricing,
+            "photos": photos,
+            "design_details": design_details,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+
+    if data.order_id:
+        await db.orders.update_one(
+            {"_id": id_query(data.order_id)},
+            {"$set": {
+                "custom_collection_published": True,
+                "custom_collection_title": title,
+                "custom_collection_published_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+
+    if data.request_id:
+        await db.custom_requests.update_one(
+            {"_id": id_query(data.request_id)},
+            {"$set": {
+                "custom_collection_published": True,
+                "custom_collection_title": title,
+                "custom_collection_published_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+
+    return {"ok": True, "title": title, "photos_count": len(photos)}
+
 # --------------------------------------------------------------------------
 # Admin: delivery zones
 # --------------------------------------------------------------------------
@@ -1585,6 +1676,8 @@ async def list_admins(admin: dict = Depends(require_perm("manage_admins"))):
         else:
             a.setdefault("permissions", default_permissions(a.get("role", "admin")))
         out.append(a)
+    role_priority = {"owner": 0, "manager": 1, "admin": 2, "employee": 3}
+    out.sort(key=lambda x: (role_priority.get(x.get("role", "employee"), 99), (x.get("name") or "").lower()))
     return out
 
 @api_router.post("/admin/admins")
@@ -2361,7 +2454,7 @@ RAK_TYPE_B_PRICES = {
 }
 
 async def seed():
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@sogil.com").lower()
+    admin_email = os.environ.get("ADMIN_EMAIL", "sogil.furniture@gmail.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.admins.find_one({"email": admin_email})
     if not existing:
