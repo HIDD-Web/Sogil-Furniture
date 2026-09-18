@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
 import "@/App.css";
+import React, { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
 import { Toaster } from "sonner";
 import api from "./lib/api";
@@ -12,6 +12,7 @@ import { Footer } from "./components/Footer";
 
 import Home from "./pages/Home";
 import Catalog from "./pages/Catalog";
+import CategoryPage from "./pages/CategoryPage";
 import ProductConfigure from "./pages/ProductConfigure";
 import Cart from "./pages/Cart";
 import Checkout from "./pages/Checkout";
@@ -81,6 +82,12 @@ function Layout() {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/produk" element={<Catalog />} />
+
+        <Route
+          path="/produk/kategori/:category"
+          element={<CategoryPage />}
+        />
+        
         <Route path="/produk/:slug" element={<ProductConfigure />} />
         <Route path="/keranjang" element={<Cart />} />
         <Route path="/checkout" element={<Checkout />} />

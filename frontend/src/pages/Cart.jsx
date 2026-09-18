@@ -38,7 +38,7 @@ export default function Cart() {
               <div className="flex items-start justify-between gap-2">
                 <div>
                   <div className="font-heading font-semibold text-[#2C1E16]">{it.product.name}</div>
-                  <div className="text-xs text-[#8B7355]">{config_summary_client(it.product.category, it.config)}</div>
+                  <div className="text-xs text-[#8B7355]">{config_summary_client(it.product.category, it.config, t)}</div>
                 </div>
                 <button onClick={() => removeItem(it.cartId)} data-testid={`cart-remove-${it.cartId}`} className="p-1 text-red-500"><Trash2 size={18} /></button>
               </div>
