@@ -15,7 +15,7 @@ export const Logo = ({ size = 40, showText = true, logoUrl = "" }) => {
         </div>
       )}
       {showText && (
-        <div className="font-heading text-[#2C1E16]" style={{ fontWeight: 700 }}>Sogil Furniture</div>
+        <div className="font-heading text-[#2C1E16] whitespace-nowrap text-base sm:text-lg font-bold">Sogil Furniture</div>
       )}
     </div>
   );

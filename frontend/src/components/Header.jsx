@@ -5,6 +5,7 @@ import { Logo } from "./Logo";
 import { Button } from "./ui/button";
 import { useCart } from "../context/CartContext";
 import { useLang } from "../context/LanguageContext";
+import { useCustomer } from "../context/CustomerContext";
 import PwaInstallModal from "./PwaInstallModal";
 
 export const Header = ({ storeInfo }) => {
@@ -14,6 +15,7 @@ export const Header = ({ storeInfo }) => {
   const navigate = useNavigate();
   const { count } = useCart();
   const { t, lang, setLang, langs } = useLang();
+  const { customer } = useCustomer();
 
   useEffect(() => { setOpen(false); }, [location.pathname]);
 
@@ -89,31 +91,53 @@ export const Header = ({ storeInfo }) => {
         </nav>
 
         <div className="flex shrink-0 items-center gap-1.5 sm:gap-2 md:hidden">
-          <button
-            type="button"
-            onClick={() => setPwaOpen(true)}
-            className="flex h-10 w-10 items-center justify-center rounded-full border border-[#8B5A2B]/40 bg-[#FAF5EE] text-[#8B5A2B]"
-            title="Pasang Aplikasi"
-          >
-            <Smartphone size={18} />
-          </button>
           <LangSelect mobile />
-          <Link to="/akun" data-testid="mobile-account" className="flex h-10 w-10 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#2C1E16]"><User size={18} /></Link>
           <CartBtn />
-          <button className="p-2 text-[#2C1E16]" onClick={() => setOpen(!open)} data-testid="mobile-menu-toggle">{open ? <X size={24} /> : <Menu size={24} />}</button>
+          <button
+            className="flex h-10 w-10 items-center justify-center rounded-full text-[#2C1E16] hover:bg-[#EFE6D5] transition-colors"
+            onClick={() => setOpen(!open)}
+            data-testid="mobile-menu-toggle"
+            aria-label="Menu"
+          >
+            {open ? <X size={24} /> : <Menu size={24} />}
+          </button>
         </div>
       </div>
 
       {open && (
         <div className="border-t border-[#E5DCC5] bg-[#F9F6F0] md:hidden" data-testid="mobile-menu">
           <nav className="mx-auto flex max-w-6xl flex-col gap-1 px-4 py-3">
-            {NAV.map((n) => <Link key={n.to} to={n.to} className="rounded-xl px-4 py-3 text-base font-medium text-[#2C1E16] hover:bg-[#EFE6D5]">{n.label}</Link>)}
+            <Link
+              to="/"
+              className={`rounded-xl px-4 py-3 text-base font-medium transition-colors ${
+                location.pathname === "/" ? "bg-[#EFE6D5] text-[#2C1E16]" : "text-[#2C1E16] hover:bg-[#EFE6D5]"
+              }`}
+            >
+              {t("nav.beranda")}
+            </Link>
+            <Link
+              to="/lacak"
+              className={`rounded-xl px-4 py-3 text-base font-medium transition-colors ${
+                location.pathname === "/lacak" ? "bg-[#EFE6D5] text-[#2C1E16]" : "text-[#2C1E16] hover:bg-[#EFE6D5]"
+              }`}
+            >
+              {t("nav.lacak")}
+            </Link>
+            <Link
+              to="/akun"
+              data-testid="mobile-account-link"
+              className={`rounded-xl px-4 py-3 text-base font-medium transition-colors ${
+                location.pathname === "/akun" ? "bg-[#EFE6D5] text-[#2C1E16]" : "text-[#2C1E16] hover:bg-[#EFE6D5]"
+              }`}
+            >
+              {customer ? (customer.username ? `${t("nav.akun_saya")} (${customer.username})` : t("nav.akun_saya")) : t("nav.masuk_akun")}
+            </Link>
             <button
               type="button"
               onClick={() => { setOpen(false); setPwaOpen(true); }}
-              className="flex items-center gap-2 rounded-xl px-4 py-3 text-base font-semibold text-[#8B5A2B] bg-[#FAF5EE] hover:bg-[#EFE6D5] mt-1 text-left"
+              className="flex items-center gap-2 rounded-xl px-4 py-3 text-base font-semibold text-[#8B5A2B] bg-[#FAF5EE] hover:bg-[#EFE6D5] mt-2 text-left transition-colors"
             >
-              <Smartphone size={18} /> Pasang Aplikasi di Layar HP
+              <Smartphone size={18} /> {t("nav.pasang_hp")}
             </button>
           </nav>
         </div>
