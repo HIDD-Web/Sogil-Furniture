@@ -2777,12 +2777,13 @@ _origins = [o for o in os.environ.get('CORS_ORIGINS', '').split(',') if o and o 
 if _frontend and _frontend not in _origins:
     _origins.append(_frontend)
 if not _origins:
-    _origins = ["http://localhost:3000"]
+    _origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
