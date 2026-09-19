@@ -8,12 +8,14 @@ import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { toast } from "sonner";
+import { Eye, EyeOff } from "lucide-react";
 
 export default function AdminLogin() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [storeInfo, setStoreInfo] = useState(null);
 
@@ -48,7 +50,24 @@ export default function AdminLogin() {
           </div>
           <div>
             <Label className="mb-1.5 block text-sm">Kata Sandi</Label>
-            <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} data-testid="login-password" className="h-12 bg-white" required />
+            <div className="relative">
+              <Input
+                type={showPassword ? "text" : "password"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                data-testid="login-password"
+                className="h-12 bg-white pr-11"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                aria-label={showPassword ? "Sembunyikan password" : "Tampilkan password"}
+                className="absolute right-0 top-0 flex h-12 w-11 items-center justify-center text-[#8B7355] hover:text-[#2C1E16] transition-colors"
+              >
+                {showPassword ? <Eye size={18} /> : <EyeOff size={18} />}
+              </button>
+            </div>
           </div>
           <Button type="submit" disabled={loading} data-testid="login-submit" className="h-12 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">
             {loading ? "Memproses..." : "Masuk"}

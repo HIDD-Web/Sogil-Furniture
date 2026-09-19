@@ -11,12 +11,13 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
-import { User, Gift, Copy, LogOut } from "lucide-react";
+import { User, Gift, Copy, LogOut, Eye, EyeOff } from "lucide-react";
 
 export default function CustomerAccount() {
   const { t } = useLang();
   const { customer, checked, register, login, logout } = useCustomer();
   const [mode, setMode] = useState("login");
+  const [showPassword, setShowPassword] = useState(false);
   const [f, setF] = useState({ username: "", phone: "", password: "", identifier: "" });
   const [orders, setOrders] = useState([]);
   const [points, setPoints] = useState(null);
@@ -79,7 +80,27 @@ export default function CustomerAccount() {
             </>) : (
               <div><Label className="mb-1 block text-sm">{t("auth.identifier")}</Label><Input value={f.identifier} onChange={(e) => setF({ ...f, identifier: e.target.value })} data-testid="login-identifier" className="bg-white" required /></div>
             )}
-            <div><Label className="mb-1 block text-sm">{t("auth.password")}</Label><Input type="password" value={f.password} onChange={(e) => setF({ ...f, password: e.target.value })} data-testid="cust-password" className="bg-white" required /></div>
+            <div>
+              <Label className="mb-1 block text-sm">{t("auth.password")}</Label>
+              <div className="relative">
+                <Input
+                  type={showPassword ? "text" : "password"}
+                  value={f.password}
+                  onChange={(e) => setF({ ...f, password: e.target.value })}
+                  data-testid="cust-password"
+                  className="bg-white pr-10"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  aria-label={showPassword ? "Sembunyikan password" : "Tampilkan password"}
+                  className="absolute right-0 top-0 flex h-9 w-10 items-center justify-center text-[#8B7355] hover:text-[#2C1E16] transition-colors"
+                >
+                  {showPassword ? <Eye size={16} /> : <EyeOff size={16} />}
+                </button>
+              </div>
+            </div>
             <Button type="submit" data-testid="cust-submit" className="h-11 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">{mode === "register" ? t("auth.btn_register") : t("auth.btn_login")}</Button>
           </form>
           <button onClick={() => setMode(mode === "register" ? "login" : "register")} className="mt-3 w-full text-center text-sm text-[#8B5A2B]" data-testid="toggle-mode">
