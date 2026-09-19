@@ -20,7 +20,11 @@ const CARDS = [
 export default function AdminOverview() {
   const [stats, setStats] = useState(null);
   const navigate = useNavigate();
-  useEffect(() => { api.get("/admin/overview").then((r) => setStats(r.data)); }, []);
+  useEffect(() => {
+    api.get("/admin/overview")
+      .then((r) => setStats(r.data))
+      .catch(() => {});
+  }, []);
 
   const go = (filter) => {
     if (!filter) return navigate("/admin/orders");

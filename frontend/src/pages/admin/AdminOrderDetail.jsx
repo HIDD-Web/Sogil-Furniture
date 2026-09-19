@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import api from "../../lib/api";
-import { fmtLE, fmtIDR } from "../../lib/format";
+import { fmtLE, fmtIDR, copyToClipboard } from "../../lib/format";
 import { config_summary_client } from "../../lib/summary";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../../lib/constants";
 import { Button } from "../../components/ui/button";
@@ -84,7 +84,10 @@ export default function AdminOrderDetail() {
   if (!order) return <div className="text-[#8B7355]">Memuat...</div>;
   const items = order.items || [order.item];
   const phoneNum = (order.customer_phone || "").replace(/[^0-9]/g, "");
-  const copySummary = () => { navigator.clipboard.writeText(order.whatsapp_message || ""); toast.success("Ringkasan disalin"); };
+  const copySummary = async () => {
+    await copyToClipboard(order.whatsapp_message || "");
+    toast.success("Ringkasan disalin");
+  };
   const doDelete = async () => {
     const paid = order.payment_status === "lunas";
     const msg = paid ? "Pesanan ini sudah LUNAS. Menghapus akan menghapus/membalik pendapatan otomatis terkait dan tidak dapat dibatalkan. Lanjutkan?" : "Apakah Anda yakin ingin menghapus pesanan ini? Tindakan ini tidak dapat dibatalkan.";

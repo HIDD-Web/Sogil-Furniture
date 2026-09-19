@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useParams, useLocation, Link } from "react-router-dom";
 import api from "../lib/api";
-import { fmtLE, fmtIDR } from "../lib/format";
+import { fmtLE, fmtIDR, copyToClipboard } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
 import { useLang } from "../context/LanguageContext";
 import { Button } from "../components/ui/button";
@@ -29,7 +29,10 @@ export default function OrderConfirmation() {
   const num = (order.whatsapp_number || "").replace(/[^0-9]/g, "");
   const waUrl = `https://wa.me/${num}?text=${encodeURIComponent(order.whatsapp_message || "")}`;
   const items = order.items || [order.item];
-  const copySummary = () => { navigator.clipboard.writeText(order.whatsapp_message || ""); toast.success(t("btn.salin")); };
+  const copySummary = async () => {
+    await copyToClipboard(order.whatsapp_message || "");
+    toast.success(t("btn.salin"));
+  };
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-10 sm:px-6">

@@ -533,6 +533,7 @@ async def login(data: LoginInput, response: Response):
     response.set_cookie("access_token", token, httponly=True, secure=True, samesite="none", max_age=43200, path="/")
     return {"id": str(user["_id"]), "email": email, "name": user.get("name", "Admin"),
             "role": user.get("role", "admin"),
+            "token": token,
             "permissions": default_permissions("owner") if user.get("role") == "owner" else user.get("permissions", default_permissions(user.get("role", "admin")))}
 
 @api_router.post("/auth/logout")

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../lib/api";
-import { fmtLE } from "../lib/format";
+import { fmtLE, copyToClipboard } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../lib/constants";
 import { useCustomer } from "../context/CustomerContext";
@@ -125,7 +125,7 @@ export default function CustomerAccount() {
         <div className="flex items-center gap-2 font-heading font-bold text-[#2C1E16]"><Gift size={18} /> {t("auth.ref_title")}</div>
         <div className="mt-2 flex items-center gap-2">
           <code className="rounded-lg bg-[#EFE6D5] px-3 py-2 font-mono text-lg font-bold text-[#8B5A2B]" data-testid="my-referral-code">{customer.referral_code}</code>
-          <Button variant="outline" onClick={() => { navigator.clipboard.writeText(customer.referral_code); toast.success(t("auth.ref_copied")); }} className="rounded-xl border-[#8B5A2B] text-[#8B5A2B]"><Copy size={14} /></Button>
+          <Button variant="outline" onClick={async () => { await copyToClipboard(customer.referral_code); toast.success(t("auth.ref_copied")); }} className="rounded-xl border-[#8B5A2B] text-[#8B5A2B]"><Copy size={14} /></Button>
         </div>
         <p className="mt-2 text-xs text-[#8B7355]">{t("auth.ref_desc")}</p>
       </div>

@@ -16,11 +16,15 @@ export const AuthProvider = ({ children }) => {
 
   const login = async (email, password) => {
     const { data } = await api.post("/auth/login", { email, password });
+    if (data?.token) {
+      localStorage.setItem("admin_token", data.token);
+    }
     setUser(data);
     return data;
   };
 
   const logout = async () => {
+    localStorage.removeItem("admin_token");
     try { await api.post("/auth/logout"); } catch (e) {}
     setUser(false);
   };
