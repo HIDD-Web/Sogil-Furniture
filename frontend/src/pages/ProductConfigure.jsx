@@ -90,7 +90,21 @@ export default function ProductConfigure() {
   const breakdown = useMemo(() => (product ? computeBreakdown(product, config, quantity) : null), [product, config, quantity]);
   const photoMatch = useMemo(() => (product ? matchPhoto(product, config) : { photo: null, exact: false }), [product, config]);
   const isConfigurable = product?.configurable;
-  const set = (k, v) => setConfig((c) => ({ ...c, [k]: v }));
+  const isSmallPapanTulis = (sz) => sz === "30x50 cm" || sz === "40x60 cm" || sz === "50x70 cm";
+
+  const set = (k, v) => {
+    setConfig((c) => {
+      const next = { ...c, [k]: v };
+      if (product?.category === "papan_tulis") {
+        if (k === "size" && isSmallPapanTulis(v)) {
+          next.mount = "Gantung";
+        } else if (k === "mount" && v === "+ Kaki 150 cm" && isSmallPapanTulis(c.size)) {
+          next.size = "80x60 cm";
+        }
+      }
+      return next;
+    });
+  };
   const [gidx, setGidx] = useState(0);
   useEffect(() => { setGidx(0); }, [photoMatch.photo?.id]);
 
@@ -383,11 +397,20 @@ export default function ProductConfigure() {
                 </div>
               ) : (
                 <>
-                  {groups && groups.map((g) => (
-                    <Section key={g.key} title={g.label || g.key} note={product.option_notes?.[g.key]}>
-                      {(g.options || []).map((o) => <Chip key={o} active={config[g.key] === o} onClick={() => set(g.key, o)} testid={`opt-${g.key}-${o}`}>{o}</Chip>)}
-                    </Section>
-                  ))}
+                  {groups && groups.map((g) => {
+                    const options = (g.options || []).filter((o) => {
+                      if (product.category === "papan_tulis") {
+                        if (g.key === "mount" && o === "+ Kaki 150 cm" && isSmallPapanTulis(config.size)) return false;
+                        if (g.key === "size" && config.mount === "+ Kaki 150 cm" && isSmallPapanTulis(o)) return false;
+                      }
+                      return true;
+                    });
+                    return (
+                      <Section key={g.key} title={g.label || g.key} note={product.option_notes?.[g.key]}>
+                        {options.map((o) => <Chip key={o} active={config[g.key] === o} onClick={() => set(g.key, o)} testid={`opt-${g.key}-${o}`}>{o}</Chip>)}
+                      </Section>
+                    );
+                  })}
                   {pr.design_details && groups && groups[0] && pr.design_details[config[groups[0].key]] && (
                     <div className="rounded-2xl border border-[#E5DCC5] bg-[#FBF9F4] p-4" data-testid="custom-design-details">
                       <div className="mb-2 font-heading text-sm font-semibold text-[#2C1E16]">

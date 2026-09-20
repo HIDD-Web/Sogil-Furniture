@@ -124,6 +124,9 @@ export function getProductCombinations(product) {
   if (cat === "papan_tulis") {
     const mounts = pr.groups?.find((g) => g.key === "mount")?.options || ["Gantung", "+ Kaki 150 cm"];
     const sizes = pr.groups?.find((g) => g.key === "size")?.options || [
+      "30x50 cm",
+      "40x60 cm",
+      "50x70 cm",
       "80x60 cm",
       "120x60 cm",
       "120x80 cm",
@@ -134,6 +137,9 @@ export function getProductCombinations(product) {
     const combos = [];
     mounts.forEach((m) => {
       sizes.forEach((s) => {
+        if (m === "+ Kaki 150 cm" && (s === "30x50 cm" || s === "40x60 cm" || s === "50x70 cm")) {
+          return;
+        }
         combos.push({
           id: `${m}_${s}`,
           title: `Papan Tulis ${m} · ${s}`,
@@ -312,7 +318,17 @@ export default function VariantPhotoManager({
     if (category === "papan_tulis") {
       return [
         { key: "mount", label: "Pemasangan", options: ["Gantung", "+ Kaki 150 cm"] },
-        { key: "size", label: "Ukuran", options: ["80x60 cm", "120x60 cm", "120x80 cm", "180x80 cm", "180x120 cm", "240x120 cm"] },
+        { key: "size", label: "Ukuran", options: [
+          "30x50 cm",
+          "40x60 cm",
+          "50x70 cm",
+          "80x60 cm",
+          "120x60 cm",
+          "120x80 cm",
+          "180x80 cm",
+          "180x120 cm",
+          "240x120 cm"
+        ] },
       ];
     }
     return [];

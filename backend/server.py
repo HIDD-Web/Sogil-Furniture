@@ -2552,6 +2552,38 @@ async def seed():
             await db.products.update_one({"_id": rak["_id"]}, {"$set": {"pricing": pricing, "starting_price_le": RAK_TYPE_B_PRICES["60_2"]}})
         await set_setting("migration_rak_typeB_v2", True)
 
+    # Migration: Papan Tulis small sizes (30x50, 40x60, 50x70) (idempotent via flag)
+    if await db.settings.find_one({"key": "migration_papan_tulis_small_sizes_v1"}) is None:
+        pt = await db.products.find_one({"slug": "papan-tulis"})
+        if pt:
+            pricing = pt.get("pricing", {}) or {}
+            groups = pricing.get("groups", []) or []
+            # Ensure size options are ordered from smallest to largest
+            for g in groups:
+                if g.get("key") == "size":
+                    current_options = g.get("options", [])
+                    new_sizes = ["30x50 cm", "40x60 cm", "50x70 cm"]
+                    combined = [s for s in new_sizes if s not in current_options] + current_options
+                    # Sort canonically: small sizes first, then existing sizes in exact specified order
+                    canonical_order = [
+                        "30x50 cm", "40x60 cm", "50x70 cm",
+                        "80x60 cm", "120x60 cm", "120x80 cm",
+                        "180x80 cm", "180x120 cm", "240x120 cm"
+                    ]
+                    g["options"] = [s for s in canonical_order if s in combined]
+            # Add base prices for Gantung small sizes without altering existing base prices
+            base_prices = pricing.get("base_prices", {}) or {}
+            base_prices["Gantung | 30x50 cm"] = 300
+            base_prices["Gantung | 40x60 cm"] = 350
+            base_prices["Gantung | 50x70 cm"] = 400
+            pricing["groups"] = groups
+            pricing["base_prices"] = base_prices
+            await db.products.update_one(
+                {"_id": pt["_id"]},
+                {"$set": {"pricing": pricing, "starting_price_le": 300}}
+            )
+        await set_setting("migration_papan_tulis_small_sizes_v1", True)
+
     # Ensure types in pricing do not contain deprecated A+ and B+
     await db.products.update_many(
         {"pricing.types": {"$in": ["A+", "B+"]}},

@@ -308,10 +308,24 @@ export function buildProductPreviews(product) {
   // 5. Papan Tulis: Mount × Size
   if (category === "papan_tulis") {
     const mounts = ["Gantung", "+ Kaki 150 cm"];
-    const sizes = ["80x60 cm", "120x60 cm", "120x80 cm", "180x80 cm", "180x120 cm", "240x120 cm"];
+    const sizes = [
+      "30x50 cm",
+      "40x60 cm",
+      "50x70 cm",
+      "80x60 cm",
+      "120x60 cm",
+      "120x80 cm",
+      "180x80 cm",
+      "180x120 cm",
+      "240x120 cm",
+    ];
 
     mounts.forEach((mount) => {
       sizes.forEach((size) => {
+        // Small sizes are Gantung only — skip Kaki
+        if (mount === "+ Kaki 150 cm" && (size === "30x50 cm" || size === "40x60 cm" || size === "50x70 cm")) {
+          return;
+        }
         const matchedPhoto = photos.find((ph) => {
           const attr = ph.attributes || {};
           return (

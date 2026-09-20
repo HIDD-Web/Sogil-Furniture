@@ -115,7 +115,7 @@ export default function CategorySection({
 
       {/* Mobile Horizontal Scroll: 1 row with cards sized identically to CategoryPage grid */}
       <div
-        className="sm:hidden -mx-4 px-4 overflow-x-auto snap-x snap-mandatory flex gap-3 pb-2 scrollbar-none touch-pan-x"
+        className="sm:hidden -mx-4 px-4 overflow-x-auto snap-x snap-mandatory flex gap-3 pb-2 scrollbar-none touch-auto"
         style={{ WebkitOverflowScrolling: "touch" }}
       >
         {displayPreviews.map((preview) => (

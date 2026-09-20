@@ -30,7 +30,7 @@ export default function ProductCard({ product, preview }) {
     <Link
       to={targetUrl}
       data-testid={testId}
-      className="group flex flex-col justify-between overflow-hidden rounded-2xl border border-[#E5DCC5] bg-white shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
+      className="group flex flex-col justify-between overflow-hidden rounded-2xl border border-[#E5DCC5] bg-white shadow-sm transition-all duration-200 sm:hover:-translate-y-0.5 sm:hover:shadow-md active:scale-[0.99]"
     >
       <div>
         <div className="overflow-hidden bg-[#FBF9F4]">
@@ -38,7 +38,7 @@ export default function ProductCard({ product, preview }) {
             url={imageUrl}
             alt={subtitle ? `${title} - ${subtitle}` : title}
             ratio="aspect-[4/5]"
-            className="transition-transform duration-300 group-hover:scale-[1.02]"
+            className="transition-transform duration-300 sm:group-hover:scale-[1.02]"
           />
         </div>
 
