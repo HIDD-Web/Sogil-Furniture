@@ -13,20 +13,18 @@ const FURNITURE_TYPES = [
   "Meja Belajar",
   "Rak Buku",
   "Meja Rak",
-  "Lemari Pakaian",
-  "Dipan / Tempat Tidur",
-  "Kitchen Set",
   "Rak Gantung",
   "Lainnya",
+];
+
+const BAHAN_CHOICES = [
+  "Blockboard",
+  "Fiber Lapis HPL",
 ];
 
 const FINISHING_CHOICES = [
   "Natural Halus",
   "Pernis Mengkilap",
-  "Cat Warna (Custom)",
-  "Multiplek / Blockboard HPL",
-  "Kombinasi Kayu & Besi",
-  "Belum Yakin (Konsultasikan)",
 ];
 
 export default function CustomOrderPage() {
@@ -52,6 +50,37 @@ export default function CustomOrderPage() {
   const [uploading, setUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [successData, setSuccessData] = useState(null);
+  const [selectedBahan, setSelectedBahan] = useState("");
+  const [selectedFinishing, setSelectedFinishing] = useState("");
+  const [isUnsure, setIsUnsure] = useState(false);
+
+  const handleSelectBahan = (bahan) => {
+    const nextBahan = selectedBahan === bahan ? "" : bahan;
+    setSelectedBahan(nextBahan);
+    setIsUnsure(false);
+    const parts = [nextBahan, selectedFinishing].filter(Boolean);
+    setForm((f) => ({ ...f, material: parts.join(" · ") }));
+  };
+
+  const handleSelectFinishing = (finishing) => {
+    const nextFinishing = selectedFinishing === finishing ? "" : finishing;
+    setSelectedFinishing(nextFinishing);
+    setIsUnsure(false);
+    const parts = [selectedBahan, nextFinishing].filter(Boolean);
+    setForm((f) => ({ ...f, material: parts.join(" · ") }));
+  };
+
+  const handleSelectUnsure = () => {
+    if (isUnsure) {
+      setIsUnsure(false);
+      setForm((f) => ({ ...f, material: "" }));
+    } else {
+      setIsUnsure(true);
+      setSelectedBahan("");
+      setSelectedFinishing("");
+      setForm((f) => ({ ...f, material: "Belum Yakin (Konsultasikan)" }));
+    }
+  };
 
   useEffect(() => {
     if (customer) {
@@ -229,123 +258,10 @@ export default function CustomOrderPage() {
 
             {/* Form */}
             <form onSubmit={handleSubmit} className="space-y-5 rounded-3xl border border-[#E5DCC5] bg-white p-5 sm:p-8 shadow-sm">
-              {/* 1. Jenis Furniture */}
+              {/* 1. Upload Foto Referensi / Sketsa */}
               <div>
                 <Label className="block text-sm font-bold text-[#2C1E16]">
-                  1. Jenis Furniture <span className="text-red-500">*</span>
-                </Label>
-                <div className="mt-2.5 flex flex-wrap gap-2">
-                  {FURNITURE_TYPES.map((type) => {
-                    const isSelected = form.furniture_type === type;
-                    return (
-                      <button
-                        key={type}
-                        type="button"
-                        onClick={() => setForm({ ...form, furniture_type: type })}
-                        className={`rounded-xl border px-3.5 py-2 text-xs sm:text-sm font-medium transition-colors ${
-                          isSelected
-                            ? "border-[#8B5A2B] bg-[#8B5A2B] text-white"
-                            : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
-                        }`}
-                      >
-                        {type}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {form.furniture_type === "Lainnya" && (
-                  <Input
-                    type="text"
-                    placeholder="Tuliskan jenis furniture yang Anda inginkan..."
-                    value={form.custom_type}
-                    onChange={(e) => setForm({ ...form, custom_type: e.target.value })}
-                    className="mt-3 bg-[#FBF9F4]"
-                  />
-                )}
-              </div>
-
-              {/* 2. Ukuran */}
-              <div className="border-t border-[#F1EBE0] pt-5">
-                <Label className="block text-sm font-bold text-[#2C1E16]">
-                  2. Perkiraan Ukuran (cm)
-                </Label>
-                <p className="mt-0.5 text-xs text-[#8B7355]">
-                  Isi ukuran yang diinginkan atau sesuaikan dengan ruangan Anda.
-                </p>
-
-                <div className="mt-3 grid grid-cols-3 gap-2 sm:gap-4">
-                  <div>
-                    <span className="text-[11px] font-semibold text-[#8B7355]">Panjang (P)</span>
-                    <Input
-                      type="number"
-                      placeholder="misal: 100"
-                      value={form.length}
-                      onChange={(e) => setForm({ ...form, length: e.target.value })}
-                      className="mt-1 bg-[#FBF9F4]"
-                    />
-                  </div>
-                  <div>
-                    <span className="text-[11px] font-semibold text-[#8B7355]">Lebar (L)</span>
-                    <Input
-                      type="number"
-                      placeholder="misal: 50"
-                      value={form.width}
-                      onChange={(e) => setForm({ ...form, width: e.target.value })}
-                      className="mt-1 bg-[#FBF9F4]"
-                    />
-                  </div>
-                  <div>
-                    <span className="text-[11px] font-semibold text-[#8B7355]">Tinggi (T)</span>
-                    <Input
-                      type="number"
-                      placeholder="misal: 75"
-                      value={form.height}
-                      onChange={(e) => setForm({ ...form, height: e.target.value })}
-                      className="mt-1 bg-[#FBF9F4]"
-                    />
-                  </div>
-                </div>
-
-                <Input
-                  type="text"
-                  placeholder="Catatan ukuran tambahan (opsional, misal: tinggi rak atas 30 cm)"
-                  value={form.dimension_notes}
-                  onChange={(e) => setForm({ ...form, dimension_notes: e.target.value })}
-                  className="mt-2.5 bg-[#FBF9F4] text-xs"
-                />
-              </div>
-
-              {/* 3. Bahan & Finishing */}
-              <div className="border-t border-[#F1EBE0] pt-5">
-                <Label className="block text-sm font-bold text-[#2C1E16]">
-                  3. Pilihan Bahan & Finishing
-                </Label>
-                <div className="mt-2.5 flex flex-wrap gap-2">
-                  {FINISHING_CHOICES.map((choice) => {
-                    const isSelected = form.material === choice;
-                    return (
-                      <button
-                        key={choice}
-                        type="button"
-                        onClick={() => setForm({ ...form, material: choice })}
-                        className={`rounded-xl border px-3 py-1.5 text-xs sm:text-sm font-medium transition-colors ${
-                          isSelected
-                            ? "border-[#8B5A2B] bg-[#8B5A2B] text-white"
-                            : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
-                        }`}
-                      >
-                        {choice}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* 4. Upload Foto Referensi / Sketsa */}
-              <div className="border-t border-[#F1EBE0] pt-5">
-                <Label className="block text-sm font-bold text-[#2C1E16]">
-                  4. Foto Referensi / Sketsa Desain
+                  1. Foto Referensi / Sketsa Desain
                 </Label>
                 <p className="mt-0.5 text-xs text-[#8B7355]">
                   Lampirkan foto dari Pinterest, Google, atau sketsa corat-coret tangan (maksimal 5 foto).
@@ -393,6 +309,168 @@ export default function CustomOrderPage() {
                       />
                     </label>
                   )}
+                </div>
+              </div>
+
+              {/* 2. Jenis Furniture */}
+              <div className="border-t border-[#F1EBE0] pt-5">
+                <Label className="block text-sm font-bold text-[#2C1E16]">
+                  2. Jenis Furniture <span className="text-red-500">*</span>
+                </Label>
+                <div className="mt-2.5 flex flex-wrap gap-2">
+                  {FURNITURE_TYPES.map((type) => {
+                    const isSelected = form.furniture_type === type;
+                    return (
+                      <button
+                        key={type}
+                        type="button"
+                        onClick={() => setForm({ ...form, furniture_type: type })}
+                        className={`rounded-xl border px-3.5 py-2 text-xs sm:text-sm font-medium transition-colors ${
+                          isSelected
+                            ? "border-[#8B5A2B] bg-[#8B5A2B] text-white"
+                            : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
+                        }`}
+                      >
+                        {type}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {form.furniture_type === "Lainnya" && (
+                  <Input
+                    type="text"
+                    placeholder="Tuliskan jenis furniture yang Anda inginkan..."
+                    value={form.custom_type}
+                    onChange={(e) => setForm({ ...form, custom_type: e.target.value })}
+                    className="mt-3 bg-[#FBF9F4]"
+                  />
+                )}
+              </div>
+
+              {/* 3. Ukuran */}
+              <div className="border-t border-[#F1EBE0] pt-5">
+                <Label className="block text-sm font-bold text-[#2C1E16]">
+                  3. Perkiraan Ukuran (cm)
+                </Label>
+                <p className="mt-0.5 text-xs text-[#8B7355]">
+                  Isi ukuran yang diinginkan atau sesuaikan dengan ruangan Anda.
+                </p>
+
+                <div className="mt-3 grid grid-cols-3 gap-2 sm:gap-4">
+                  <div>
+                    <span className="text-[11px] font-semibold text-[#8B7355]">Panjang (P)</span>
+                    <Input
+                      type="number"
+                      placeholder="misal: 100"
+                      value={form.length}
+                      onChange={(e) => setForm({ ...form, length: e.target.value })}
+                      className="mt-1 bg-[#FBF9F4]"
+                    />
+                  </div>
+                  <div>
+                    <span className="text-[11px] font-semibold text-[#8B7355]">Lebar (L)</span>
+                    <Input
+                      type="number"
+                      placeholder="misal: 50"
+                      value={form.width}
+                      onChange={(e) => setForm({ ...form, width: e.target.value })}
+                      className="mt-1 bg-[#FBF9F4]"
+                    />
+                  </div>
+                  <div>
+                    <span className="text-[11px] font-semibold text-[#8B7355]">Tinggi (T)</span>
+                    <Input
+                      type="number"
+                      placeholder="misal: 75"
+                      value={form.height}
+                      onChange={(e) => setForm({ ...form, height: e.target.value })}
+                      className="mt-1 bg-[#FBF9F4]"
+                    />
+                  </div>
+                </div>
+
+                <Input
+                  type="text"
+                  placeholder="Catatan ukuran tambahan (opsional, misal: tinggi rak atas 30 cm)"
+                  value={form.dimension_notes}
+                  onChange={(e) => setForm({ ...form, dimension_notes: e.target.value })}
+                  className="mt-2.5 bg-[#FBF9F4] text-xs"
+                />
+              </div>
+
+              {/* 4. Pilihan Bahan & Finishing */}
+              <div className="border-t border-[#F1EBE0] pt-5">
+                <Label className="block text-sm font-bold text-[#2C1E16]">
+                  4. Pilihan Bahan & Finishing
+                </Label>
+                <p className="mt-0.5 text-xs text-[#8B7355]">
+                  Pilih bahan dan finishing yang diinginkan, atau konsultasikan jika belum yakin.
+                </p>
+
+                <div className="mt-3 space-y-3">
+                  {/* Baris 1: Bahan */}
+                  <div>
+                    <span className="text-[11px] font-semibold text-[#8B7355]">Bahan</span>
+                    <div className="mt-1.5 flex flex-wrap gap-2">
+                      {BAHAN_CHOICES.map((choice) => {
+                        const isSelected = selectedBahan === choice;
+                        return (
+                          <button
+                            key={choice}
+                            type="button"
+                            onClick={() => handleSelectBahan(choice)}
+                            className={`rounded-xl border px-3.5 py-1.5 text-xs sm:text-sm font-medium transition-colors ${
+                              isSelected
+                                ? "border-[#8B5A2B] bg-[#8B5A2B] text-white"
+                                : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
+                            }`}
+                          >
+                            {choice}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Baris 2: Finishing */}
+                  <div>
+                    <span className="text-[11px] font-semibold text-[#8B7355]">Finishing</span>
+                    <div className="mt-1.5 flex flex-wrap gap-2">
+                      {FINISHING_CHOICES.map((choice) => {
+                        const isSelected = selectedFinishing === choice;
+                        return (
+                          <button
+                            key={choice}
+                            type="button"
+                            onClick={() => handleSelectFinishing(choice)}
+                            className={`rounded-xl border px-3.5 py-1.5 text-xs sm:text-sm font-medium transition-colors ${
+                              isSelected
+                                ? "border-[#8B5A2B] bg-[#8B5A2B] text-white"
+                                : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
+                            }`}
+                          >
+                            {choice}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Baris 3: Belum Yakin */}
+                  <div>
+                    <button
+                      type="button"
+                      onClick={handleSelectUnsure}
+                      className={`rounded-xl border px-3.5 py-1.5 text-xs sm:text-sm font-medium transition-colors ${
+                        isUnsure
+                          ? "border-[#8B5A2B] bg-[#8B5A2B] text-white"
+                          : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
+                      }`}
+                    >
+                      Belum Yakin (Konsultasikan)
+                    </button>
+                  </div>
                 </div>
               </div>
 
