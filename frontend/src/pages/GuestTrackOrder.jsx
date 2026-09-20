@@ -40,7 +40,11 @@ export default function GuestTrackOrder() {
         <p className="mt-1 text-center text-xs text-[#8B7355]">{t("track.desc")}</p>
         <form onSubmit={submit} className="mt-5 space-y-3">
           <div><Label className="mb-1 block text-sm">{t("track.order_num")}</Label><Input value={f.order_number} onChange={(e) => setF({ ...f, order_number: e.target.value })} placeholder="SGF-20260827-001" data-testid="track-order-number" className="bg-white" required /></div>
-          <div><Label className="mb-1 block text-sm">{t("track.phone")}</Label><Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder="+201234567890" data-testid="track-phone" className="bg-white" required /></div>
+          <div>
+            <Label className="mb-1 block text-sm">{t("track.phone")}</Label>
+            <Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} placeholder={t("track.phone_ph")} data-testid="track-phone" className="bg-white" required />
+            <p className="mt-1 text-xs text-[#8B7355]">{t("track.phone_help")}</p>
+          </div>
           <Button type="submit" disabled={loading} data-testid="track-submit" className="h-11 w-full rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">{loading ? t("track.searching") : t("track.btn_track")}</Button>
         </form>
       </div>

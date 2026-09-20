@@ -795,7 +795,7 @@ async def create_order(request: Request, data: OrderInput):
     if not phone:
         raise HTTPException(status_code=400, detail="No HP tidak boleh kosong.")
     if not valid_intl_phone(phone):
-        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +201234567890")
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +62xxxxxxxxxx")
     if not data.customer_address.strip():
         raise HTTPException(status_code=400, detail="Alamat tidak boleh kosong.")
     if data.delivery_method not in ("delivery", "pickup"):
@@ -2207,7 +2207,7 @@ def clean_customer(c):
 async def customer_register(data: CustomerRegister, response: Response):
     phone = normalize_phone(data.phone)
     if not valid_intl_phone(phone):
-        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +201234567890")
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +62xxxxxxxxxx")
     if len(data.password) < 6:
         raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter")
     if await db.customers.find_one({"phone": phone}):
@@ -2248,7 +2248,7 @@ async def customer_logout(response: Response):
 async def find_username(payload: Dict[str, Any]):
     phone = normalize_phone(payload.get("phone") or "")
     if not valid_intl_phone(phone):
-        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +201234567890")
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +62xxxxxxxxxx")
     c = await db.customers.find_one({"phone": phone})
     if not c:
         raise HTTPException(status_code=404, detail="Tidak ada akun terdaftar dengan No HP ini")

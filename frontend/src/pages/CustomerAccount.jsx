@@ -76,7 +76,8 @@ export default function CustomerAccount() {
           <form onSubmit={submit} className="mt-5 space-y-3">
             {mode === "register" ? (<>
               <div><Label className="mb-1 block text-sm">{t("auth.username")}</Label><Input value={f.username} onChange={(e) => setF({ ...f, username: e.target.value })} data-testid="reg-username" className="bg-white" required /></div>
-              <div><Label className="mb-1 block text-sm">{t("auth.phone")}</Label><Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} data-testid="reg-phone" placeholder="+201234567890" className="bg-white" required /></div>
+              <div><Label className="mb-1 block text-sm">{t("auth.phone")}</Label><Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} data-testid="reg-phone" placeholder={t("auth.phone_ph")} className="bg-white" required />
+              <p className="mt-1 text-xs text-[#8B7355]">{t("auth.phone_help")}</p></div>
             </>) : (
               <div><Label className="mb-1 block text-sm">{t("auth.identifier")}</Label><Input value={f.identifier} onChange={(e) => setF({ ...f, identifier: e.target.value })} data-testid="login-identifier" className="bg-white" required /></div>
             )}
@@ -111,9 +112,12 @@ export default function CustomerAccount() {
             {showRecover && (
               <div className="mt-2 space-y-2 rounded-xl bg-[#FBF9F4] p-3" data-testid="recover-panel">
                 <Label className="block text-xs text-[#5C4A3D]">{t("auth.recover_prompt")}</Label>
-                <div className="flex gap-2">
-                  <Input value={recoverPhone} onChange={(e) => setRecoverPhone(e.target.value)} placeholder="+201234567890" data-testid="recover-phone" className="bg-white" />
-                  <Button type="button" onClick={findUsername} data-testid="recover-submit" className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">{t("auth.btn_search")}</Button>
+                <div>
+                  <div className="flex gap-2">
+                    <Input value={recoverPhone} onChange={(e) => setRecoverPhone(e.target.value)} placeholder={t("auth.phone_ph")} data-testid="recover-phone" className="bg-white" />
+                    <Button type="button" onClick={findUsername} data-testid="recover-submit" className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">{t("auth.btn_search")}</Button>
+                  </div>
+                  <p className="mt-1 text-xs text-[#8B7355]">{t("auth.phone_help")}</p>
                 </div>
                 {recoverResult && <div className="text-sm text-[#2C1E16]" data-testid="recover-result">{t("auth.your_username")} <b>{recoverResult}</b></div>}
                 <p className="text-xs text-[#8B7355]">{t("auth.forgot_note")}</p>
@@ -154,9 +158,12 @@ export default function CustomerAccount() {
       <div className="mt-4 rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="claim-order-card">
         <div className="font-heading font-bold text-[#2C1E16]">{t("auth.claim_title")}</div>
         <p className="mt-1 text-xs text-[#8B7355]">{t("auth.claim_desc")}</p>
-        <div className="mt-3 grid gap-2 sm:grid-cols-2">
-          <Input value={claim.order_number} onChange={(e) => setClaim({ ...claim, order_number: e.target.value })} placeholder="SGF-20260827-001" data-testid="claim-order-number" className="bg-white" />
-          <Input value={claim.phone} onChange={(e) => setClaim({ ...claim, phone: e.target.value })} placeholder="+201234567890" data-testid="claim-phone" className="bg-white" />
+        <div className="mt-3">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Input value={claim.order_number} onChange={(e) => setClaim({ ...claim, order_number: e.target.value })} placeholder="SGF-20260827-001" data-testid="claim-order-number" className="bg-white" />
+            <Input value={claim.phone} onChange={(e) => setClaim({ ...claim, phone: e.target.value })} placeholder={t("auth.claim_phone_ph")} data-testid="claim-phone" className="bg-white" />
+          </div>
+          <p className="mt-1 text-xs text-[#8B7355]">{t("auth.phone_help")}</p>
         </div>
         <Button onClick={claimOrder} data-testid="claim-submit" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">{t("auth.claim_btn")}</Button>
       </div>
