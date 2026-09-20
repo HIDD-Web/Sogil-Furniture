@@ -111,10 +111,12 @@ export default function CategoryPage() {
 
   const description = categoryDoc?.description || (CATEGORY_DESCRIPTION_KEYS[category] ? t(CATEGORY_DESCRIPTION_KEYS[category]) : t("cat.default_desc"));
 
-  const whatsappNumber = (store?.whatsapp_number || "201016843442").replace(/[^0-9]/g, "");
-  const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(
-    "Halo Sogil Furniture, saya ingin konsultasi pemesanan furnitur custom."
-  )}`;
+  const whatsappNumber = (store?.whatsapp_number || "").replace(/[^0-9]/g, "");
+  const whatsappUrl = whatsappNumber
+    ? `https://wa.me/${whatsappNumber}?text=${encodeURIComponent(
+        "Halo Sogil Furniture, saya ingin konsultasi pemesanan furnitur custom."
+      )}`
+    : null;
 
   return (
     <main className="min-h-[60vh] bg-[#F9F6F0]">
@@ -163,14 +165,16 @@ export default function CategoryPage() {
               >
                 Isi Form Request
               </Link>
-              <a
-                href={whatsappUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#25D366] px-4 py-2.5 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#1EBE5D] transition-colors"
-              >
-                Konsultasi via WA
-              </a>
+              {whatsappUrl && (
+                <a
+                  href={whatsappUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#25D366] px-4 py-2.5 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#1EBE5D] transition-colors"
+                >
+                  Konsultasi via WA
+                </a>
+              )}
             </div>
           </div>
         )}

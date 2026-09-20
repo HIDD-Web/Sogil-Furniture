@@ -20,7 +20,7 @@ export default function Cart() {
         <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#EFE6D5] text-[#8B5A2B]"><ShoppingCart size={30} /></div>
         <h1 className="mt-4 font-heading text-2xl font-bold text-[#2C1E16]">{t("cart.title")}</h1>
         <p className="mt-2 text-[#5C4A3D]">{t("cart.empty")}</p>
-        <Link to="/produk"><Button className="mt-5 h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]">{t("cart.belanja")}</Button></Link>
+        <Link to="/"><Button className="mt-5 h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]">{t("cart.belanja")}</Button></Link>
       </div>
     );
   }

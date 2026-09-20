@@ -522,12 +522,15 @@ export default function CustomOrderPage() {
                     <span className="text-xs font-semibold text-[#8B7355]">Nomor WhatsApp</span>
                     <Input
                       type="tel"
-                      placeholder="Contoh: 08123456789 atau +201..."
+                      placeholder="Contoh: +62xxxxxxxxxx"
                       value={form.customer_phone}
                       onChange={(e) => setForm({ ...form, customer_phone: e.target.value })}
                       required
                       className="mt-1 bg-[#FBF9F4]"
                     />
+                    <p className="mt-1 text-[11px] text-[#8B7355]">
+                      Gunakan format internasional dengan kode negara, misalnya +20, +62, atau +60.
+                    </p>
                   </div>
                 </div>
 

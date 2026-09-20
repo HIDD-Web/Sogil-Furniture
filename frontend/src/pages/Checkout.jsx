@@ -71,7 +71,7 @@ export default function Checkout() {
     return (
       <div className="mx-auto max-w-2xl px-4 py-16 text-center">
         <p className="text-[#5C4A3D]">{t("cart.empty")}</p>
-        <Button onClick={() => navigate("/produk")} className="mt-4 rounded-full bg-[#8B5A2B] px-8">{t("cart.belanja")}</Button>
+        <Button onClick={() => navigate("/")} className="mt-4 rounded-full bg-[#8B5A2B] px-8">{t("cart.belanja")}</Button>
       </div>
     );
   }
@@ -137,7 +137,11 @@ export default function Checkout() {
           <div className="space-y-4" data-testid="checkout-customer">
             <h2 className="font-heading text-xl font-bold text-[#2C1E16]">{t("chk.title")}</h2>
             <div><Label className="mb-1.5 block text-sm">{t("chk.nama")} *</Label><Input value={cust.name} onChange={(e) => setCust({ ...cust, name: e.target.value })} data-testid="input-name" className="h-12 bg-white" /></div>
-            <div><Label className="mb-1.5 block text-sm">{t("chk.no_hp")} * <span className="text-xs text-[#8B7355]">(+kode negara)</span></Label><Input value={cust.phone} onChange={(e) => setCust({ ...cust, phone: e.target.value })} data-testid="input-phone" placeholder={t("chk.phone_ph")} className="h-12 bg-white" /></div>
+            <div>
+              <Label className="mb-1.5 block text-sm">{t("chk.no_hp")} * <span className="text-xs text-[#8B7355]">(+kode negara)</span></Label>
+              <Input value={cust.phone} onChange={(e) => setCust({ ...cust, phone: e.target.value })} data-testid="input-phone" placeholder={t("chk.phone_ph")} className="h-12 bg-white" />
+              <p className="mt-1 text-xs text-[#8B7355]">{t("chk.phone_help")}</p>
+            </div>
             <div><Label className="mb-1.5 block text-sm">{t("chk.alamat")} *</Label><Textarea value={cust.address} onChange={(e) => setCust({ ...cust, address: e.target.value })} data-testid="input-address" className="min-h-[80px] bg-white" /></div>
             <div><Label className="mb-1.5 block text-sm">{t("chk.link_maps")} {delivery.method === "delivery" ? t("chk.maps_saran") : t("chk.maps_opsional")}</Label><Input value={cust.maps} onChange={(e) => setCust({ ...cust, maps: e.target.value })} data-testid="input-maps" placeholder="https://maps.google.com/..." className="h-12 bg-white" /></div>
             <div>

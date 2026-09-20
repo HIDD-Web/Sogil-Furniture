@@ -12,6 +12,7 @@ import { Textarea } from "../components/ui/textarea";
 import { Label } from "../components/ui/label";
 import { Minus, Plus, ChevronLeft, ChevronRight, Info, ShoppingCart, Zap, MessageCircle } from "lucide-react";
 import { CATEGORY_PRICELISTS } from "../lib/constants";
+import { toast } from "sonner";
 
 const CATEGORY_KEYS = {
   rak: "cat.rak",
@@ -20,6 +21,19 @@ const CATEGORY_KEYS = {
   papan_tulis: "cat.papan_tulis",
   blockboard: "cat.blockboard",
   custom: "cat.custom",
+};
+
+const getDesignSpecs = (details, designKey) => {
+  if (!details || !designKey) return [];
+  const val = details[designKey];
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  if (typeof val === "object" && val.spesifikasi) {
+    if (Array.isArray(val.spesifikasi)) return val.spesifikasi;
+    return [String(val.spesifikasi)];
+  }
+  if (typeof val === "string") return [val];
+  return [];
 };
 
 const Chip = ({ active, onClick, children, testid }) => (
@@ -150,18 +164,33 @@ export default function ProductConfigure() {
     const p = product.pricing || {};
     const grps = Array.isArray(p.groups) ? p.groups : null;
     let cfg = config.custom_size ? { ...config, custom_note: customNote } : { ...config };
+    const customCat = product.category === "custom";
+    const currentDesignTitle = customCat
+      ? (config.desain || (grps && grps[0] ? config[grps[0].key] : null) || (grps && grps[0] && grps[0].options ? grps[0].options[0] : null) || product.name)
+      : product.name;
+
     if (grps && !config.custom_size) {
       const g0 = grps[0];
-      if (p.design_details && g0 && p.design_details[config[g0.key]]) {
-        cfg._summary = `${config[g0.key]} — ${p.design_details[config[g0.key]].join(" · ")}`;
+      const designKey = config[g0?.key];
+      const specs = getDesignSpecs(p.design_details, designKey);
+      if (specs.length > 0) {
+        cfg._summary = `${designKey} — ${specs.join(" · ")}`;
       } else {
         cfg._summary = grps.map((g) => config[g.key]).filter(Boolean).join(", ");
       }
     }
     return {
-      product: { id: product.id, slug: product.slug, name: product.name, category: product.category, image: photoMatch.photo ? (photoMatch.photo.main_url || photoMatch.photo.front_url) : product.display_image },
+      product: {
+        id: product.id,
+        slug: product.slug,
+        name: customCat ? currentDesignTitle : product.name,
+        category: product.category,
+        image: photoMatch.photo ? (photoMatch.photo.main_url || photoMatch.photo.front_url) : product.display_image,
+      },
       config: cfg,
-      quantity, breakdown: { ...breakdown }, label: product.name,
+      quantity,
+      breakdown: { ...breakdown },
+      label: customCat ? currentDesignTitle : product.name,
     };
   };
 
@@ -176,6 +205,17 @@ export default function ProductConfigure() {
   const pr = product.pricing || {};
   const groups = Array.isArray(pr.groups) ? pr.groups : null;
   const isFixed = pr.price_model === "additive";
+  const isCustomCategory = product.category === "custom";
+  const activeDesignTitle = isCustomCategory
+    ? (config.desain || (groups && groups[0] ? config[groups[0].key] : null) || (groups && groups[0] && groups[0].options ? groups[0].options[0] : null) || product.name)
+    : product.name;
+  const activeDesignSpecs = isCustomCategory && pr.design_details ? getDesignSpecs(pr.design_details, activeDesignTitle) : [];
+  const adminWhatsApp = (store?.whatsapp_number || "").replace(/[^0-9]/g, "");
+  const customWaUrl = adminWhatsApp
+    ? `https://wa.me/${adminWhatsApp}?text=${encodeURIComponent(
+        `Halo Sogil Furniture, saya tertarik dengan Koleksi Custom "${activeDesignTitle}". Apakah bisa dikonsultasikan untuk penyesuaian ukuran/bahan/desain?`
+      )}`
+    : null;
 
   const onTouchStart = (e) => {
     setTouchEnd(null);
@@ -306,173 +346,287 @@ export default function ProductConfigure() {
             </div>
           </div>
 
-          <div className="border-b border-[#E5DCC5]/60 pb-2.5">
-            <div className="text-[10px] sm:text-xs font-medium uppercase tracking-wider text-[#8B7355]">
-             {CATEGORY_KEYS[product.category]
-              ? t(CATEGORY_KEYS[product.category])
-              : product.category}
-            </div>
-            <h1 className="font-heading text-lg sm:text-2xl font-bold text-[#2C1E16]">{product.name}</h1>
-            {product.description && (
-              <p className="mt-0.5 text-xs sm:text-sm text-[#5C4A3D] line-clamp-2 sm:line-clamp-none">{product.description}</p>
-            )}
-          </div>
-
-          {product.category === "custom" ? (
-            <div className="rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 space-y-4 shadow-xs">
-              <div className="flex items-start gap-3">
-                <Info className="mt-0.5 text-[#8B5A2B] shrink-0" size={20} />
-                <div>
-                  <div className="font-heading font-semibold text-[#2C1E16]">
-                    Karya Pesanan Custom
-                  </div>
-                  <p className="mt-1 text-xs sm:text-sm text-[#5C4A3D]">
-                    Produk ini adalah portofolio pesanan custom yang pernah diproduksi oleh Sogil Furniture. Anda dapat memesan desain serupa dengan ukuran, bahan, dan finishing yang disesuaikan dengan ruangan Anda.
-                  </p>
-                </div>
+          {isCustomCategory ? (
+            <div className="space-y-4 sm:space-y-5">
+              {/* 1. Kategori */}
+              <div className="text-[10px] sm:text-xs font-medium uppercase tracking-wider text-[#8B7355]">
+                {CATEGORY_KEYS[product.category]
+                  ? t(CATEGORY_KEYS[product.category])
+                  : "Koleksi Custom"}
               </div>
 
-              {/* WhatsApp direct consultation CTA */}
-              <a
-                href={`https://wa.me/${(store?.whatsapp_number || "201016843442").replace(/[^0-9]/g, "")}?text=${encodeURIComponent(
-                  `Halo Sogil Furniture, saya tertarik dengan Koleksi Custom "${product.name}". Apakah bisa dibuatkan dengan spesifikasi saya?`
-                )}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                data-testid="btn-custom-wa"
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#25D366] py-3 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#1EBE5D] transition-colors"
-              >
-                <MessageCircle size={18} />
-                Konsultasikan Desain Ini via WhatsApp
-              </a>
-
-              <div className="border-t border-[#F1EBE0] pt-3">
-                <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
-                  Atau tulis catatan spesifikasi untuk dipesan online:
-                </Label>
-                <Textarea
-                  value={customNote}
-                  onChange={(e) => setCustomNote(e.target.value)}
-                  placeholder="Tuliskan ukuran, model, atau catatan khusus yang Anda inginkan..."
-                  className="mt-1.5 min-h-[80px] bg-[#FBF9F4] text-xs sm:text-sm"
-                />
-              </div>
-            </div>
-          ) : !isConfigurable && (
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
-              <div className="flex items-start gap-3"><Info className="mt-0.5 text-amber-600" size={20} />
-                <div><div className="font-heading font-semibold text-amber-800">{t("cfg.segera_t")}</div>
-                  <p className="mt-1 text-sm text-amber-700">{t("cfg.segera_d")}</p></div>
-              </div>
-            </div>
-          )}
-
-          {isConfigurable && (
-            <>
-              {!isFixed && product.category === "custom" && (
-              <div>
-                <Label className="mb-2 block font-heading text-sm font-semibold text-[#2C1E16]">{t("cfg.jenis_pesanan")}</Label>
-                <div className="flex flex-wrap gap-2">
-                  <Chip active={!config.custom_size} onClick={() => set("custom_size", false)} testid="opt-standard">{t("cfg.ukuran_standar")}</Chip>
-                  <Chip active={config.custom_size} onClick={() => set("custom_size", true)} testid="opt-custom">{t("cfg.ukuran_custom")}</Chip>
-                </div>
-              </div>
-              )}
-
-              {config.custom_size ? (
-                <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5">
-                  <p className="text-sm text-[#5C4A3D]">{t("cfg.custom_info")}</p>
-                  <Textarea value={customNote} onChange={(e) => setCustomNote(e.target.value)} data-testid="custom-note" placeholder={t("cfg.custom_ph")} className="mt-3 min-h-[100px] bg-[#FBF9F4]" />
-                  <p className="mt-2 text-xs text-amber-700">{t("cfg.custom_note")}</p>
-                  <div className="mt-3 flex items-center justify-between border-t border-[#F1EBE0] pt-2.5">
-                    <span className="text-xs text-[#8B7355]">Punya foto referensi / sketsa sendiri?</span>
-                    <button
-                      type="button"
-                      onClick={() => navigate("/request-custom")}
-                      className="text-xs font-semibold text-[#8B5A2B] hover:underline"
-                    >
-                      Buka Form Request Custom ↗
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  {groups && groups.map((g) => {
-                    const options = (g.options || []).filter((o) => {
-                      if (product.category === "papan_tulis") {
-                        if (g.key === "mount" && o === "+ Kaki 150 cm" && isSmallPapanTulis(config.size)) return false;
-                        if (g.key === "size" && config.mount === "+ Kaki 150 cm" && isSmallPapanTulis(o)) return false;
-                      }
-                      return true;
-                    });
-                    return (
-                      <Section key={g.key} title={g.label || g.key} note={product.option_notes?.[g.key]}>
-                        {options.map((o) => <Chip key={o} active={config[g.key] === o} onClick={() => set(g.key, o)} testid={`opt-${g.key}-${o}`}>{o}</Chip>)}
-                      </Section>
-                    );
-                  })}
-                  {pr.design_details && groups && groups[0] && pr.design_details[config[groups[0].key]] && (
-                    <div className="rounded-2xl border border-[#E5DCC5] bg-[#FBF9F4] p-4" data-testid="custom-design-details">
-                      <div className="mb-2 font-heading text-sm font-semibold text-[#2C1E16]">
-                        {t("cfg.spesifikasi_desain")}
-                      </div>
-                      <ul className="space-y-1 text-sm text-[#5C4A3D]">
-                        {pr.design_details[config[groups[0].key]].map((d, i) => <li key={i} className="flex gap-2"><span className="text-[#8B5A2B]">•</span><span>{d}</span></li>)}
-                      </ul>
-                    </div>
-                  )}
-                  {!groups && product.category === "rak" && (<>
-                    <Section title={t("cfg.pilih_ukuran")} note={product.option_notes?.length}>{(pr.lengths || []).map((l) => <Chip key={l} active={config.length === l} onClick={() => set("length", l)} testid={`opt-length-${l}`}>{l} cm</Chip>)}</Section>
-                    <Section title={t("cfg.jumlah_tingkat")} note={product.option_notes?.level}>{(pr.levels || []).map((l) => <Chip key={l} active={config.level === l} onClick={() => set("level", l)} testid={`opt-level-${l}`}>{l} {t("cfg.tingkat")}</Chip>)}</Section>
-                    <Section title={t("cfg.tipe_rak")} hint={t("cfg.tipe_hint")} note={product.option_notes?.type}>{(pr.types || []).filter((tp) => tp !== "B+" && tp !== "A+").map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
-                    <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
-                  </>)}
-                  {!groups && product.category === "meja" && (<>
-                    <Section title={t("cfg.ukuran_tabletop")} note={product.option_notes?.size}>{(pr.sizes || []).map((s) => <Chip key={s} active={config.size === s} onClick={() => set("size", s)} testid={`opt-size-${s}`}>{s} cm</Chip>)}</Section>
-                    <Section title={t("cfg.tinggi_meja")} note={product.option_notes?.height}>
-                      {(pr.heights || []).map((h) => (
+              {/* 2. Pilihan Desain Custom */}
+              {groups && groups.map((g) => {
+                const options = g.options || [];
+                return (
+                  <Section key={g.key} title={g.label || g.key} note={product.option_notes?.[g.key]}>
+                    {options.map((o) => (
                       <Chip
-                        key={h}
-                        active={config.height === h}
-                        onClick={() => set("height", h)}
-                        testid={`opt-height-${h}`}
+                        key={o}
+                        active={config[g.key] === o}
+                        onClick={() => set(g.key, o)}
+                        testid={`opt-${g.key}-${o}`}
                       >
-                        {h} cm{" "}
-                        {h === "30"
-                          ? `(${t("cfg.lesehan")})`
-                          : h === "75"
-                            ? `(${t("cfg.kursi")})`
-                            : ""}
+                        {o}
                       </Chip>
                     ))}
                   </Section>
-                    <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
-                  </>)}
-                  {!groups && product.category === "meja_rak" && (<>
-                    <Section title={t("cfg.pilih_varian")} note={product.option_notes?.variant}>{(pr.variants || []).map((v) => <Chip key={v} active={config.variant === v} onClick={() => set("variant", v)} testid={`opt-variant-${v}`}>{v}</Chip>)}</Section>
-                    <Section title={t("cfg.tipe")} hint={t("cfg.tipe_hint")} note={product.option_notes?.type}>{(pr.types || []).map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
-                    <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
-                  </>)}
-                  <Section title={t("cfg.jumlah")}>
-                    <div className="flex items-center gap-3">
-                      <button onClick={() => setQuantity((q) => Math.max(1, q - 1))} data-testid="qty-minus" className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#E5DCC5] bg-white hover:border-[#8B5A2B]"><Minus size={18} /></button>
-                      <span className="w-10 text-center text-lg font-semibold" data-testid="qty-value">{quantity}</span>
-                      <button onClick={() => setQuantity((q) => q + 1)} data-testid="qty-plus" className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#E5DCC5] bg-white hover:border-[#8B5A2B]"><Plus size={18} /></button>
-                    </div>
-                  </Section>
-                </>
+                );
+              })}
+
+              {/* 3. Nama desain aktif */}
+              <div className="border-b border-[#E5DCC5]/60 pb-2.5">
+                <h1 className="font-heading text-lg sm:text-2xl font-bold text-[#2C1E16]">
+                  {activeDesignTitle}
+                </h1>
+                {product.description && (
+                  <p className="mt-0.5 text-xs sm:text-sm text-[#5C4A3D]">
+                    {product.description}
+                  </p>
+                )}
+              </div>
+
+              {/* 4. Spesifikasi desain */}
+              {activeDesignSpecs.length > 0 && (
+                <div className="rounded-2xl border border-[#E5DCC5] bg-[#FBF9F4] p-4" data-testid="custom-design-details">
+                  <div className="mb-2 font-heading text-sm font-semibold text-[#2C1E16]">
+                    {t("cfg.spesifikasi_desain")}
+                  </div>
+                  <ul className="space-y-1 text-sm text-[#5C4A3D]">
+                    {activeDesignSpecs.map((d, i) => (
+                      <li key={i} className="flex gap-2">
+                        <span className="text-[#8B5A2B]">•</span>
+                        <span>{d}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
 
-              <div className="hidden gap-3 lg:flex">
-                <Button variant="outline" onClick={() => addToCart(false)} data-testid="add-to-cart-desktop" className="h-12 rounded-full border-[#8B5A2B] px-6 text-[#8B5A2B] hover:bg-[#EFE6D5]"><ShoppingCart size={18} className="mr-2" /> {t("btn.add_to_cart")}</Button>
-                <Button onClick={() => addToCart(true)} data-testid="order-now-desktop" className="h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]"><Zap size={18} className="mr-2" /> {t("btn.order_now")}</Button>
+              {/* 5. Harga + Quantity */}
+              <div className="space-y-3">
+                <div className="flex items-baseline gap-2">
+                  <span className="font-heading text-2xl font-bold text-[#8B5A2B]">
+                    {fmtLE(breakdown?.subtotal || 0)} LE
+                  </span>
+                  <span className="text-sm text-[#5C4A3D]">
+                    ≈ {fmtIDR((breakdown?.subtotal || 0) * rate)}
+                  </span>
+                </div>
+
+                <Section title={t("cfg.jumlah")}>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => setQuantity((q) => Math.max(1, q - 1))}
+                      data-testid="qty-minus"
+                      className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#E5DCC5] bg-white hover:border-[#8B5A2B]"
+                    >
+                      <Minus size={18} />
+                    </button>
+                    <span className="w-10 text-center text-lg font-semibold" data-testid="qty-value">
+                      {quantity}
+                    </span>
+                    <button
+                      onClick={() => setQuantity((q) => q + 1)}
+                      data-testid="qty-plus"
+                      className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#E5DCC5] bg-white hover:border-[#8B5A2B]"
+                    >
+                      <Plus size={18} />
+                    </button>
+                  </div>
+                </Section>
+
+                <div className="hidden gap-3 lg:flex">
+                  <Button
+                    variant="outline"
+                    onClick={() => addToCart(false)}
+                    data-testid="add-to-cart-desktop"
+                    className="h-12 rounded-full border-[#8B5A2B] px-6 text-[#8B5A2B] hover:bg-[#EFE6D5]"
+                  >
+                    <ShoppingCart size={18} className="mr-2" /> {t("btn.add_to_cart")}
+                  </Button>
+                  <Button
+                    onClick={() => addToCart(true)}
+                    data-testid="order-now-desktop"
+                    className="h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]"
+                  >
+                    <Zap size={18} className="mr-2" /> {t("btn.order_now")}
+                  </Button>
+                </div>
               </div>
-            </>
-          )}
-          {!isConfigurable && (
-            <div className="hidden gap-3 lg:flex">
-              <Button onClick={() => addToCart(true)} data-testid="order-now-desktop" className="h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]">{t("btn.order_now")}</Button>
+
+              {/* 6 & 7. Informasi Karya Pesanan Custom & Konsultasi WhatsApp & Catatan */}
+              <div className="rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 space-y-4 shadow-xs">
+                <div className="flex items-start gap-3">
+                  <Info className="mt-0.5 text-[#8B5A2B] shrink-0" size={20} />
+                  <div>
+                    <div className="font-heading font-semibold text-[#2C1E16]">
+                      Karya Pesanan Custom
+                    </div>
+                    <p className="mt-1 text-xs sm:text-sm text-[#5C4A3D]">
+                      Karya pesanan custom ini dapat dikonsultasikan desainnya via WhatsApp jika Anda menginginkan ukuran berbeda, bahan berbeda, finishing berbeda, atau penyesuaian desain lainnya yang disesuaikan dengan ruangan Anda.
+                    </p>
+                  </div>
+                </div>
+
+                {customWaUrl && (
+                  <a
+                    href={customWaUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-testid="btn-custom-wa"
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#25D366] py-3 text-xs sm:text-sm font-semibold text-white shadow-xs hover:bg-[#1EBE5D] transition-colors"
+                  >
+                    <MessageCircle size={18} />
+                    Konsultasikan Desain Ini via WhatsApp
+                  </a>
+                )}
+
+                <div className="border-t border-[#F1EBE0] pt-3">
+                  <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                    Atau tulis catatan spesifikasi untuk dipesan online:
+                  </Label>
+                  <Textarea
+                    value={customNote}
+                    onChange={(e) => setCustomNote(e.target.value)}
+                    placeholder="Tuliskan ukuran, model, atau catatan khusus yang Anda inginkan..."
+                    className="mt-1.5 min-h-[80px] bg-[#FBF9F4] text-xs sm:text-sm"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between border-t border-[#F1EBE0] pt-2.5">
+                  <span className="text-xs text-[#8B7355]">Punya foto referensi / sketsa sendiri?</span>
+                  <button
+                    type="button"
+                    onClick={() => navigate("/request-custom")}
+                    className="text-xs font-semibold text-[#8B5A2B] hover:underline"
+                  >
+                    Buka Form Request Custom ↗
+                  </button>
+                </div>
+              </div>
             </div>
+          ) : (
+            <>
+              <div className="border-b border-[#E5DCC5]/60 pb-2.5">
+                <div className="text-[10px] sm:text-xs font-medium uppercase tracking-wider text-[#8B7355]">
+                 {CATEGORY_KEYS[product.category]
+                  ? t(CATEGORY_KEYS[product.category])
+                  : product.category}
+                </div>
+                <h1 className="font-heading text-lg sm:text-2xl font-bold text-[#2C1E16]">{product.name}</h1>
+                {product.description && (
+                  <p className="mt-0.5 text-xs sm:text-sm text-[#5C4A3D] line-clamp-2 sm:line-clamp-none">{product.description}</p>
+                )}
+              </div>
+
+              {!isConfigurable && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
+                  <div className="flex items-start gap-3"><Info className="mt-0.5 text-amber-600" size={20} />
+                    <div><div className="font-heading font-semibold text-amber-800">{t("cfg.segera_t")}</div>
+                      <p className="mt-1 text-sm text-amber-700">{t("cfg.segera_d")}</p></div>
+                  </div>
+                </div>
+              )}
+
+              {isConfigurable && (
+                <>
+                  {config.custom_size ? (
+                    <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5">
+                      <p className="text-sm text-[#5C4A3D]">{t("cfg.custom_info")}</p>
+                      <Textarea value={customNote} onChange={(e) => setCustomNote(e.target.value)} data-testid="custom-note" placeholder={t("cfg.custom_ph")} className="mt-3 min-h-[100px] bg-[#FBF9F4]" />
+                      <p className="mt-2 text-xs text-amber-700">{t("cfg.custom_note")}</p>
+                      <div className="mt-3 flex items-center justify-between border-t border-[#F1EBE0] pt-2.5">
+                        <span className="text-xs text-[#8B7355]">Punya foto referensi / sketsa sendiri?</span>
+                        <button
+                          type="button"
+                          onClick={() => navigate("/request-custom")}
+                          className="text-xs font-semibold text-[#8B5A2B] hover:underline"
+                        >
+                          Buka Form Request Custom ↗
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {groups && groups.map((g) => {
+                        const options = (g.options || []).filter((o) => {
+                          if (product.category === "papan_tulis") {
+                            if (g.key === "mount" && o === "+ Kaki 150 cm" && isSmallPapanTulis(config.size)) return false;
+                            if (g.key === "size" && config.mount === "+ Kaki 150 cm" && isSmallPapanTulis(o)) return false;
+                          }
+                          return true;
+                        });
+                        return (
+                          <Section key={g.key} title={g.label || g.key} note={product.option_notes?.[g.key]}>
+                            {options.map((o) => <Chip key={o} active={config[g.key] === o} onClick={() => set(g.key, o)} testid={`opt-${g.key}-${o}`}>{o}</Chip>)}
+                          </Section>
+                        );
+                      })}
+                      {pr.design_details && groups && groups[0] && pr.design_details[config[groups[0].key]] && (
+                        <div className="rounded-2xl border border-[#E5DCC5] bg-[#FBF9F4] p-4" data-testid="custom-design-details">
+                          <div className="mb-2 font-heading text-sm font-semibold text-[#2C1E16]">
+                            {t("cfg.spesifikasi_desain")}
+                          </div>
+                          <ul className="space-y-1 text-sm text-[#5C4A3D]">
+                            {getDesignSpecs(pr.design_details, config[groups[0].key]).map((d, i) => <li key={i} className="flex gap-2"><span className="text-[#8B5A2B]">•</span><span>{d}</span></li>)}
+                          </ul>
+                        </div>
+                      )}
+                      {!groups && product.category === "rak" && (<>
+                        <Section title={t("cfg.pilih_ukuran")} note={product.option_notes?.length}>{(pr.lengths || []).map((l) => <Chip key={l} active={config.length === l} onClick={() => set("length", l)} testid={`opt-length-${l}`}>{l} cm</Chip>)}</Section>
+                        <Section title={t("cfg.jumlah_tingkat")} note={product.option_notes?.level}>{(pr.levels || []).map((l) => <Chip key={l} active={config.level === l} onClick={() => set("level", l)} testid={`opt-level-${l}`}>{l} {t("cfg.tingkat")}</Chip>)}</Section>
+                        <Section title={t("cfg.tipe_rak")} hint={t("cfg.tipe_hint")} note={product.option_notes?.type}>{(pr.types || []).filter((tp) => tp !== "B+" && tp !== "A+").map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
+                        <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
+                      </>)}
+                      {!groups && product.category === "meja" && (<>
+                        <Section title={t("cfg.ukuran_tabletop")} note={product.option_notes?.size}>{(pr.sizes || []).map((s) => <Chip key={s} active={config.size === s} onClick={() => set("size", s)} testid={`opt-size-${s}`}>{s} cm</Chip>)}</Section>
+                        <Section title={t("cfg.tinggi_meja")} note={product.option_notes?.height}>
+                          {(pr.heights || []).map((h) => (
+                          <Chip
+                            key={h}
+                            active={config.height === h}
+                            onClick={() => set("height", h)}
+                            testid={`opt-height-${h}`}
+                          >
+                            {h} cm{" "}
+                            {h === "30"
+                              ? `(${t("cfg.lesehan")})`
+                              : h === "75"
+                                ? `(${t("cfg.kursi")})`
+                                : ""}
+                          </Chip>
+                        ))}
+                      </Section>
+                        <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
+                      </>)}
+                      {!groups && product.category === "meja_rak" && (<>
+                        <Section title={t("cfg.pilih_varian")} note={product.option_notes?.variant}>{(pr.variants || []).map((v) => <Chip key={v} active={config.variant === v} onClick={() => set("variant", v)} testid={`opt-variant-${v}`}>{v}</Chip>)}</Section>
+                        <Section title={t("cfg.tipe")} hint={t("cfg.tipe_hint")} note={product.option_notes?.type}>{(pr.types || []).map((tp) => <Chip key={tp} active={config.type === tp} onClick={() => set("type", tp)} testid={`opt-type-${tp}`}>{t("cfg.tipe")} {tp}</Chip>)}</Section>
+                        <Section title={t("cfg.jenis_finishing")} note={product.option_notes?.finishing}>{(pr.finishings || []).map((f) => <Chip key={f} active={config.finishing === f} onClick={() => set("finishing", f)} testid={`opt-finishing-${f}`}>{f}</Chip>)}</Section>
+                      </>)}
+                      <Section title={t("cfg.jumlah")}>
+                        <div className="flex items-center gap-3">
+                          <button onClick={() => setQuantity((q) => Math.max(1, q - 1))} data-testid="qty-minus" className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#E5DCC5] bg-white hover:border-[#8B5A2B]"><Minus size={18} /></button>
+                          <span className="w-10 text-center text-lg font-semibold" data-testid="qty-value">{quantity}</span>
+                          <button onClick={() => setQuantity((q) => q + 1)} data-testid="qty-plus" className="flex h-12 w-12 items-center justify-center rounded-xl border border-[#E5DCC5] bg-white hover:border-[#8B5A2B]"><Plus size={18} /></button>
+                        </div>
+                      </Section>
+                    </>
+                  )}
+
+                  <div className="hidden gap-3 lg:flex">
+                    <Button variant="outline" onClick={() => addToCart(false)} data-testid="add-to-cart-desktop" className="h-12 rounded-full border-[#8B5A2B] px-6 text-[#8B5A2B] hover:bg-[#EFE6D5]"><ShoppingCart size={18} className="mr-2" /> {t("btn.add_to_cart")}</Button>
+                    <Button onClick={() => addToCart(true)} data-testid="order-now-desktop" className="h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]"><Zap size={18} className="mr-2" /> {t("btn.order_now")}</Button>
+                  </div>
+                </>
+              )}
+              {!isConfigurable && (
+                <div className="hidden gap-3 lg:flex">
+                  <Button onClick={() => addToCart(true)} data-testid="order-now-desktop" className="h-12 rounded-full bg-[#8B5A2B] px-8 hover:bg-[#6B4423]">{t("btn.order_now")}</Button>
+                </div>
+              )}
+            </>
           )}
         </div>
 
