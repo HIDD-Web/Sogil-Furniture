@@ -4,7 +4,33 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Input } from "../../components/ui/input";
 import { X, ChevronRight } from "lucide-react";
 
-const money = (v, cur) => (cur === "IDR" ? "Rp" : "") + Math.round(Number(v) || 0).toLocaleString("de-DE") + (cur === "EGP" ? " LE" : "");
+const money = (v, cur) => {
+  const n = Number(v) || 0;
+  if (cur === "IDR") {
+    return "Rp" + Math.round(n).toLocaleString("de-DE");
+  }
+  const formatted = n % 1 !== 0
+    ? n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : Math.round(n).toLocaleString("de-DE");
+  return formatted + (cur === "EGP" ? " LE" : "");
+};
+
+const formatDrilldownAmount = (t) => {
+  const primCur = t.primary_currency || t.currency || "EGP";
+  const primAmt = t.primary_amount != null ? t.primary_amount : t.amount;
+  const primaryStr = money(primAmt, primCur);
+  if (t.counterpart_amount != null && t.counterpart_amount !== "") {
+    const cpCur = t.counterpart_currency || (primCur === "EGP" ? "IDR" : "EGP");
+    return (
+      <span>
+        {primaryStr}{" "}
+        <span className="text-xs font-normal text-[#8B7355]">(≈ {money(t.counterpart_amount, cpCur)})</span>
+      </span>
+    );
+  }
+  return primaryStr;
+};
+
 const PERIODS = [["this_month", "Bulan Ini"], ["last_month", "Bulan Lalu"], ["last_3_months", "3 Bulan Terakhir"], ["this_year", "Tahun Ini"], ["last_year", "Tahun Lalu"], ["custom", "Kustom"]];
 
 export default function AdminFinanceStats() {
@@ -187,7 +213,7 @@ export default function AdminFinanceStats() {
                         <div className="text-[11px] text-[#8B7355]">Dicatat oleh: {t.recorded_by_name || "-"}</div>
                       </div>
                       <div className="text-left sm:text-right font-bold text-[#8B5A2B] text-sm shrink-0">
-                        {money(t.amount, currency)}
+                        {formatDrilldownAmount(t)}
                       </div>
                     </div>
                   ))}

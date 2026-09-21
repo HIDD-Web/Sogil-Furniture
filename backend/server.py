@@ -2820,7 +2820,7 @@ async def shutdown():
 async def finance_statistics(period: str = "this_month", start: Optional[str] = None, end: Optional[str] = None,
                              currency: str = "EGP", admin: dict = Depends(require_perm("access_finance"))):
     s, e, _ps, _pe = _period_range(period, start, end)
-    q = {"currency": currency}
+    q = {}
     if s or e:
         q["date"] = {}
         if s:
@@ -2830,20 +2830,53 @@ async def finance_statistics(period: str = "this_month", start: Optional[str] = 
     groups = {}
     totals = {"revenue": 0.0, "transfer_income": 0.0, "cost": 0.0, "transfer_expense": 0.0}
     team_wages_map = {}
+    target_currency = (currency or "EGP").strip().upper()
+
     async for t in db.finance_transactions.find(q):
-        typ = t.get("type"); amt = _num(t.get("amount")); cls = t.get("classification")
+        typ = t.get("type"); raw_amt = _num(t.get("amount")); cls = t.get("classification")
         if typ == "order_revenue":
             typ = "income"; cls = "revenue"
         if typ not in ("income", "expense"):
             continue
+
+        t_cur = (t.get("currency") or "EGP").strip().upper()
+        cp_cur = (t.get("counterpart_currency") or get_counterpart_currency(t_cur)).strip().upper()
+        stored_cp = t.get("counterpart_amount")
+        stored_rate = _num(t.get("exchange_rate")) if t.get("exchange_rate") is not None else None
+
+        # Normalize amount according to target_currency using historical rate / counterpart (Option 1)
+        if t_cur == target_currency:
+            norm_amt = raw_amt
+        elif stored_cp is not None and cp_cur == target_currency:
+            norm_amt = _num(stored_cp)
+        elif stored_rate is not None and stored_rate > 0:
+            conv = compute_currency_conversion(t_cur, raw_amt, stored_rate)
+            norm_amt = _num(conv["counterpart_amount"])
+        else:
+            # Legacy transaction without historical counterpart and without historical rate:
+            # DO NOT fabricate rate or conversion. Omit from cross-currency aggregation.
+            norm_amt = 0.0
+
+        # Determine counterpart values for drilldown (preserve real historical data)
+        if stored_cp is not None:
+            drill_cp_amt = _num(stored_cp)
+            drill_cp_cur = cp_cur
+        elif stored_rate is not None and stored_rate > 0:
+            conv = compute_currency_conversion(t_cur, raw_amt, stored_rate)
+            drill_cp_amt = _num(conv["counterpart_amount"])
+            drill_cp_cur = conv["counterpart_currency"]
+        else:
+            drill_cp_amt = None
+            drill_cp_cur = None
+
         cat = t.get("category", "(tanpa kategori)")
         key = (typ, cat)
         g = groups.setdefault(key, {"type": typ, "category": cat, "total": 0.0, "count": 0, "classification": cls or ("revenue" if typ == "income" else "cost")})
-        g["total"] += amt; g["count"] += 1
+        g["total"] += norm_amt; g["count"] += 1
         if typ == "income":
-            totals["revenue" if cls in (None, "revenue") else "transfer_income"] += amt
+            totals["revenue" if cls in (None, "revenue") else "transfer_income"] += norm_amt
         else:
-            totals["cost" if cls in (None, "cost") else "transfer_expense"] += amt
+            totals["cost" if cls in (None, "cost") else "transfer_expense"] += norm_amt
             # Team wage aggregation directly from finance_transactions
             rec_id = t.get("recipient_employee_id")
             if rec_id and _is_wage_category(cat):
@@ -2854,17 +2887,35 @@ async def finance_statistics(period: str = "this_month", start: Optional[str] = 
                     "count": 0,
                     "transactions": []
                 })
-                tw["total"] += amt
+                tw["total"] += norm_amt
                 tw["count"] += 1
                 tw["transactions"].append({
                     "id": str(t["_id"]),
                     "date": t.get("date"),
-                    "amount": amt,
-                    "currency": currency,
+                    "amount": norm_amt,
+                    "currency": t_cur,
+                    "primary_amount": raw_amt,
+                    "primary_currency": t_cur,
+                    "counterpart_amount": drill_cp_amt,
+                    "counterpart_currency": drill_cp_cur,
+                    "exchange_rate": stored_rate,
+                    "normalized_amount": norm_amt,
+                    "normalized_currency": target_currency,
                     "category": cat,
                     "description": t.get("description") or "",
-                    "recorded_by_name": t.get("created_by_name") or "-"
+                    "recorded_by_name": t.get("created_by_name") or "-",
+                    "recipient_employee_id": rec_id,
+                    "recipient_employee_name": t.get("recipient_employee_name") or tw["name"]
                 })
+
+    for k in totals:
+        totals[k] = round(totals[k], 2)
+    totals["operating_profit"] = round(totals["revenue"] - totals["cost"], 2)
+    for g in groups.values():
+        g["total"] = round(g["total"], 2)
+    for tw in team_wages_map.values():
+        tw["total"] = round(tw["total"], 2)
+
     income = sorted([g for g in groups.values() if g["type"] == "income"], key=lambda x: x["total"], reverse=True)
     expense = sorted([g for g in groups.values() if g["type"] == "expense"], key=lambda x: x["total"], reverse=True)
     inc_sum = sum(g["total"] for g in income) or 1
@@ -2873,13 +2924,12 @@ async def finance_statistics(period: str = "this_month", start: Optional[str] = 
         g["pct"] = round(g["total"] / inc_sum * 100, 1)
     for g in expense:
         g["pct"] = round(g["total"] / exp_sum * 100, 1)
-    totals["operating_profit"] = totals["revenue"] - totals["cost"]
 
     # Enrich team_wages with latest role and name from db.admins
     admin_docs = {str(a["_id"]): a for a in await db.admins.find({}).to_list(200)}
     team_wages_list = []
     for rid, tw in team_wages_map.items():
-        if tw["total"] > 0:
+        if tw["total"] > 0 or tw["count"] > 0:
             adm = admin_docs.get(rid)
             if adm:
                 tw["name"] = adm.get("name") or tw["name"]
