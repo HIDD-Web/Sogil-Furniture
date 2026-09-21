@@ -373,6 +373,79 @@ def _num(v, default=0.0):
     except (TypeError, ValueError):
         return default
 
+# --------------------------------------------------------------------------
+# Unified Finance Currency Helpers
+# --------------------------------------------------------------------------
+def get_counterpart_currency(currency: str) -> str:
+    cur = (currency or "").strip().upper()
+    return "IDR" if cur == "EGP" else "EGP"
+
+def compute_currency_conversion(currency: str, amount: float, rate: float) -> dict:
+    """
+    Standard currency conversion between EGP and IDR.
+    - EGP is rounded to 2 decimal places.
+    - IDR is rounded to whole numbers (integer).
+    """
+    cur = (currency or "").strip().upper()
+    amt = _num(amount)
+    r = _num(rate)
+    if cur == "EGP":
+        cp_cur = "IDR"
+        cp_amt = round(amt * r) if r > 0 else 0
+        norm_primary = round(amt, 2)
+    else:  # IDR
+        cp_cur = "EGP"
+        cp_amt = round(amt / r, 2) if r > 0 else 0.0
+        norm_primary = round(amt)
+    return {
+        "primary_currency": cur,
+        "primary_amount": norm_primary,
+        "counterpart_currency": cp_cur,
+        "counterpart_amount": cp_amt,
+        "rate": r,
+    }
+
+def compute_primary_from_counterpart(currency: str, counterpart_amount: float, rate: float) -> dict:
+    """
+    Derives primary amount when counterpart is directly entered/modified.
+    - If primary is EGP (counterpart is IDR): primary = round(counterpart / rate, 2)
+    - If primary is IDR (counterpart is EGP): primary = round(counterpart * rate)
+    """
+    cur = (currency or "").strip().upper()
+    cp_amt = _num(counterpart_amount)
+    r = _num(rate)
+    if cur == "EGP":
+        primary_amt = round(cp_amt / r, 2) if r > 0 else 0.0
+        norm_cp = round(cp_amt)
+    else:  # IDR
+        primary_amt = round(cp_amt * r) if r > 0 else 0
+        norm_cp = round(cp_amt, 2)
+    return {
+        "primary_currency": cur,
+        "primary_amount": primary_amt,
+        "counterpart_currency": get_counterpart_currency(cur),
+        "counterpart_amount": norm_cp,
+        "rate": r,
+    }
+
+def resolve_transaction_rate(input_rate=None, existing_rate=None, settings_rate=357.0) -> float:
+    """
+    Resolves exchange rate with strict priority:
+    1. Explicit input rate (> 0) if provided.
+    2. Existing historical rate (> 0) if transaction already exists.
+    3. Settings rate fallback (> 0) for new transactions (default 357.0).
+    """
+    inp = _num(input_rate) if input_rate is not None else 0.0
+    if inp > 0:
+        return inp
+    ex = _num(existing_rate) if existing_rate is not None else 0.0
+    if ex > 0:
+        return ex
+    st = _num(settings_rate) if settings_rate is not None else 0.0
+    if st > 0:
+        return st
+    return 357.0
+
 def compute_item_price(product: dict, config: dict, quantity: int):
     pricing = product.get("pricing", {}) or {}
     category = product.get("category")
@@ -1078,23 +1151,22 @@ async def record_order_revenue(order):
         return
     now = datetime.now(timezone.utc).isoformat()
     total_le = _num(order.get("total_le"))
-    rate = _num(order.get("exchange_rate_idr_per_le"))
-    if not rate or rate <= 0:
-        rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    rate = resolve_transaction_rate(None, order.get("exchange_rate_idr_per_le"), settings_rate)
 
     pay_method = (order.get("payment_method") or "cash").lower()
     if pay_method == "transfer":
         primary_currency = "IDR"
         primary_account = "IDR"
-        primary_amount = round(total_le * rate)
-        counterpart_currency = "EGP"
-        counterpart_amount = total_le
+        conv = compute_currency_conversion("IDR", round(total_le * rate), rate)
     else:  # cash
         primary_currency = "EGP"
         primary_account = "EGP"
-        primary_amount = total_le
-        counterpart_currency = "IDR"
-        counterpart_amount = round(total_le * rate, 2)
+        conv = compute_currency_conversion("EGP", total_le, rate)
+
+    primary_amount = conv["primary_amount"]
+    counterpart_currency = conv["counterpart_currency"]
+    counterpart_amount = conv["counterpart_amount"]
 
     await db.finance_transactions.insert_one({
         "date": now, "type": "order_revenue", "category": "Penjualan",
@@ -1175,33 +1247,32 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
         if txn:
             if has_price_change or method_changed:
                 new_total = _num(order.get("total_le"))
-                txn_rate = _num(txn.get("exchange_rate")) or _num(order.get("exchange_rate_idr_per_le"))
-                if not txn_rate or txn_rate <= 0:
-                    txn_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+                settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+                txn_rate = resolve_transaction_rate(
+                    None,
+                    txn.get("exchange_rate") or order.get("exchange_rate_idr_per_le"),
+                    settings_rate
+                )
 
                 effective_method = (order.get("payment_method") or "cash").lower()
                 if effective_method == "transfer":
                     primary_cur = "IDR"
                     primary_acc = "IDR"
-                    primary_amt = round(new_total * txn_rate)
-                    cp_cur = "EGP"
-                    cp_amt = new_total
+                    conv = compute_currency_conversion("IDR", round(new_total * txn_rate), txn_rate)
                 else:  # cash
                     primary_cur = "EGP"
                     primary_acc = "EGP"
-                    primary_amt = new_total
-                    cp_cur = "IDR"
-                    cp_amt = round(new_total * txn_rate, 2)
+                    conv = compute_currency_conversion("EGP", new_total, txn_rate)
 
                 await db.finance_transactions.update_one(
                     {"_id": txn["_id"]},
                     {"$set": {
-                        "amount": primary_amt,
+                        "amount": conv["primary_amount"],
                         "currency": primary_cur,
                         "account": primary_acc,
                         "exchange_rate": txn_rate,
-                        "counterpart_amount": cp_amt,
-                        "counterpart_currency": cp_cur,
+                        "counterpart_amount": conv["counterpart_amount"],
+                        "counterpart_currency": conv["counterpart_currency"],
                         "payment_method": effective_method,
                         "updated_at": now_iso,
                         "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
@@ -1867,7 +1938,10 @@ async def finance_list(currency: Optional[str] = None, type: Optional[str] = Non
         ors = [{"description": rx}, {"category": rx}, {"type": rx}, {"classification": rx},
                {"created_by_name": rx}, {"recipient_employee_name": rx}]
         try:
-            ors.append({"amount": float(qs)})
+            val = float(qs)
+            ors.append({"amount": val})
+            ors.append({"from_amount": val})
+            ors.append({"to_amount": val})
         except ValueError:
             pass
         conds.append({"$or": ors})
@@ -1896,32 +1970,19 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
     classification = await category_classification(data.category, data.type)
 
     settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-    if data.exchange_rate is not None and _num(data.exchange_rate) > 0:
-        rate = _num(data.exchange_rate)
-    else:
-        rate = settings_rate
+    rate = resolve_transaction_rate(data.exchange_rate, None, settings_rate)
 
     primary_amt = _num(data.amount)
-    if data.currency == "EGP":
-        counterpart_cur = "IDR"
-        if data.counterpart_amount is not None and _num(data.counterpart_amount) > 0 and primary_amt == 0:
-            primary_amt = round(_num(data.counterpart_amount) / rate, 2) if rate > 0 else 0.0
-            counterpart_amt = round(_num(data.counterpart_amount), 2)
-        else:
-            counterpart_amt = round(primary_amt * rate, 2)
+    if data.counterpart_amount is not None and _num(data.counterpart_amount) > 0 and primary_amt == 0:
+        conv = compute_primary_from_counterpart(data.currency, data.counterpart_amount, rate)
     else:
-        counterpart_cur = "EGP"
-        if data.counterpart_amount is not None and _num(data.counterpart_amount) > 0 and primary_amt == 0:
-            primary_amt = round(_num(data.counterpart_amount) * rate, 2)
-            counterpart_amt = round(_num(data.counterpart_amount), 2)
-        else:
-            counterpart_amt = round(primary_amt / rate, 2) if rate > 0 else 0.0
+        conv = compute_currency_conversion(data.currency, primary_amt, rate)
 
     doc = {"date": data.date or now, "type": data.type, "category": data.category,
-           "amount": primary_amt, "currency": data.currency, "account": data.currency,
+           "amount": conv["primary_amount"], "currency": data.currency, "account": data.currency,
            "exchange_rate": rate,
-           "counterpart_amount": counterpart_amt,
-           "counterpart_currency": counterpart_cur,
+           "counterpart_amount": conv["counterpart_amount"],
+           "counterpart_currency": conv["counterpart_currency"],
            "classification": classification,
            "description": data.description or "", "related_order_id": None,
            "created_by_id": admin.get("id"), "created_by_name": admin.get("name"),
@@ -1937,7 +1998,7 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
     tid = str(result.inserted_id)
     if doc.get("recipient_employee_id"):
         await db.employee_wages.insert_one({"employee_id": doc["recipient_employee_id"], "employee_name": doc["recipient_employee_name"],
-            "amount": primary_amt, "currency": data.currency, "date": doc["date"], "category": data.category,
+            "amount": conv["primary_amount"], "currency": data.currency, "date": doc["date"], "category": data.category,
             "description": data.description or "", "transaction_id": tid, "recorded_by_name": admin.get("name"), "created_at": now})
     return clean(await db.finance_transactions.find_one({"_id": result.inserted_id}))
 
@@ -1951,12 +2012,7 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
 
     existing_rate = _num(t.get("exchange_rate"))
     settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-    base_rate = existing_rate if (existing_rate and existing_rate > 0) else settings_rate
-
-    if data.exchange_rate is not None and _num(data.exchange_rate) > 0:
-        rate = _num(data.exchange_rate)
-    else:
-        rate = base_rate
+    rate = resolve_transaction_rate(data.exchange_rate, existing_rate, settings_rate)
 
     existing_amt = _num(t.get("amount"))
     existing_cp = _num(t.get("counterpart_amount"))
@@ -1964,28 +2020,15 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     input_cp = _num(data.counterpart_amount) if data.counterpart_amount is not None else None
 
     if input_cp is not None and input_amt == existing_amt and input_cp != existing_cp:
-        if data.currency == "EGP":
-            primary_amt = round(input_cp / rate, 2) if rate > 0 else 0.0
-            counterpart_amt = input_cp
-            counterpart_cur = "IDR"
-        else:
-            primary_amt = round(input_cp * rate, 2)
-            counterpart_amt = input_cp
-            counterpart_cur = "EGP"
+        conv = compute_primary_from_counterpart(data.currency, input_cp, rate)
     else:
-        primary_amt = input_amt
-        if data.currency == "EGP":
-            counterpart_cur = "IDR"
-            counterpart_amt = round(primary_amt * rate, 2)
-        else:
-            counterpart_cur = "EGP"
-            counterpart_amt = round(primary_amt / rate, 2) if rate > 0 else 0.0
+        conv = compute_currency_conversion(data.currency, input_amt, rate)
 
     upd = {"date": data.date or t.get("date"), "type": data.type, "category": data.category,
-           "amount": primary_amt, "currency": data.currency, "account": data.currency,
+           "amount": conv["primary_amount"], "currency": data.currency, "account": data.currency,
            "exchange_rate": rate,
-           "counterpart_amount": counterpart_amt,
-           "counterpart_currency": counterpart_cur,
+           "counterpart_amount": conv["counterpart_amount"],
+           "counterpart_currency": conv["counterpart_currency"],
            "classification": await category_classification(data.category, data.type),
            "description": data.description or "", "updated_by_name": admin.get("name"),
            "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -2003,7 +2046,7 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     await db.employee_wages.delete_many({"transaction_id": txn_id})
     if upd["recipient_employee_id"]:
         await db.employee_wages.insert_one({"employee_id": upd["recipient_employee_id"], "employee_name": upd["recipient_employee_name"],
-            "amount": primary_amt, "currency": data.currency, "date": upd["date"], "category": data.category,
+            "amount": conv["primary_amount"], "currency": data.currency, "date": upd["date"], "category": data.category,
             "description": data.description or "", "transaction_id": txn_id, "recorded_by_name": admin.get("name"),
             "created_at": datetime.now(timezone.utc).isoformat()})
     return clean(await db.finance_transactions.find_one({"_id": id_query(txn_id)}))
@@ -2267,22 +2310,16 @@ async def balance_adjust(payload: Dict[str, Any], admin: dict = Depends(require_
     delta = new_balance - prev
     now = datetime.now(timezone.utc).isoformat()
 
-    rate = _num(payload.get("exchange_rate"))
-    if not rate or rate <= 0:
-        rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    rate = resolve_transaction_rate(payload.get("exchange_rate"), None, settings_rate)
 
-    if account == "EGP":
-        counterpart_cur = "IDR"
-        counterpart_amt = round(delta * rate, 2)
-    else:
-        counterpart_cur = "EGP"
-        counterpart_amt = round(delta / rate, 2) if rate > 0 else 0.0
+    conv = compute_currency_conversion(account, delta, rate)
 
     doc = {"date": payload.get("date") or now, "type": "balance_adjustment", "category": "Penyesuaian Saldo",
-           "amount": delta, "currency": account, "account": account, "previous_balance": prev, "new_balance": new_balance,
+           "amount": conv["primary_amount"], "currency": account, "account": account, "previous_balance": prev, "new_balance": new_balance,
            "exchange_rate": rate,
-           "counterpart_amount": counterpart_amt,
-           "counterpart_currency": counterpart_cur,
+           "counterpart_amount": conv["counterpart_amount"],
+           "counterpart_currency": conv["counterpart_currency"],
            "description": payload.get("description", ""), "created_by_name": admin.get("name"),
            "created_at": now, "updated_at": now}
     await db.finance_transactions.insert_one(doc)

@@ -12,10 +12,13 @@ import { toast } from "sonner";
 
 const money = (v, cur) => {
   const n = Number(v) || 0;
+  if (cur === "IDR") {
+    return "Rp " + Math.round(n).toLocaleString("de-DE");
+  }
   const formatted = n % 1 !== 0
     ? n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
     : Math.round(n).toLocaleString("de-DE");
-  return (cur === "IDR" ? "Rp " : "") + formatted + (cur === "EGP" ? " LE" : "");
+  return formatted + (cur === "EGP" ? " LE" : "");
 };
 const PERIODS = [["this_month", "Bulan Ini"], ["last_month", "Bulan Lalu"], ["this_year", "Tahun Ini"], ["last_year", "Tahun Lalu"], ["custom", "Kustom"]];
 
