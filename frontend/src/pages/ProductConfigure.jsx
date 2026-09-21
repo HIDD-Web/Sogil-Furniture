@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import api, { imgUrl } from "../lib/api";
 import { fmtLE, fmtIDR } from "../lib/format";
@@ -54,8 +54,10 @@ export default function ProductConfigure() {
   const [config, setConfig] = useState({ custom_size: false });
   const [quantity, setQuantity] = useState(1);
   const [customNote, setCustomNote] = useState("");
+  const isInitializedRef = useRef(false);
 
   useEffect(() => {
+    isInitializedRef.current = false;
     Promise.all([api.get(`/products/${slug}`), api.get("/store-info")]).then(([p, s]) => {
       setProduct(p.data); setStore(s.data);
       const pr = p.data.pricing || {};
@@ -97,6 +99,7 @@ export default function ProductConfigure() {
       });
 
       setConfig(init);
+      isInitializedRef.current = true;
     }).catch(() => toast.error(t("err.product_not_found")));
   }, [slug, searchParams, t]);
 
@@ -119,6 +122,33 @@ export default function ProductConfigure() {
       return next;
     });
   };
+
+  useEffect(() => {
+    if (!isInitializedRef.current || !product || !config) return;
+
+    const params = new URLSearchParams();
+    Object.entries(config).forEach(([key, val]) => {
+      if (key === "custom_size" || key === "custom_note" || key.startsWith("_")) {
+        return;
+      }
+      if (val === null || val === undefined) return;
+      if (typeof val !== "string" && typeof val !== "number" && typeof val !== "boolean") {
+        return;
+      }
+      const strVal = String(val).trim();
+      if (strVal.length > 0 && strVal !== "[object Object]") {
+        params.set(key, strVal);
+      }
+    });
+
+    const qs = params.toString();
+    const newUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}`;
+    const currentUrl = `${window.location.pathname}${window.location.search}`;
+
+    if (newUrl !== currentUrl) {
+      window.history.replaceState(null, "", newUrl);
+    }
+  }, [config, product]);
   const [gidx, setGidx] = useState(0);
   useEffect(() => { setGidx(0); }, [photoMatch.photo?.id]);
 
