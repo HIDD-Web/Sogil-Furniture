@@ -9,6 +9,7 @@ import { CartProvider } from "./context/CartContext";
 import { CustomerProvider } from "./context/CustomerContext";
 import { Header } from "./components/Header";
 import { Footer } from "./components/Footer";
+import { BottomNav } from "./components/BottomNav";
 
 import Home from "./pages/Home";
 import Catalog from "./pages/Catalog";
@@ -44,12 +45,21 @@ import CustomOrderPage from "./pages/CustomOrderPage";
 
 function CustomerShell({ children }) {
   const [store, setStore] = useState(null);
+  const location = useLocation();
   useEffect(() => { api.get("/store-info").then((r) => setStore(r.data)).catch(() => {}); }, []);
+
+  const isConfigurator =
+    location.pathname.startsWith("/produk/") &&
+    !location.pathname.startsWith("/produk/kategori/");
+  const isCheckout = location.pathname === "/checkout";
+  const hideBottomNav = isConfigurator || isCheckout;
+
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className={`flex min-h-screen flex-col ${hideBottomNav ? "" : "pb-16 md:pb-0"}`}>
       <Header storeInfo={store} />
       <div className="flex-1">{children}</div>
       <Footer storeInfo={store} />
+      {!hideBottomNav && <BottomNav />}
     </div>
   );
 }
