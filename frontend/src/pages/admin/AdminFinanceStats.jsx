@@ -69,11 +69,14 @@ export default function AdminFinanceStats() {
         ))}
       </div>
 
-      {/* DATA UPAH TIM */}
+      <Table title="Pemasukan per Kategori" rows={data?.income} cur={currency} />
+      <Table title="Pengeluaran per Kategori" rows={data?.expense} cur={currency} />
+
+      {/* Keuangan Tim */}
       <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm" data-testid="team-wages-card">
         <div className="mb-2 flex items-center justify-between">
           <div className="font-heading font-bold text-[#2C1E16] text-base sm:text-lg">
-            DATA UPAH TIM
+            Keuangan Tim
           </div>
           <span className="text-xs text-[#8B7355]">
             Urutan: Total Terbesar ↓ Terkecil
@@ -129,9 +132,6 @@ export default function AdminFinanceStats() {
           </div>
         )}
       </div>
-
-      <Table title="Pemasukan per Kategori" rows={data?.income} cur={currency} />
-      <Table title="Pengeluaran per Kategori" rows={data?.expense} cur={currency} />
 
       {/* Drilldown Modal: Riwayat Transaksi Upah Akun */}
       {selectedMember && (
