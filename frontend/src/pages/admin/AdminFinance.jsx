@@ -26,7 +26,6 @@ export default function AdminFinance() {
   const [chart, setChart] = useState({ currency: "EGP", year: new Date().getFullYear(), data: [] });
   const [customCats, setCustomCats] = useState([]);
   const [employees, setEmployees] = useState([]);
-  const [wages, setWages] = useState([]);
   const [txnSearch, setTxnSearch] = useState("");
   const [txnInput, setTxnInput] = useState("");
 
@@ -42,7 +41,6 @@ export default function AdminFinance() {
     api.get("/admin/finance/categories").then((r) => setCats(r.data));
     api.get("/admin/finance/custom-categories").then((r) => setCustomCats(r.data)).catch(() => {});
     api.get("/admin/employees").then((r) => setEmployees(r.data)).catch(() => {});
-    api.get("/admin/employees/wages").then((r) => setWages(r.data)).catch(() => {});
   };
   useEffect(() => { loadConfig(); }, []);
   useEffect(() => { loadTxns(); }, [txnSearch]);
@@ -129,9 +127,21 @@ export default function AdminFinance() {
             <Select value={form.type} onValueChange={(v) => setForm({ ...form, type: v, category: "" })}><SelectTrigger data-testid="txn-type" className="bg-white text-xs sm:text-sm"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="income">Pemasukan</SelectItem><SelectItem value="expense">Pengeluaran</SelectItem></SelectContent></Select>
             <Select value={form.currency} onValueChange={(v) => setForm({ ...form, currency: v })}><SelectTrigger data-testid="txn-currency" className="bg-white text-xs sm:text-sm"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="EGP">EGP</SelectItem><SelectItem value="IDR">IDR</SelectItem></SelectContent></Select>
           </div>
-          <Select value={form.category} onValueChange={(v) => setForm({ ...form, category: v })}><SelectTrigger data-testid="txn-category" className="mt-2 bg-white text-xs sm:text-sm"><SelectValue placeholder="Kategori" /></SelectTrigger><SelectContent>{(cats[form.type] || []).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent></Select>
-          {form.type === "expense" && /upah|wage/i.test(form.category) && (
-            <Select value={form.recipient_employee_id} onValueChange={(v) => setForm({ ...form, recipient_employee_id: v })}><SelectTrigger data-testid="txn-recipient" className="mt-2 bg-white text-xs sm:text-sm"><SelectValue placeholder="Penerima (Karyawan) — opsional" /></SelectTrigger><SelectContent>{employees.length ? employees.map((e) => <SelectItem key={e.id} value={e.id}>{e.name}</SelectItem>) : <div className="px-2 py-1.5 text-xs text-[#8B7355]">Belum ada akun karyawan</div>}</SelectContent></Select>
+          <Select value={form.category} onValueChange={(v) => setForm({ ...form, category: v, recipient_employee_id: "" })}><SelectTrigger data-testid="txn-category" className="mt-2 bg-white text-xs sm:text-sm"><SelectValue placeholder="Kategori" /></SelectTrigger><SelectContent>{(cats[form.type] || []).map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent></Select>
+          {form.type === "expense" && /upah|wage|pekerja/i.test(form.category) && (
+            <Select value={form.recipient_employee_id || "_none"} onValueChange={(v) => setForm({ ...form, recipient_employee_id: v === "_none" ? "" : v })}>
+              <SelectTrigger data-testid="txn-recipient" className="mt-2 bg-white text-xs sm:text-sm">
+                <SelectValue placeholder="Penerima Upah (opsional)" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="_none">Tanpa Penerima (Umum)</SelectItem>
+                {employees.map((e) => (
+                  <SelectItem key={e.id} value={e.id}>
+                    {e.name} ({e.role === "owner" ? "Owner" : e.role === "manager" ? "Manager" : e.role === "admin" ? "Admin" : "Employee"})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           )}
           <Input type="number" placeholder="Jumlah" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} data-testid="txn-amount" className="mt-2 bg-white text-xs sm:text-sm" />
           <Textarea placeholder="Deskripsi (opsional)" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="mt-2 bg-white text-xs sm:text-sm" />
@@ -208,30 +218,6 @@ export default function AdminFinance() {
           )}
         </div>
       </div>
-
-      {/* Employee wages */}
-      {wages.length > 0 && (
-        <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-5 shadow-xs" data-testid="wage-summary">
-          <div className="mb-3 font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Upah Karyawan</div>
-          <div className="space-y-2.5">
-            {wages.map((w) => (
-              <div key={w.id} className="rounded-xl border border-[#F1EBE0] p-2.5 sm:p-3" data-testid={`wage-emp-${w.id}`}>
-                <div className="flex items-center justify-between">
-                  <div className="font-medium text-xs sm:text-sm text-[#2C1E16]">{w.name}</div>
-                  <div className="text-xs sm:text-sm font-semibold text-[#8B5A2B]">{Object.entries(w.totals).map(([c, v]) => money(v, c)).join(" · ") || "—"}</div>
-                </div>
-                {w.history.length > 0 && (
-                  <div className="mt-2 space-y-1 text-[11px] sm:text-xs text-[#8B7355]">
-                    {w.history.slice(0, 5).map((h) => (
-                      <div key={h.id} className="flex justify-between"><span>{(h.date || "").slice(0, 10)} · oleh {h.recorded_by_name || "-"}</span><span className="font-medium text-[#5C4A3D]">{money(h.amount, h.currency)}</span></div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {/* Transactions list */}
       <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-5 shadow-xs">

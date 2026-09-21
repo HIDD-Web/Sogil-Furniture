@@ -2092,27 +2092,49 @@ async def delete_custom_category(cid: str, admin: dict = Depends(require_perm("a
 
 @api_router.get("/admin/employees")
 async def list_employees(admin: dict = Depends(require_perm("access_finance"))):
-    return [clean(a) for a in await db.admins.find({"role": "employee", "status": {"$ne": "inactive"}}).to_list(200)]
+    return [clean(a) for a in await db.admins.find({"status": {"$ne": "inactive"}}).sort("name", 1).to_list(200)]
 
 @api_router.get("/admin/employees/wages")
 async def employee_wages_summary(admin: dict = Depends(require_perm("access_finance"))):
     now = datetime.now(timezone.utc)
     mkey = now.strftime("%Y-%m"); ykey = now.strftime("%Y")
     out = []
-    for e in await db.admins.find({"role": "employee"}).to_list(200):
+    for e in await db.admins.find({}).sort("name", 1).to_list(200):
         eid = str(e["_id"])
-        wages = await db.employee_wages.find({"employee_id": eid}).sort("date", -1).to_list(500)
+        # Source of truth: finance_transactions
+        txns = await db.finance_transactions.find({
+            "type": "expense",
+            "recipient_employee_id": eid
+        }).sort("date", -1).to_list(1000)
+
+        # Fallback to employee_wages mirror if no transactions found (for legacy compatibility)
+        if not txns:
+            txns = await db.employee_wages.find({"employee_id": eid}).sort("date", -1).to_list(500)
+
         totals, month, year = {}, {}, {}
-        for w in wages:
+        history = []
+        for w in txns:
+            if not _is_wage_category(w.get("category", "")):
+                continue
             c = w.get("currency", "EGP"); amt = _num(w.get("amount")); d = (w.get("date") or "")
             totals[c] = totals.get(c, 0) + amt
             if d[:7] == mkey:
                 month[c] = month.get(c, 0) + amt
             if d[:4] == ykey:
                 year[c] = year.get(c, 0) + amt
+            history.append({
+                "id": str(w["_id"]),
+                "amount": amt,
+                "currency": c,
+                "date": d,
+                "category": w.get("category", "Pekerja"),
+                "description": w.get("description", ""),
+                "recorded_by_name": w.get("recorded_by_name") or w.get("created_by_name") or "-",
+                "created_at": w.get("created_at")
+            })
         out.append({"id": eid, "name": e.get("name"), "email": e.get("email"), "role": e.get("role"),
                     "status": e.get("status", "active"), "totals": totals, "month": month, "year": year,
-                    "count": len(wages), "history": [clean(w) for w in wages]})
+                    "count": len(history), "history": history})
     return out
 
 @api_router.post("/admin/finance/balance-adjust")
@@ -2636,6 +2658,7 @@ async def finance_statistics(period: str = "this_month", start: Optional[str] = 
             q["date"]["$lte"] = e
     groups = {}
     totals = {"revenue": 0.0, "transfer_income": 0.0, "cost": 0.0, "transfer_expense": 0.0}
+    team_wages_map = {}
     async for t in db.finance_transactions.find(q):
         typ = t.get("type"); amt = _num(t.get("amount")); cls = t.get("classification")
         if typ == "order_revenue":
@@ -2650,6 +2673,27 @@ async def finance_statistics(period: str = "this_month", start: Optional[str] = 
             totals["revenue" if cls in (None, "revenue") else "transfer_income"] += amt
         else:
             totals["cost" if cls in (None, "cost") else "transfer_expense"] += amt
+            # Team wage aggregation directly from finance_transactions
+            rec_id = t.get("recipient_employee_id")
+            if rec_id and _is_wage_category(cat):
+                tw = team_wages_map.setdefault(rec_id, {
+                    "id": rec_id,
+                    "name": t.get("recipient_employee_name") or "Akun Tim",
+                    "total": 0.0,
+                    "count": 0,
+                    "transactions": []
+                })
+                tw["total"] += amt
+                tw["count"] += 1
+                tw["transactions"].append({
+                    "id": str(t["_id"]),
+                    "date": t.get("date"),
+                    "amount": amt,
+                    "currency": currency,
+                    "category": cat,
+                    "description": t.get("description") or "",
+                    "recorded_by_name": t.get("created_by_name") or "-"
+                })
     income = sorted([g for g in groups.values() if g["type"] == "income"], key=lambda x: x["total"], reverse=True)
     expense = sorted([g for g in groups.values() if g["type"] == "expense"], key=lambda x: x["total"], reverse=True)
     inc_sum = sum(g["total"] for g in income) or 1
@@ -2659,8 +2703,27 @@ async def finance_statistics(period: str = "this_month", start: Optional[str] = 
     for g in expense:
         g["pct"] = round(g["total"] / exp_sum * 100, 1)
     totals["operating_profit"] = totals["revenue"] - totals["cost"]
+
+    # Enrich team_wages with latest role and name from db.admins
+    admin_docs = {str(a["_id"]): a for a in await db.admins.find({}).to_list(200)}
+    team_wages_list = []
+    for rid, tw in team_wages_map.items():
+        if tw["total"] > 0:
+            adm = admin_docs.get(rid)
+            if adm:
+                tw["name"] = adm.get("name") or tw["name"]
+                tw["role"] = adm.get("role", "employee")
+            else:
+                tw["role"] = "employee"
+            # Sort transaction history by date descending
+            tw["transactions"].sort(key=lambda x: x.get("date") or "", reverse=True)
+            team_wages_list.append(tw)
+
+    # Sort primarily by total DESC (highest wage recipient first)
+    team_wages_list.sort(key=lambda x: x["total"], reverse=True)
+
     return {"currency": currency, "period": period, "range": {"start": s, "end": e},
-            "income": income, "expense": expense, "totals": totals}
+            "income": income, "expense": expense, "totals": totals, "team_wages": team_wages_list}
 
 @api_router.post("/customer/change-password")
 async def customer_change_password(payload: Dict[str, Any], c: dict = Depends(get_current_customer)):

@@ -292,15 +292,15 @@ export default function AdminAdmins() {
                   )}
                 </div>
                 <div className="text-xs text-[#8B7355] mt-0.5">{a.email}</div>
-                {a.role === "employee" && wageMap[a.id] && (
-                  <div className="mt-1 text-xs text-[#8B5A2B]" data-testid={`admin-wage-${a.id}`}>
-                    Total Upah:{" "}
-                    {Object.entries(wageMap[a.id].totals || {})
-                      .map(([c, v]) => `${Math.round(v).toLocaleString("de-DE")} ${c}`)
-                      .join(" · ") || "—"}{" "}
-                    ({wageMap[a.id].count || 0}x)
-                  </div>
-                )}
+                <div className="mt-1 text-xs text-[#8B5A2B]" data-testid={`admin-wage-${a.id}`}>
+                  Total Upah Diterima:{" "}
+                  {wageMap[a.id] && Object.entries(wageMap[a.id].totals || {}).length > 0
+                    ? Object.entries(wageMap[a.id].totals)
+                        .map(([c, v]) => `${Math.round(v).toLocaleString("de-DE")} ${c}`)
+                        .join(" · ")
+                    : "0 LE"}{" "}
+                  ({wageMap[a.id]?.count || 0}x)
+                </div>
               </div>
 
               {a.role !== "owner" && (
