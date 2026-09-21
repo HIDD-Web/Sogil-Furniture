@@ -106,11 +106,13 @@ export default function AdminOrderDetail() {
 
       <div className="mt-6 grid gap-4 lg:grid-cols-2">
         <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm lg:col-span-2">
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-3">
             <div><Label className="mb-1.5 block text-sm font-semibold">Status Pesanan</Label>
               <Select value={order.order_status} onValueChange={(v) => update({ order_status: v })}><SelectTrigger data-testid="select-order-status" className="h-11 bg-white"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(ORDER_STATUS).map(([k, v]) => <SelectItem key={k} value={k}>{v.label}</SelectItem>)}</SelectContent></Select></div>
             <div><Label className="mb-1.5 block text-sm font-semibold">Status Pembayaran</Label>
               <Select value={order.payment_status} onValueChange={(v) => update({ payment_status: v })}><SelectTrigger data-testid="select-payment-status" className="h-11 bg-white"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(PAYMENT_STATUS).map(([k, v]) => <SelectItem key={k} value={k}>{v.label}</SelectItem>)}</SelectContent></Select></div>
+            <div><Label className="mb-1.5 block text-sm font-semibold">Metode Pembayaran</Label>
+              <Select value={order.payment_method || "cash"} onValueChange={(v) => update({ payment_method: v })}><SelectTrigger data-testid="select-payment-method" className="h-11 bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="cash">Cash (Tunai — EGP)</SelectItem><SelectItem value="transfer">Transfer (IDR)</SelectItem></SelectContent></Select></div>
           </div>
           <div className="mt-4"><Label className="mb-1.5 block text-sm font-semibold">Catatan Admin</Label>
             <Textarea value={note} onChange={(e) => setNote(e.target.value)} data-testid="admin-note-input" className="min-h-[70px] bg-white" />
@@ -179,6 +181,24 @@ export default function AdminOrderDetail() {
             <Row k="Total LE" v={<span className="font-bold text-[#8B5A2B]">{fmtLE(order.total_le)} LE</span>} />
             <Row k="Rate" v={`Rp${fmtLE(order.exchange_rate_idr_per_le)}/LE`} />
             <Row k="Estimasi IDR" v={fmtIDR(order.estimated_total_idr)} />
+            <div className="mt-2 pt-2 border-t border-[#F1EBE0]">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-[#8B7355]">Kas Keuangan Masuk:</span>
+                <span className="font-bold text-[#2C1E16]" data-testid="order-real-revenue">
+                  {order.payment_method === "transfer"
+                    ? `${fmtIDR(order.estimated_total_idr)} (IDR)`
+                    : `${fmtLE(order.total_le)} LE (EGP)`}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-[#8B7355] mt-0.5">
+                <span>Nilai Referensi:</span>
+                <span data-testid="order-counterpart-ref">
+                  {order.payment_method === "transfer"
+                    ? `≈ ${fmtLE(order.total_le)} LE (EGP)`
+                    : `≈ ${fmtIDR(order.estimated_total_idr)} (IDR)`}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -193,7 +213,14 @@ export default function AdminOrderDetail() {
         )}
 
         <Block title="Pembayaran & Pengiriman">
-          <Row k="Metode Bayar" v={order.payment_method === "transfer" ? "Transfer" : "Cash"} />
+          <Row
+            k="Metode Bayar"
+            v={
+              <span className="font-medium">
+                {order.payment_method === "transfer" ? "Transfer (Kas IDR)" : "Cash (Kas EGP)"}
+              </span>
+            }
+          />
           <Row k="Status Bayar" v={PAYMENT_STATUS[order.payment_status]?.label} />
           <Row k="Pengiriman" v={order.delivery_method === "delivery" ? "Delivery" : "Ambil di Toko"} />
           {order.delivery_zone_name && <Row k="Zona" v={order.delivery_zone_name} />}

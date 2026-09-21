@@ -260,6 +260,7 @@ class OrderInput(BaseModel):
 class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
     payment_status: Optional[str] = None
+    payment_method: Optional[str] = None
     admin_note: Optional[str] = None
     subtotal_le: Optional[float] = None
     delivery_fee_le: Optional[float] = None
@@ -1080,15 +1081,28 @@ async def record_order_revenue(order):
     rate = _num(order.get("exchange_rate_idr_per_le"))
     if not rate or rate <= 0:
         rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-    counterpart_idr = _num(order.get("estimated_total_idr"))
-    if not counterpart_idr or counterpart_idr <= 0:
-        counterpart_idr = round(total_le * rate, 2)
+
+    pay_method = (order.get("payment_method") or "cash").lower()
+    if pay_method == "transfer":
+        primary_currency = "IDR"
+        primary_account = "IDR"
+        primary_amount = round(total_le * rate)
+        counterpart_currency = "EGP"
+        counterpart_amount = total_le
+    else:  # cash
+        primary_currency = "EGP"
+        primary_account = "EGP"
+        primary_amount = total_le
+        counterpart_currency = "IDR"
+        counterpart_amount = round(total_le * rate, 2)
+
     await db.finance_transactions.insert_one({
         "date": now, "type": "order_revenue", "category": "Penjualan",
-        "amount": total_le, "currency": "EGP", "account": "EGP",
+        "amount": primary_amount, "currency": primary_currency, "account": primary_account,
         "exchange_rate": rate,
-        "counterpart_amount": counterpart_idr,
-        "counterpart_currency": "IDR",
+        "counterpart_amount": counterpart_amount,
+        "counterpart_currency": counterpart_currency,
+        "payment_method": pay_method,
         "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')}",
         "related_order_id": str(order["_id"]), "created_by_name": "Sistem",
         "created_at": now, "updated_at": now,
@@ -1099,6 +1113,7 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
     update = audit_fields(admin)
     valid_status = {"pesanan_masuk", "dikonfirmasi", "diproses", "siap", "selesai", "dibatalkan"}
     valid_pay = {"belum_dibayar", "dp", "lunas"}
+    valid_methods = {"cash", "transfer"}
 
     existing_order = await db.orders.find_one({"_id": id_query(order_id)})
     if not existing_order:
@@ -1112,6 +1127,10 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
         if data.payment_status not in valid_pay:
             raise HTTPException(status_code=400, detail="Status pembayaran tidak valid")
         update["payment_status"] = data.payment_status
+    if data.payment_method is not None:
+        if data.payment_method not in valid_methods:
+            raise HTTPException(status_code=400, detail="Metode pembayaran tidak valid")
+        update["payment_method"] = data.payment_method
     if data.admin_note is not None:
         update["admin_note"] = data.admin_note
 
@@ -1148,24 +1167,42 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
     await db.orders.update_one({"_id": id_query(order_id)}, {"$set": update})
     order = await db.orders.find_one({"_id": id_query(order_id)})
     effective_pay = data.payment_status if data.payment_status is not None else order.get("payment_status")
+    method_changed = data.payment_method is not None and data.payment_method != existing_order.get("payment_method")
 
     if effective_pay == "lunas":
         now_iso = datetime.now(timezone.utc).isoformat()
         txn = await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
         if txn:
-            if has_price_change:
+            if has_price_change or method_changed:
                 new_total = _num(order.get("total_le"))
                 txn_rate = _num(txn.get("exchange_rate")) or _num(order.get("exchange_rate_idr_per_le"))
                 if not txn_rate or txn_rate <= 0:
                     txn_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-                recomputed_cp = round(new_total * txn_rate, 2)
+
+                effective_method = (order.get("payment_method") or "cash").lower()
+                if effective_method == "transfer":
+                    primary_cur = "IDR"
+                    primary_acc = "IDR"
+                    primary_amt = round(new_total * txn_rate)
+                    cp_cur = "EGP"
+                    cp_amt = new_total
+                else:  # cash
+                    primary_cur = "EGP"
+                    primary_acc = "EGP"
+                    primary_amt = new_total
+                    cp_cur = "IDR"
+                    cp_amt = round(new_total * txn_rate, 2)
+
                 await db.finance_transactions.update_one(
                     {"_id": txn["_id"]},
                     {"$set": {
-                        "amount": new_total,
+                        "amount": primary_amt,
+                        "currency": primary_cur,
+                        "account": primary_acc,
                         "exchange_rate": txn_rate,
-                        "counterpart_amount": recomputed_cp,
-                        "counterpart_currency": "IDR",
+                        "counterpart_amount": cp_amt,
+                        "counterpart_currency": cp_cur,
+                        "payment_method": effective_method,
                         "updated_at": now_iso,
                         "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
                     }}
