@@ -324,6 +324,8 @@ class FinanceTxnInput(BaseModel):
     currency: str  # IDR | EGP
     description: Optional[str] = ""
     recipient_employee_id: Optional[str] = None
+    exchange_rate: Optional[float] = None
+    counterpart_amount: Optional[float] = None
 
 class TransferInput(BaseModel):
     date: Optional[str] = None
@@ -1074,9 +1076,19 @@ async def record_order_revenue(order):
     if await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"}):
         return
     now = datetime.now(timezone.utc).isoformat()
+    total_le = _num(order.get("total_le"))
+    rate = _num(order.get("exchange_rate_idr_per_le"))
+    if not rate or rate <= 0:
+        rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    counterpart_idr = _num(order.get("estimated_total_idr"))
+    if not counterpart_idr or counterpart_idr <= 0:
+        counterpart_idr = round(total_le * rate, 2)
     await db.finance_transactions.insert_one({
         "date": now, "type": "order_revenue", "category": "Penjualan",
-        "amount": _num(order.get("total_le")), "currency": "EGP", "account": "EGP",
+        "amount": total_le, "currency": "EGP", "account": "EGP",
+        "exchange_rate": rate,
+        "counterpart_amount": counterpart_idr,
+        "counterpart_currency": "IDR",
         "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')}",
         "related_order_id": str(order["_id"]), "created_by_name": "Sistem",
         "created_at": now, "updated_at": now,
@@ -1142,10 +1154,18 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
         txn = await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
         if txn:
             if has_price_change:
+                new_total = _num(order.get("total_le"))
+                txn_rate = _num(txn.get("exchange_rate")) or _num(order.get("exchange_rate_idr_per_le"))
+                if not txn_rate or txn_rate <= 0:
+                    txn_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+                recomputed_cp = round(new_total * txn_rate, 2)
                 await db.finance_transactions.update_one(
                     {"_id": txn["_id"]},
                     {"$set": {
-                        "amount": _num(order.get("total_le")),
+                        "amount": new_total,
+                        "exchange_rate": txn_rate,
+                        "counterpart_amount": recomputed_cp,
+                        "counterpart_currency": "IDR",
                         "updated_at": now_iso,
                         "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
                     }}
@@ -1837,8 +1857,34 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
         raise HTTPException(status_code=400, detail="Mata uang tidak valid")
     now = datetime.now(timezone.utc).isoformat()
     classification = await category_classification(data.category, data.type)
+
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    if data.exchange_rate is not None and _num(data.exchange_rate) > 0:
+        rate = _num(data.exchange_rate)
+    else:
+        rate = settings_rate
+
+    primary_amt = _num(data.amount)
+    if data.currency == "EGP":
+        counterpart_cur = "IDR"
+        if data.counterpart_amount is not None and _num(data.counterpart_amount) > 0 and primary_amt == 0:
+            primary_amt = round(_num(data.counterpart_amount) / rate, 2) if rate > 0 else 0.0
+            counterpart_amt = round(_num(data.counterpart_amount), 2)
+        else:
+            counterpart_amt = round(primary_amt * rate, 2)
+    else:
+        counterpart_cur = "EGP"
+        if data.counterpart_amount is not None and _num(data.counterpart_amount) > 0 and primary_amt == 0:
+            primary_amt = round(_num(data.counterpart_amount) * rate, 2)
+            counterpart_amt = round(_num(data.counterpart_amount), 2)
+        else:
+            counterpart_amt = round(primary_amt / rate, 2) if rate > 0 else 0.0
+
     doc = {"date": data.date or now, "type": data.type, "category": data.category,
-           "amount": _num(data.amount), "currency": data.currency, "account": data.currency,
+           "amount": primary_amt, "currency": data.currency, "account": data.currency,
+           "exchange_rate": rate,
+           "counterpart_amount": counterpart_amt,
+           "counterpart_currency": counterpart_cur,
            "classification": classification,
            "description": data.description or "", "related_order_id": None,
            "created_by_id": admin.get("id"), "created_by_name": admin.get("name"),
@@ -1854,7 +1900,7 @@ async def finance_create(data: FinanceTxnInput, admin: dict = Depends(require_pe
     tid = str(result.inserted_id)
     if doc.get("recipient_employee_id"):
         await db.employee_wages.insert_one({"employee_id": doc["recipient_employee_id"], "employee_name": doc["recipient_employee_name"],
-            "amount": _num(data.amount), "currency": data.currency, "date": doc["date"], "category": data.category,
+            "amount": primary_amt, "currency": data.currency, "date": doc["date"], "category": data.category,
             "description": data.description or "", "transaction_id": tid, "recorded_by_name": admin.get("name"), "created_at": now})
     return clean(await db.finance_transactions.find_one({"_id": result.inserted_id}))
 
@@ -1865,8 +1911,44 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
         raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
     if t.get("type") == "order_revenue":
         raise HTTPException(status_code=400, detail="Pendapatan otomatis pesanan tidak dapat diubah manual")
+
+    existing_rate = _num(t.get("exchange_rate"))
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    base_rate = existing_rate if (existing_rate and existing_rate > 0) else settings_rate
+
+    if data.exchange_rate is not None and _num(data.exchange_rate) > 0:
+        rate = _num(data.exchange_rate)
+    else:
+        rate = base_rate
+
+    existing_amt = _num(t.get("amount"))
+    existing_cp = _num(t.get("counterpart_amount"))
+    input_amt = _num(data.amount)
+    input_cp = _num(data.counterpart_amount) if data.counterpart_amount is not None else None
+
+    if input_cp is not None and input_amt == existing_amt and input_cp != existing_cp:
+        if data.currency == "EGP":
+            primary_amt = round(input_cp / rate, 2) if rate > 0 else 0.0
+            counterpart_amt = input_cp
+            counterpart_cur = "IDR"
+        else:
+            primary_amt = round(input_cp * rate, 2)
+            counterpart_amt = input_cp
+            counterpart_cur = "EGP"
+    else:
+        primary_amt = input_amt
+        if data.currency == "EGP":
+            counterpart_cur = "IDR"
+            counterpart_amt = round(primary_amt * rate, 2)
+        else:
+            counterpart_cur = "EGP"
+            counterpart_amt = round(primary_amt / rate, 2) if rate > 0 else 0.0
+
     upd = {"date": data.date or t.get("date"), "type": data.type, "category": data.category,
-           "amount": _num(data.amount), "currency": data.currency, "account": data.currency,
+           "amount": primary_amt, "currency": data.currency, "account": data.currency,
+           "exchange_rate": rate,
+           "counterpart_amount": counterpart_amt,
+           "counterpart_currency": counterpart_cur,
            "classification": await category_classification(data.category, data.type),
            "description": data.description or "", "updated_by_name": admin.get("name"),
            "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -1884,7 +1966,7 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     await db.employee_wages.delete_many({"transaction_id": txn_id})
     if upd["recipient_employee_id"]:
         await db.employee_wages.insert_one({"employee_id": upd["recipient_employee_id"], "employee_name": upd["recipient_employee_name"],
-            "amount": _num(data.amount), "currency": data.currency, "date": upd["date"], "category": data.category,
+            "amount": primary_amt, "currency": data.currency, "date": upd["date"], "category": data.category,
             "description": data.description or "", "transaction_id": txn_id, "recorded_by_name": admin.get("name"),
             "created_at": datetime.now(timezone.utc).isoformat()})
     return clean(await db.finance_transactions.find_one({"_id": id_query(txn_id)}))
@@ -2147,8 +2229,23 @@ async def balance_adjust(payload: Dict[str, Any], admin: dict = Depends(require_
     new_balance = _num(payload.get("new_balance"))
     delta = new_balance - prev
     now = datetime.now(timezone.utc).isoformat()
+
+    rate = _num(payload.get("exchange_rate"))
+    if not rate or rate <= 0:
+        rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+
+    if account == "EGP":
+        counterpart_cur = "IDR"
+        counterpart_amt = round(delta * rate, 2)
+    else:
+        counterpart_cur = "EGP"
+        counterpart_amt = round(delta / rate, 2) if rate > 0 else 0.0
+
     doc = {"date": payload.get("date") or now, "type": "balance_adjustment", "category": "Penyesuaian Saldo",
            "amount": delta, "currency": account, "account": account, "previous_balance": prev, "new_balance": new_balance,
+           "exchange_rate": rate,
+           "counterpart_amount": counterpart_amt,
+           "counterpart_currency": counterpart_cur,
            "description": payload.get("description", ""), "created_by_name": admin.get("name"),
            "created_at": now, "updated_at": now}
     await db.finance_transactions.insert_one(doc)
@@ -2771,12 +2868,13 @@ async def export_finance(period: str = "this_year", start: Optional[str] = None,
                          admin: dict = Depends(require_perm("access_finance"))):
     q, _s, _e = _date_query(period, start, end)
     txns = await db.finance_transactions.find(q).sort("date", -1).to_list(10000)
-    headers = ["Tanggal", "ID Referensi", "Tipe", "Klasifikasi", "Kategori", "Deskripsi", "Jumlah", "Mata Uang", "Dari", "Ke", "Penerima", "Dicatat oleh"]
+    headers = ["Tanggal", "ID Referensi", "Tipe", "Klasifikasi", "Kategori", "Deskripsi", "Jumlah", "Mata Uang", "Kurs (IDR/EGP)", "Nilai Ekuivalen", "Mata Uang Ekuivalen", "Dari", "Ke", "Penerima", "Dicatat oleh"]
     rows = []
     for t in txns:
         amt = _num(t.get("amount")) if t.get("type") != "transfer" else _num(t.get("from_amount"))
         rows.append([(t.get("date") or "")[:19], str(t.get("_id")), t.get("type", ""), t.get("classification", ""),
                      t.get("category", ""), t.get("description", ""), amt, t.get("currency", t.get("from_account", "")),
+                     t.get("exchange_rate", ""), t.get("counterpart_amount", ""), t.get("counterpart_currency", ""),
                      t.get("from_account", ""), t.get("to_account", ""), t.get("recipient_employee_name", ""), t.get("created_by_name", "")])
     return xlsx_response(build_xlsx([("Keuangan", headers, rows)]), f"keuangan_{period}.xlsx")
 
