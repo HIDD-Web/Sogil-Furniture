@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChevronLeft, Upload, X, MessageCircle, Sparkles, CheckCircle2, Image as ImageIcon } from "lucide-react";
 import api from "../lib/api";
+import { normalizeEgyptPhone, validEgyptPhone } from "../lib/photoMatch";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
@@ -34,6 +35,7 @@ export default function CustomOrderPage() {
   const [form, setForm] = useState({
     customer_name: "",
     customer_phone: "",
+    phone_number: "",
     customer_address: "",
     furniture_type: "",
     custom_type: "",
@@ -156,11 +158,21 @@ export default function CustomOrderPage() {
       return;
     }
 
+    let normEgyptPhone = null;
+    if (form.phone_number && form.phone_number.trim()) {
+      normEgyptPhone = normalizeEgyptPhone(form.phone_number);
+      if (!validEgyptPhone(normEgyptPhone)) {
+        toast.error("Nomor telepon harus nomor Mesir dengan kode negara +20.");
+        return;
+      }
+    }
+
     setSubmitting(true);
     try {
       const payload = {
         customer_name: form.customer_name.trim(),
         customer_phone: form.customer_phone.trim(),
+        phone_number: normEgyptPhone,
         customer_address: form.customer_address.trim(),
         furniture_type: selectedType,
         dimensions: {
@@ -519,7 +531,7 @@ export default function CustomOrderPage() {
                     />
                   </div>
                   <div>
-                    <span className="text-xs font-semibold text-[#8B7355]">Nomor WhatsApp</span>
+                    <span className="text-xs font-semibold text-[#8B7355]">Nomor WhatsApp *</span>
                     <Input
                       type="tel"
                       placeholder="Contoh: +62xxxxxxxxxx"
@@ -532,6 +544,27 @@ export default function CustomOrderPage() {
                       Gunakan format internasional dengan kode negara, misalnya +20, +62, atau +60.
                     </p>
                   </div>
+                </div>
+
+                <div className="mt-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-[#8B7355]">Nomor Telepon</span>
+                    <span className="text-[11px] text-[#8B7355]">(Opsional — khusus nomor Mesir)</span>
+                  </div>
+                  <div className="relative mt-1 flex items-center">
+                    <span className="absolute left-3 text-xs font-medium text-[#8B7355] select-none">+20</span>
+                    <Input
+                      type="tel"
+                      placeholder="1x xxxx xxxx"
+                      value={form.phone_number}
+                      onChange={(e) => setForm({ ...form, phone_number: e.target.value })}
+                      data-testid="input-custom-phone-number"
+                      className="bg-[#FBF9F4] pl-11"
+                    />
+                  </div>
+                  <p className="mt-1 text-[11px] text-[#8B7355]">
+                    Nomor panggilan telepon lokal Mesir (opsional jika memiliki nomor Mesir).
+                  </p>
                 </div>
 
                 <div className="mt-3">

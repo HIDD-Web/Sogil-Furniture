@@ -9,7 +9,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
@@ -119,6 +119,13 @@ export default function AdminOrderDetail() {
             <Button onClick={() => update({ admin_note: note })} data-testid="save-admin-note" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Simpan Catatan</Button></div>
           <div className="mt-4 flex flex-wrap gap-2">
             <a href={`https://wa.me/${phoneNum}`} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#25D366] text-[#25D366]"><MessageCircle size={16} className="mr-1" /> WhatsApp</Button></a>
+            {order.phone_number && (
+              <a href={`tel:${order.phone_number}`}>
+                <Button variant="outline" data-testid="admin-call-button" className="rounded-xl border-[#8B5A2B] text-[#8B5A2B] hover:bg-[#FAF5EE]">
+                  <Phone size={16} className="mr-1" /> Telepon
+                </Button>
+              </a>
+            )}
             {order.customer_maps_url && <a href={order.customer_maps_url} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><MapPin size={16} className="mr-1" /> Maps</Button></a>}
             <Button variant="outline" onClick={copySummary} data-testid="admin-copy-summary" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><Copy size={16} className="mr-1" /> Salin Ringkasan</Button>
             {canModifyProducts && (
@@ -141,7 +148,13 @@ export default function AdminOrderDetail() {
           </div>
         </div>
 
-        <Block title="Customer"><Row k="Nama" v={order.customer_name} /><Row k="No HP" v={order.customer_phone} /><Row k="Alamat" v={order.customer_address} />{order.customer_maps_url && <Row k="Maps" v={order.customer_maps_url} />}</Block>
+        <Block title="Customer">
+          <Row k="Nama" v={order.customer_name} />
+          <Row k="No WhatsApp" v={order.customer_phone} />
+          {order.phone_number && <Row k="No Telepon" v={order.phone_number} />}
+          <Row k="Alamat" v={order.customer_address} />
+          {order.customer_maps_url && <Row k="Maps" v={order.customer_maps_url} />}
+        </Block>
 
         <Block title="Produk">
           {items.map((it, i) => it && (

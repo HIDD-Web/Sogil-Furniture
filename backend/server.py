@@ -256,6 +256,7 @@ class OrderInput(BaseModel):
     discount_code: Optional[str] = None
     referral_code: Optional[str] = None
     redeem_points: Optional[float] = 0
+    phone_number: Optional[str] = None
 
 class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
@@ -278,6 +279,7 @@ class CustomRequestInput(BaseModel):
     reference_photos: Optional[List[str]] = []
     budget_estimation_le: Optional[float] = None
     notes: Optional[str] = ""
+    phone_number: Optional[str] = None
 
 class CustomRequestUpdate(BaseModel):
     status: Optional[str] = None
@@ -854,6 +856,33 @@ def normalize_phone(raw: str) -> str:
 def valid_intl_phone(s: str) -> bool:
     return bool(re.match(r"^\+\d{8,15}$", s))
 
+def normalize_egypt_phone(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    s = re.sub(r"[\s\-().]", "", str(raw).strip())
+    if not s:
+        return None
+    if s.startswith("+"):
+        if not s.startswith("+20"):
+            raise HTTPException(status_code=400, detail="Nomor telepon harus nomor Mesir dengan kode negara +20.")
+        clean = s
+    elif s.startswith("0020"):
+        clean = "+20" + s[4:]
+    elif s.startswith("00"):
+        raise HTTPException(status_code=400, detail="Nomor telepon harus nomor Mesir dengan kode negara +20.")
+    elif s.startswith("20"):
+        clean = "+" + s
+    elif s.startswith("01") or s.startswith("02") or s.startswith("03"):
+        clean = "+20" + s[1:]
+    elif s.startswith("1") and len(s) in (9, 10):
+        clean = "+20" + s
+    else:
+        raise HTTPException(status_code=400, detail="Nomor telepon harus nomor Mesir dengan kode negara +20.")
+
+    if not re.match(r"^\+20\d{8,12}$", clean):
+        raise HTTPException(status_code=400, detail="Nomor telepon harus nomor Mesir dengan kode negara +20.")
+    return clean
+
 async def generate_order_number():
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"SGF-{today}-"
@@ -872,6 +901,7 @@ async def create_order(request: Request, data: OrderInput):
         raise HTTPException(status_code=400, detail="No HP tidak boleh kosong.")
     if not valid_intl_phone(phone):
         raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +62xxxxxxxxxx")
+    egypt_phone = normalize_egypt_phone(data.phone_number)
     if not data.customer_address.strip():
         raise HTTPException(status_code=400, detail="Alamat tidak boleh kosong.")
     if data.delivery_method not in ("delivery", "pickup"):
@@ -954,6 +984,7 @@ async def create_order(request: Request, data: OrderInput):
     order_doc = {
         "order_number": await generate_order_number(),
         "customer_name": data.customer_name.strip(), "customer_phone": phone,
+        "phone_number": egypt_phone,
         "customer_address": data.customer_address.strip(), "customer_maps_url": maps,
         "delivery_method": data.delivery_method, "delivery_zone_id": zone_id, "delivery_zone_name": zone_name,
         "delivery_fee_le": delivery_fee, "payment_method": data.payment_method,
@@ -1446,6 +1477,7 @@ async def create_custom_request(data: CustomRequestInput):
             phone = "+" + phone
     if not valid_intl_phone(phone):
         raise HTTPException(status_code=400, detail="Nomor telepon WhatsApp tidak valid (format internasional e.g. +62... atau +20...)")
+    egypt_phone = normalize_egypt_phone(data.phone_number)
     if not data.furniture_type or not data.furniture_type.strip():
         raise HTTPException(status_code=400, detail="Jenis furniture wajib diisi")
 
@@ -1458,6 +1490,7 @@ async def create_custom_request(data: CustomRequestInput):
         "ticket_number": ticket_number,
         "customer_name": data.customer_name.strip(),
         "customer_phone": phone,
+        "phone_number": egypt_phone,
         "customer_address": (data.customer_address or "").strip(),
         "furniture_type": data.furniture_type.strip(),
         "dimensions": data.dimensions or {},
@@ -1607,6 +1640,7 @@ async def admin_convert_custom_to_order(
         "order_number": order_num,
         "customer_name": custom_req.get("customer_name"),
         "customer_phone": custom_req.get("customer_phone"),
+        "phone_number": custom_req.get("phone_number"),
         "customer_address": data.customer_address or custom_req.get("customer_address") or "Dikonfirmasi via WA",
         "customer_maps_url": data.customer_maps_url or "",
         "delivery_method": data.delivery_method,

@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import api from "../lib/api";
 import { fmtLE, fmtIDR, formatApiError } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
-import { normalizePhone, validIntlPhone } from "../lib/photoMatch";
+import { normalizePhone, validIntlPhone, normalizeEgyptPhone, validEgyptPhone } from "../lib/photoMatch";
 import { useCart } from "../context/CartContext";
 import { useLang } from "../context/LanguageContext";
 import { useCustomer } from "../context/CustomerContext";
@@ -28,7 +28,7 @@ export default function Checkout() {
   const [store, setStore] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [delivery, setDelivery] = useState({ method: "", zone_id: "" });
-  const [cust, setCust] = useState({ name: "", phone: "", address: "", maps: "", payment: "", notes: "" });
+  const [cust, setCust] = useState({ name: "", phone: "", phone_number: "", address: "", maps: "", payment: "", notes: "" });
   const [disc, setDisc] = useState({ code: "", amount: 0, applied: false });
   const [ref, setRef] = useState({ code: "", amount: 0, applied: false });
   const [pts, setPts] = useState(0);
@@ -80,6 +80,15 @@ export default function Checkout() {
     if (!cust.name.trim()) return toast.error(t("err.nama"));
     const phone = normalizePhone(cust.phone);
     if (!validIntlPhone(phone)) return toast.error(t("err.phone"));
+
+    let normEgyptPhone = null;
+    if (cust.phone_number && cust.phone_number.trim()) {
+      normEgyptPhone = normalizeEgyptPhone(cust.phone_number);
+      if (!validEgyptPhone(normEgyptPhone)) {
+        return toast.error("Nomor telepon harus nomor Mesir dengan kode negara +20.");
+      }
+    }
+
     if (!cust.address.trim()) return toast.error(t("err.alamat"));
     if (!delivery.method) return toast.error(t("err.metode"));
     if (delivery.method === "delivery" && !delivery.zone_id) return toast.error(t("err.zona"));
@@ -90,7 +99,7 @@ export default function Checkout() {
     const notes = [cust.notes, ...items.filter((i) => i.config?.custom_size && i.config?.custom_note).map((i) => `Custom (${i.product.name}): ${i.config.custom_note}`)].filter(Boolean).join(" | ");
     try {
       const { data } = await api.post("/orders", {
-        customer_name: cust.name, customer_phone: phone, customer_address: cust.address,
+        customer_name: cust.name, customer_phone: phone, phone_number: normEgyptPhone, customer_address: cust.address,
         customer_maps_url: cust.maps, delivery_method: delivery.method,
         delivery_zone_id: delivery.method === "delivery" ? delivery.zone_id : null,
         payment_method: cust.payment, notes,
@@ -141,6 +150,24 @@ export default function Checkout() {
               <Label className="mb-1.5 block text-sm">{t("chk.no_hp")} * <span className="text-xs text-[#8B7355]">(+kode negara)</span></Label>
               <Input value={cust.phone} onChange={(e) => setCust({ ...cust, phone: e.target.value })} data-testid="input-phone" placeholder={t("chk.phone_ph")} className="h-12 bg-white" />
               <p className="mt-1 text-xs text-[#8B7355]">{t("chk.phone_help")}</p>
+            </div>
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <Label className="text-sm font-medium text-[#2C1E16]">Nomor Telepon</Label>
+                <span className="text-xs text-[#8B7355]">(Opsional — khusus nomor Mesir)</span>
+              </div>
+              <div className="relative flex items-center">
+                <span className="absolute left-3 font-medium text-sm text-[#8B7355] select-none">+20</span>
+                <Input
+                  type="tel"
+                  value={cust.phone_number}
+                  onChange={(e) => setCust({ ...cust, phone_number: e.target.value })}
+                  data-testid="input-phone-number"
+                  placeholder="1x xxxx xxxx"
+                  className="h-12 bg-white pl-12"
+                />
+              </div>
+              <p className="mt-1 text-xs text-[#8B7355]">Nomor panggilan telepon lokal Mesir (opsional jika memiliki simcard Mesir)</p>
             </div>
             <div><Label className="mb-1.5 block text-sm">{t("chk.alamat")} *</Label><Textarea value={cust.address} onChange={(e) => setCust({ ...cust, address: e.target.value })} data-testid="input-address" className="min-h-[80px] bg-white" /></div>
             <div><Label className="mb-1.5 block text-sm">{t("chk.link_maps")} {delivery.method === "delivery" ? t("chk.maps_saran") : t("chk.maps_opsional")}</Label><Input value={cust.maps} onChange={(e) => setCust({ ...cust, maps: e.target.value })} data-testid="input-maps" placeholder="https://maps.google.com/..." className="h-12 bg-white" /></div>

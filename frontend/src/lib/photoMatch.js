@@ -41,3 +41,33 @@ export function normalizePhone(raw) {
 export function validIntlPhone(s) {
   return /^\+\d{8,15}$/.test(s);
 }
+
+export function normalizeEgyptPhone(raw) {
+  if (!raw) return null;
+  const s = String(raw).replace(/[\s\-().]/g, "").trim();
+  if (!s) return null;
+  if (s.startsWith("+20")) {
+    return s;
+  }
+  if (s.startsWith("+")) {
+    return s;
+  }
+  if (s.startsWith("0020")) {
+    return "+20" + s.slice(4);
+  }
+  if (s.startsWith("20")) {
+    return "+" + s;
+  }
+  if (s.startsWith("01") || s.startsWith("02") || s.startsWith("03")) {
+    return "+20" + s.slice(1);
+  }
+  if (s.startsWith("1") && (s.length === 9 || s.length === 10)) {
+    return "+20" + s;
+  }
+  return s;
+}
+
+export function validEgyptPhone(s) {
+  if (!s) return true;
+  return /^\+20\d{8,12}$/.test(s);
+}
