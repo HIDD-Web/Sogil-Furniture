@@ -1,6 +1,7 @@
 {
+  "id": "/admin?pwa=admin",
   "short_name": "Sogil Tim",
-  "name": "Sogil Tim Dashboard",
+  "name": "Sogil Tim",
   "description": "Dashboard Manajemen & Operasional Tim Sogil Furniture",
   "icons": [
     {
@@ -20,7 +21,7 @@
       "purpose": "any maskable"
     }
   ],
-  "start_url": "/admin/login?pwa=admin",
+  "start_url": "/admin?pwa=admin",
   "scope": "/admin",
   "background_color": "#FAF5EE",
   "theme_color": "#2C1E16",

@@ -1,5 +1,6 @@
 {
-  "short_name": "Sogil",
+  "id": "/?pwa=customer",
+  "short_name": "Sogil Furniture",
   "name": "Sogil Furniture",
   "description": "Pemesanan & pembuatan furniture custom berkualitas di Kairo, Mesir",
   "icons": [
@@ -21,6 +22,7 @@
     }
   ],
   "start_url": "/?pwa=customer",
+  "scope": "/",
   "background_color": "#FFFFFF",
   "theme_color": "#8B5A2B",
   "display": "standalone",

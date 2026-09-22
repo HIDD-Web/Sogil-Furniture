@@ -3,21 +3,36 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <meta name="theme-color" content="#8B5A2B" />
+        <meta id="theme-color-meta" name="theme-color" content="#8B5A2B" />
         <meta name="description" content="Sogil Furniture — Pemesanan Furniture Custom di Kairo" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
         
-        <!-- PWA Configuration -->
-        <link id="manifest-link" rel="manifest" href="%PUBLIC_URL%/manifest.json" />
-        <link rel="apple-touch-icon" href="%PUBLIC_URL%/icons/apple-touch-icon.png" />
+        <!-- PWA Early Resolution Script: evaluate route synchronously before manifest/apple tags are evaluated -->
+        <script>
+          (function() {
+            var isAdmin = window.location.pathname.indexOf("/admin") === 0;
+            window.__SOGIL_PWA_EARLY_ADMIN__ = isAdmin;
+            if (isAdmin) {
+              document.write(
+                '<link id="manifest-link" rel="manifest" href="%PUBLIC_URL%/manifest-admin.json" />' +
+                '<link id="apple-icon-link" rel="apple-touch-icon" href="%PUBLIC_URL%/icons/apple-touch-icon-admin.png" />' +
+                '<meta id="apple-title-meta" name="apple-mobile-web-app-title" content="Sogil Tim" />'
+              );
+            } else {
+              document.write(
+                '<link id="manifest-link" rel="manifest" href="%PUBLIC_URL%/manifest.json" />' +
+                '<link id="apple-icon-link" rel="apple-touch-icon" href="%PUBLIC_URL%/icons/apple-touch-icon.png" />' +
+                '<meta id="apple-title-meta" name="apple-mobile-web-app-title" content="Sogil Furniture" />'
+              );
+            }
+          })();
+        </script>
         <meta name="apple-mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-        <meta name="apple-mobile-web-app-title" content="Sogil Furniture" />
         <meta name="mobile-web-app-capable" content="yes" />
         <title>Sogil Furniture — Furniture Ordering & Management</title>
-
     </head>
     <body>
         <noscript>You need to enable JavaScript to run this app.</noscript>

@@ -93,7 +93,7 @@ export default function PwaInstallModal({ isOpen, onClose, mode = "customer" }) 
           >
             <Sparkles size={13} />
             {isAdmin
-              ? "Langsung membuka Login Dashboard Tim"
+              ? "Langsung membuka Dashboard Tim Sogil"
               : "Langsung membuka Beranda Katalog Sogil"}
           </div>
         </div>

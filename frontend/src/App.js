@@ -70,15 +70,20 @@ function Layout() {
 
   useEffect(() => {
     const link = document.getElementById("manifest-link");
-    const themeMeta = document.querySelector('meta[name="theme-color"]');
-    if (!link) return;
+    const themeMeta = document.getElementById("theme-color-meta") || document.querySelector('meta[name="theme-color"]');
+    const appleIcon = document.getElementById("apple-icon-link") || document.querySelector('link[rel="apple-touch-icon"]');
+    const appleTitle = document.getElementById("apple-title-meta") || document.querySelector('meta[name="apple-mobile-web-app-title"]');
 
     if (isAdmin) {
-      link.setAttribute("href", "/manifest-admin.json");
+      if (link) link.setAttribute("href", "/manifest-admin.json");
       if (themeMeta) themeMeta.setAttribute("content", "#2C1E16");
+      if (appleIcon) appleIcon.setAttribute("href", "/icons/apple-touch-icon-admin.png");
+      if (appleTitle) appleTitle.setAttribute("content", "Sogil Tim");
     } else {
-      link.setAttribute("href", "/manifest.json");
+      if (link) link.setAttribute("href", "/manifest.json");
       if (themeMeta) themeMeta.setAttribute("content", "#8B5A2B");
+      if (appleIcon) appleIcon.setAttribute("href", "/icons/apple-touch-icon.png");
+      if (appleTitle) appleTitle.setAttribute("content", "Sogil Furniture");
     }
   }, [isAdmin]);
 

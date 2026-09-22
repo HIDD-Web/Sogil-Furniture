@@ -11,13 +11,19 @@ import { toast } from "sonner";
 import { Eye, EyeOff } from "lucide-react";
 
 export default function AdminLogin() {
-  const { login } = useAuth();
+  const { login, user, checked } = useAuth();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [storeInfo, setStoreInfo] = useState(null);
+
+  React.useEffect(() => {
+    if (checked && user) {
+      navigate("/admin", { replace: true });
+    }
+  }, [checked, user, navigate]);
 
   React.useEffect(() => {
     api.get("/store-info").then((r) => setStoreInfo(r.data)).catch(() => {});
