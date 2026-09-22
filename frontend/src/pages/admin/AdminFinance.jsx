@@ -119,7 +119,8 @@ export default function AdminFinance() {
     }
     setEditModal({
       id: t.id,
-      type: t.type || "expense",
+      type: t.type === "order_revenue" ? "income" : (t.type || "expense"),
+      raw_type: t.type,
       category: t.category || "",
       amount: String(t.amount ?? ""),
       currency: t.currency || "EGP",
@@ -127,7 +128,10 @@ export default function AdminFinance() {
       counterpart_amount: cp != null ? String(cp) : "",
       description: t.description || "",
       date: (t.date || "").slice(0, 10),
-      recipient_employee_id: t.recipient_employee_id || ""
+      recipient_employee_id: t.recipient_employee_id || "",
+      created_by_name: t.created_by_name || "",
+      related_order_id: t.related_order_id || null,
+      is_order_revenue: t.type === "order_revenue"
     });
   };
 
@@ -197,7 +201,20 @@ export default function AdminFinance() {
     try { await api.post("/admin/finance/transfer", { ...xfer, from_amount: Number(xfer.from_amount), to_amount: Number(xfer.to_amount), exchange_rate: xfer.exchange_rate ? Number(xfer.exchange_rate) : null }); toast.success("Transfer dicatat"); setXfer({ ...xfer, from_amount: "", to_amount: "", exchange_rate: "" }); loadTxns(); loadStats(); loadChart(); }
     catch (e) { toast.error(formatApiError(e.response?.data?.detail)); }
   };
-  const del = async (id) => { if (!window.confirm("Hapus transaksi?")) return; await api.delete(`/admin/finance/transactions/${id}`); loadTxns(); loadStats(); loadConfig(); loadChart(); };
+  const del = async (id) => {
+    const confirmed = window.confirm("Batalkan transaksi ini?\n\nTransaksi akan dibatalkan dan dikeluarkan dari perhitungan aktif (saldo & statistik). Pesanan terkait (jika ada) TIDAK akan dihapus.");
+    if (!confirmed) return;
+    try {
+      await api.delete(`/admin/finance/transactions/${id}`);
+      toast.success("Transaksi berhasil dibatalkan");
+      loadTxns();
+      loadStats();
+      loadConfig();
+      loadChart();
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail));
+    }
+  };
   const setBalance = async () => {
     if (adj.new_balance === "") return toast.error("Isi saldo baru");
     try { await api.post("/admin/finance/balance-adjust", { ...adj, new_balance: Number(adj.new_balance) }); toast.success("Saldo disesuaikan"); setAdj({ ...adj, new_balance: "", description: "" }); loadStats(); loadTxns(); loadChart(); }
@@ -210,9 +227,22 @@ export default function AdminFinance() {
   };
   const delCat = async (c) => { if (!window.confirm(`Nonaktifkan kategori "${c.name}"? Transaksi lama tetap tersimpan dengan kategorinya.`)) return; await api.delete(`/admin/finance/custom-categories/${c.id}`); toast.success("Kategori dinonaktifkan"); loadConfig(); };
 
-  const Cmp = ({ v }) => v == null ? null : (
-    <span className={`ml-2 inline-flex items-center text-xs font-medium ${v >= 0 ? "text-green-600" : "text-red-600"}`}>{v >= 0 ? <TrendingUp size={12} /> : <TrendingDown size={12} />} {v >= 0 ? "+" : ""}{v}%</span>
-  );
+  const Cmp = ({ v, reverseColor = false }) => {
+    if (v == null) {
+      return <span className="ml-2 inline-flex items-center text-xs text-[#8B7355] font-medium">—</span>;
+    }
+    if (v === 0) {
+      return <span className="ml-2 inline-flex items-center text-xs text-[#8B7355] font-medium">0%</span>;
+    }
+    const isFavorable = reverseColor ? v < 0 : v > 0;
+    const colorClass = isFavorable ? "text-green-600" : "text-red-600";
+    const Icon = v > 0 ? TrendingUp : TrendingDown;
+    return (
+      <span className={`ml-2 inline-flex items-center text-xs font-medium ${colorClass}`}>
+        <Icon size={12} className="mr-0.5" /> {v > 0 ? "+" : ""}{v}%
+      </span>
+    );
+  };
 
   return (
     <div className="space-y-4 sm:space-y-6">
@@ -250,7 +280,7 @@ export default function AdminFinance() {
               <div className="font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Statistik {cur}</div>
               <div className="mt-2.5 sm:mt-3 space-y-1.5 sm:space-y-2 text-xs sm:text-sm">
                 <div className="flex justify-between"><span className="text-[#5C4A3D]">Pendapatan</span><span className="font-medium">{money(c?.revenue || 0, cur)}<Cmp v={cmp?.revenue} /></span></div>
-                <div className="flex justify-between"><span className="text-[#5C4A3D]">Biaya</span><span className="font-medium">{money(c?.cost || 0, cur)}<Cmp v={cmp?.cost} /></span></div>
+                <div className="flex justify-between"><span className="text-[#5C4A3D]">Biaya</span><span className="font-medium">{money(c?.cost || 0, cur)}<Cmp v={cmp?.cost} reverseColor={true} /></span></div>
                 <div className="flex justify-between border-t border-dashed border-[#E5DCC5] pt-1.5 sm:pt-2"><span className="text-[#5C4A3D]">Laba Operasi</span><span className="font-bold text-[#8B5A2B]">{money(c?.operating_profit || 0, cur)}<Cmp v={cmp?.operating_profit} /></span></div>
                 <div className="flex justify-between"><span className="text-[#5C4A3D]">Arus Kas</span><span className="font-medium">{money(c?.cash_flow || 0, cur)}</span></div>
               </div>
@@ -467,12 +497,10 @@ export default function AdminFinance() {
               </div>
               <div className="mt-2 pt-2 border-t border-[#F1EBE0] flex items-center justify-between text-[11px] text-[#8B7355]">
                 <span>Dicatat: {t.created_by_name || "-"}</span>
-                {t.type !== "order_revenue" && (
-                  <div className="flex items-center gap-2">
-                    <button onClick={() => openEditModal(t)} className="p-1 rounded-md bg-white border border-[#E5DCC5] text-[#8B5A2B] hover:text-[#6B4423]" title="Edit" data-testid={`txn-edit-mobile-${t.id}`}><Pencil size={12} /></button>
-                    <button onClick={() => del(t.id)} className="p-1 rounded-md bg-white border border-[#E5DCC5] text-red-500 hover:text-red-700" title="Hapus" data-testid={`txn-del-mobile-${t.id}`}><Trash2 size={12} /></button>
-                  </div>
-                )}
+                <div className="flex items-center gap-2">
+                  <button onClick={() => openEditModal(t)} className="p-1 rounded-md bg-white border border-[#E5DCC5] text-[#8B5A2B] hover:text-[#6B4423]" title="Edit" data-testid={`txn-edit-mobile-${t.id}`}><Pencil size={12} /></button>
+                  <button onClick={() => del(t.id)} className="p-1 rounded-md bg-white border border-[#E5DCC5] text-red-500 hover:text-red-700" title="Hapus" data-testid={`txn-del-mobile-${t.id}`}><Trash2 size={12} /></button>
+                </div>
               </div>
               {t.description && <p className="mt-1 text-[11px] text-[#5C4A3D] line-clamp-1 italic">{t.description}</p>}
             </div>
@@ -502,12 +530,10 @@ export default function AdminFinance() {
                   <td className="py-2.5 px-2 font-medium text-[#2C1E16]">{formatTxnAmount(t)}</td>
                   <td className="py-2.5 px-2 text-[#8B7355]">{t.created_by_name || "-"}</td>
                   <td className="py-2.5 px-3 text-right">
-                    {t.type !== "order_revenue" && (
-                      <div className="flex items-center justify-end gap-1">
-                        <button onClick={() => openEditModal(t)} className="p-1 text-[#8B5A2B] hover:text-[#6B4423]" title="Edit transaksi" data-testid={`txn-edit-${t.id}`}><Pencil size={15} /></button>
-                        <button onClick={() => del(t.id)} className="p-1 text-red-500 hover:text-red-700" title="Hapus transaksi" data-testid={`txn-del-${t.id}`}><Trash2 size={15} /></button>
-                      </div>
-                    )}
+                    <div className="flex items-center justify-end gap-1">
+                      <button onClick={() => openEditModal(t)} className="p-1 text-[#8B5A2B] hover:text-[#6B4423]" title="Edit transaksi" data-testid={`txn-edit-${t.id}`}><Pencil size={15} /></button>
+                      <button onClick={() => del(t.id)} className="p-1 text-red-500 hover:text-red-700" title="Hapus transaksi" data-testid={`txn-del-${t.id}`}><Trash2 size={15} /></button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -525,13 +551,28 @@ export default function AdminFinance() {
               <button onClick={() => setEditModal(null)} className="rounded-lg p-1 text-[#8B7355] hover:bg-[#F1EBE0] hover:text-[#2C1E16]" aria-label="Tutup"><X size={18} /></button>
             </div>
             <div className="mt-4 space-y-3 text-xs sm:text-sm">
+              {editModal.is_order_revenue && (
+                <div className="rounded-xl border border-blue-200 bg-blue-50/70 p-3 text-xs text-blue-900">
+                  <div className="font-semibold flex items-center justify-between">
+                    <span>Pendapatan Otomatis Pesanan</span>
+                    <span className="text-[11px] text-blue-700">Asal: {editModal.created_by_name || "Sistem"}</span>
+                  </div>
+                  <p className="mt-1 text-blue-700">
+                    Mengoreksi catatan keuangan ini tidak akan mengubah isi pesanan terkait. Transaksi ini selanjutnya dikelola independen oleh bagian Keuangan.
+                  </p>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <Label className="mb-1 block text-xs text-[#8B7355]">Tipe Transaksi</Label>
-                  <Select value={editModal.type} onValueChange={(v) => setEditModal({ ...editModal, type: v, category: "" })}>
-                    <SelectTrigger className="bg-white text-xs sm:text-sm"><SelectValue /></SelectTrigger>
-                    <SelectContent><SelectItem value="income">Pemasukan</SelectItem><SelectItem value="expense">Pengeluaran</SelectItem></SelectContent>
-                  </Select>
+                  {editModal.is_order_revenue ? (
+                    <Input value="Pendapatan Pesanan" disabled className="bg-gray-50 text-xs sm:text-sm font-medium" />
+                  ) : (
+                    <Select value={editModal.type} onValueChange={(v) => setEditModal({ ...editModal, type: v, category: "" })}>
+                      <SelectTrigger className="bg-white text-xs sm:text-sm"><SelectValue /></SelectTrigger>
+                      <SelectContent><SelectItem value="income">Pemasukan</SelectItem><SelectItem value="expense">Pengeluaran</SelectItem></SelectContent>
+                    </Select>
+                  )}
                 </div>
                 <div>
                   <Label className="mb-1 block text-xs text-[#8B7355]">Mata Uang Utama</Label>

@@ -489,12 +489,12 @@ class TestOrderRevenueRegression:
         assert r.status_code == 200
         after = owner.get(f"{API}/admin/finance/stats", params={"period": "this_year"}).json()["current"]["EGP"]["revenue"]
         assert after > before, f"revenue should increase after payment ({before} -> {after})"
-        # delete order reverses
+        # delete order (order-finance separation preserves revenue history)
         r = owner.delete(f"{API}/admin/orders/{oid}")
         assert r.status_code == 200
         _created_orders.remove(oid)
         rev_after_del = owner.get(f"{API}/admin/finance/stats", params={"period": "this_year"}).json()["current"]["EGP"]["revenue"]
-        assert abs(rev_after_del - before) < 0.01, f"revenue should reverse ({before} vs {rev_after_del})"
+        assert abs(rev_after_del - after) < 0.01, f"revenue should remain preserved after order deletion ({after} vs {rev_after_del})"
 
 
 # ---------------- Cleanup ---------------- #

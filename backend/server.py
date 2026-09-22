@@ -1178,8 +1178,22 @@ async def admin_get_order(order_id: str, admin: dict = Depends(require_perm("man
     return order
 
 async def record_order_revenue(order):
-    if await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"}):
+    if await db.finance_transactions.find_one({
+        "related_order_id": str(order["_id"]),
+        "type": "order_revenue",
+        "is_void": {"$ne": True},
+        "status": {"$ne": "void"}
+    }):
         return
+    # If permanently voided by finance manual action, do not re-create
+    if await db.finance_transactions.find_one({
+        "related_order_id": str(order["_id"]),
+        "type": "order_revenue",
+        "is_void": True,
+        "void_source": "finance_manual"
+    }):
+        return
+
     now = datetime.now(timezone.utc).isoformat()
     total_le = _num(order.get("total_le"))
     settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
@@ -1274,46 +1288,72 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
 
     if effective_pay == "lunas":
         now_iso = datetime.now(timezone.utc).isoformat()
-        txn = await db.finance_transactions.find_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
-        if txn:
-            if has_price_change or method_changed:
-                new_total = _num(order.get("total_le"))
-                settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-                txn_rate = resolve_transaction_rate(
-                    None,
-                    txn.get("exchange_rate") or order.get("exchange_rate_idr_per_le"),
-                    settings_rate
-                )
+        active_txn = await db.finance_transactions.find_one({
+            "related_order_id": str(order["_id"]),
+            "type": "order_revenue",
+            "is_void": {"$ne": True},
+            "status": {"$ne": "void"}
+        })
+        if active_txn:
+            # If manually edited by finance, do NOT overwrite financial details
+            if not active_txn.get("is_manual_override"):
+                if has_price_change or method_changed:
+                    new_total = _num(order.get("total_le"))
+                    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+                    txn_rate = resolve_transaction_rate(
+                        None,
+                        active_txn.get("exchange_rate") or order.get("exchange_rate_idr_per_le"),
+                        settings_rate
+                    )
 
-                effective_method = (order.get("payment_method") or "cash").lower()
-                if effective_method == "transfer":
-                    primary_cur = "IDR"
-                    primary_acc = "IDR"
-                    conv = compute_currency_conversion("IDR", round(new_total * txn_rate), txn_rate)
-                else:  # cash
-                    primary_cur = "EGP"
-                    primary_acc = "EGP"
-                    conv = compute_currency_conversion("EGP", new_total, txn_rate)
+                    effective_method = (order.get("payment_method") or "cash").lower()
+                    if effective_method == "transfer":
+                        primary_cur = "IDR"
+                        primary_acc = "IDR"
+                        conv = compute_currency_conversion("IDR", round(new_total * txn_rate), txn_rate)
+                    else:  # cash
+                        primary_cur = "EGP"
+                        primary_acc = "EGP"
+                        conv = compute_currency_conversion("EGP", new_total, txn_rate)
 
-                await db.finance_transactions.update_one(
-                    {"_id": txn["_id"]},
-                    {"$set": {
-                        "amount": conv["primary_amount"],
-                        "currency": primary_cur,
-                        "account": primary_acc,
-                        "exchange_rate": txn_rate,
-                        "counterpart_amount": conv["counterpart_amount"],
-                        "counterpart_currency": conv["counterpart_currency"],
-                        "payment_method": effective_method,
-                        "updated_at": now_iso,
-                        "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
-                    }}
-                )
+                    await db.finance_transactions.update_one(
+                        {"_id": active_txn["_id"]},
+                        {"$set": {
+                            "amount": conv["primary_amount"],
+                            "currency": primary_cur,
+                            "account": primary_acc,
+                            "exchange_rate": txn_rate,
+                            "counterpart_amount": conv["counterpart_amount"],
+                            "counterpart_currency": conv["counterpart_currency"],
+                            "payment_method": effective_method,
+                            "updated_at": now_iso,
+                            "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
+                        }}
+                    )
         else:
             await record_order_revenue(order)
             await award_referral_points(order)
     elif effective_pay in ("belum_dibayar", "dp"):
-        await db.finance_transactions.delete_one({"related_order_id": str(order["_id"]), "type": "order_revenue"})
+        now_iso = datetime.now(timezone.utc).isoformat()
+        active_txn = await db.finance_transactions.find_one({
+            "related_order_id": str(order["_id"]),
+            "type": "order_revenue",
+            "is_void": {"$ne": True},
+            "status": {"$ne": "void"}
+        })
+        # If active txn exists and NOT manually overridden, mark order_sync void
+        if active_txn and not active_txn.get("is_manual_override"):
+            await db.finance_transactions.update_one(
+                {"_id": active_txn["_id"]},
+                {"$set": {
+                    "is_void": True,
+                    "status": "void",
+                    "void_source": "order_sync",
+                    "voided_at": now_iso,
+                    "voided_by_name": "Sistem (Status Pesanan)",
+                    "updated_at": now_iso
+                }}
+            )
         await reverse_referral_points(order)
 
     return clean(order)
@@ -1325,7 +1365,7 @@ async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
     await reverse_referral_points(order)
     await db.orders.delete_one({"_id": id_query(order_id)})
-    await db.finance_transactions.delete_many({"related_order_id": order_id, "type": "order_revenue"})
+    # NOTE: Order deletion must NOT delete finance history (Order <-> Finance separation)
     return {"ok": True}
 
 # --------------------------------------------------------------------------
@@ -1931,9 +1971,12 @@ async def finance_categories(admin: dict = Depends(require_perm("access_finance"
             out[typ].append(c["name"])
     return out
 
-async def _compute_balances():
+async def _compute_balances(as_of: Optional[str] = None):
     bal = {"IDR": 0.0, "EGP": 0.0}
-    async for t in db.finance_transactions.find({}):
+    q = {"is_void": {"$ne": True}, "status": {"$ne": "void"}}
+    if as_of:
+        q["date"] = {"$lte": as_of}
+    async for t in db.finance_transactions.find(q):
         typ = t.get("type"); cur = t.get("currency", "EGP"); amt = _num(t.get("amount"))
         if typ in ("income", "order_revenue"):
             bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) + amt
@@ -1944,6 +1987,8 @@ async def _compute_balances():
             bal[t.get("to_account", "EGP")] = bal.get(t.get("to_account", "EGP"), 0) + _num(t.get("to_amount"))
         elif typ == "balance_adjustment":
             bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) + _num(t.get("amount"))
+    for k in bal:
+        bal[k] = round(bal[k], 2)
     return bal
 
 @api_router.get("/admin/finance/accounts")
@@ -1954,7 +1999,7 @@ async def finance_accounts(admin: dict = Depends(require_perm("access_finance"))
 async def finance_list(currency: Optional[str] = None, type: Optional[str] = None,
                        start: Optional[str] = None, end: Optional[str] = None, q: Optional[str] = None,
                        admin: dict = Depends(require_perm("access_finance"))):
-    conds = []
+    conds = [{"is_void": {"$ne": True}, "status": {"$ne": "void"}}]
     if currency:
         conds.append({"$or": [{"currency": currency}, {"from_account": currency}, {"to_account": currency}]})
     if type:
@@ -2041,9 +2086,10 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     t = await db.finance_transactions.find_one({"_id": id_query(txn_id)})
     if not t:
         raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
-    if t.get("type") == "order_revenue":
-        raise HTTPException(status_code=400, detail="Pendapatan otomatis pesanan tidak dapat diubah manual")
+    if t.get("is_void") or t.get("status") == "void":
+        raise HTTPException(status_code=400, detail="Transaksi yang telah dibatalkan tidak dapat diedit")
 
+    is_order_rev = (t.get("type") == "order_revenue")
     existing_rate = _num(t.get("exchange_rate"))
     settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
     rate = resolve_transaction_rate(data.exchange_rate, existing_rate, settings_rate)
@@ -2058,16 +2104,27 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     else:
         conv = compute_currency_conversion(data.currency, input_amt, rate)
 
-    upd = {"date": data.date or t.get("date"), "type": data.type, "category": data.category,
+    now_iso = datetime.now(timezone.utc).isoformat()
+    txn_type = t.get("type") if is_order_rev else data.type
+    upd = {"date": data.date or t.get("date"), "type": txn_type, "category": data.category,
            "amount": conv["primary_amount"], "currency": data.currency, "account": data.currency,
            "exchange_rate": rate,
            "counterpart_amount": conv["counterpart_amount"],
            "counterpart_currency": conv["counterpart_currency"],
-           "classification": await category_classification(data.category, data.type),
-           "description": data.description or "", "updated_by_name": admin.get("name"),
-           "updated_at": datetime.now(timezone.utc).isoformat()}
+           "classification": await category_classification(data.category, txn_type),
+           "description": data.description if data.description is not None else t.get("description", ""),
+           "updated_by_id": admin.get("id"),
+           "updated_by_name": admin.get("name"),
+           "updated_at": now_iso}
+
+    if is_order_rev:
+        upd["is_manual_override"] = True
+        upd["manual_override_at"] = now_iso
+        upd["manual_override_by_id"] = admin.get("id")
+        upd["manual_override_by_name"] = admin.get("name")
+
     # Re-sync wage linkage: recompute wage-ness/recipient so employee history stays consistent on edit.
-    is_wage = data.type == "expense" and _is_wage_category(data.category)
+    is_wage = txn_type == "expense" and _is_wage_category(data.category)
     upd["recipient_employee_id"] = None
     upd["recipient_employee_name"] = None
     if is_wage and data.recipient_employee_id:
@@ -2078,18 +2135,35 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
         upd["recipient_employee_name"] = emp.get("name")
     await db.finance_transactions.update_one({"_id": id_query(txn_id)}, {"$set": upd})
     await db.employee_wages.delete_many({"transaction_id": txn_id})
-    if upd["recipient_employee_id"]:
+    if upd.get("recipient_employee_id"):
         await db.employee_wages.insert_one({"employee_id": upd["recipient_employee_id"], "employee_name": upd["recipient_employee_name"],
             "amount": conv["primary_amount"], "currency": data.currency, "date": upd["date"], "category": data.category,
-            "description": data.description or "", "transaction_id": txn_id, "recorded_by_name": admin.get("name"),
-            "created_at": datetime.now(timezone.utc).isoformat()})
+            "description": upd.get("description", ""), "transaction_id": txn_id, "recorded_by_name": admin.get("name"),
+            "created_at": now_iso})
     return clean(await db.finance_transactions.find_one({"_id": id_query(txn_id)}))
 
 @api_router.delete("/admin/finance/transactions/{txn_id}")
 async def finance_delete(txn_id: str, admin: dict = Depends(require_perm("access_finance"))):
+    t = await db.finance_transactions.find_one({"_id": id_query(txn_id)})
+    if not t:
+        raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.finance_transactions.update_one(
+        {"_id": id_query(txn_id)},
+        {"$set": {
+            "is_void": True,
+            "status": "void",
+            "void_source": "finance_manual",
+            "voided_at": now_iso,
+            "voided_by_id": admin.get("id"),
+            "voided_by_name": admin.get("name"),
+            "updated_at": now_iso,
+            "updated_by_id": admin.get("id"),
+            "updated_by_name": admin.get("name")
+        }}
+    )
     await db.employee_wages.delete_many({"transaction_id": txn_id})
-    await db.finance_transactions.delete_one({"_id": id_query(txn_id)})
-    return {"ok": True}
+    return {"ok": True, "voided": True}
 
 @api_router.post("/admin/finance/transfer")
 async def finance_transfer(data: TransferInput, admin: dict = Depends(require_perm("access_finance"))):
@@ -2140,7 +2214,7 @@ def _period_range(period, start, end):
     return None, None, None, None
 
 async def _stats_for(s, e):
-    q = {}
+    q = {"is_void": {"$ne": True}, "status": {"$ne": "void"}}
     if s or e:
         q["date"] = {}
         if s:
@@ -2169,7 +2243,20 @@ async def finance_stats(period: str = "this_month", start: Optional[str] = None,
                         admin: dict = Depends(require_perm("access_finance"))):
     s, e, ps, pe = _period_range(period, start, end)
     current = await _stats_for(s, e)
-    balances = await _compute_balances()
+
+    # Generalized Cumulative Ending Balance:
+    # Cumulative valid real-currency transactions from the beginning of financial history
+    # through the END/CUTOFF of the selected period.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if period in ("this_month", "this_year"):
+        cutoff = now_iso
+    elif e:
+        cutoff = e
+    else:
+        cutoff = now_iso
+
+    balances = await _compute_balances(as_of=cutoff)
+
     comparison = None
     if ps and pe:
         prev = await _stats_for(ps, pe)
@@ -2178,8 +2265,14 @@ async def finance_stats(period: str = "this_month", start: Optional[str] = None,
             comparison[cur] = {}
             for metric in ("revenue", "cost", "operating_profit"):
                 cv = current[cur][metric]; pv = prev[cur][metric]
-                pct = ((cv - pv) / abs(pv) * 100) if pv else (100.0 if cv else 0.0)
-                comparison[cur][metric] = round(pct, 1)
+                if pv == 0:
+                    if cv == 0:
+                        pct = 0.0
+                    else:
+                        pct = None  # Neutral indicator ("—" / "Baru"), do NOT fake +100% or Infinity
+                else:
+                    pct = round(((cv - pv) / abs(pv)) * 100, 1)
+                comparison[cur][metric] = pct
     return {"period": period, "range": {"start": s, "end": e}, "current": current,
             "comparison": comparison, "balances": balances}
 
@@ -2300,7 +2393,9 @@ async def employee_wages_summary(admin: dict = Depends(require_perm("access_fina
         # Source of truth: finance_transactions
         txns = await db.finance_transactions.find({
             "type": "expense",
-            "recipient_employee_id": eid
+            "recipient_employee_id": eid,
+            "is_void": {"$ne": True},
+            "status": {"$ne": "void"}
         }).sort("date", -1).to_list(1000)
 
         # Fallback to employee_wages mirror if no transactions found (for legacy compatibility)
@@ -2364,7 +2459,7 @@ async def finance_monthly(year: Optional[int] = None, currency: str = "EGP",
                           admin: dict = Depends(require_perm("access_finance"))):
     yr = year or datetime.now(timezone.utc).year
     months = [{"month": m, "label": f"{yr}-{m:02d}", "revenue": 0.0, "cost": 0.0, "profit": 0.0} for m in range(1, 13)]
-    async for t in db.finance_transactions.find({"currency": currency}):
+    async for t in db.finance_transactions.find({"currency": currency, "is_void": {"$ne": True}, "status": {"$ne": "void"}}):
         d = (t.get("date") or "")[:7]
         try:
             ty, tm = int(d[:4]), int(d[5:7])
@@ -2854,7 +2949,7 @@ async def shutdown():
 async def finance_statistics(period: str = "this_month", start: Optional[str] = None, end: Optional[str] = None,
                              currency: str = "EGP", admin: dict = Depends(require_perm("access_finance"))):
     s, e, _ps, _pe = _period_range(period, start, end)
-    q = {}
+    q = {"is_void": {"$ne": True}, "status": {"$ne": "void"}}
     if s or e:
         q["date"] = {}
         if s:
@@ -3012,7 +3107,7 @@ def xlsx_response(data, filename):
 
 def _date_query(period, start, end):
     s, e, _ps, _pe = _period_range(period, start, end)
-    q = {}
+    q = {"is_void": {"$ne": True}, "status": {"$ne": "void"}}
     if s or e:
         q["date"] = {}
         if s:

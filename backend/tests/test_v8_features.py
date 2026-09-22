@@ -392,15 +392,16 @@ class TestOrderRevenueRegression:
         assert round(delta, 2) == round(order["total_le"], 2), \
             f"revenue delta {delta} != order total_le {order['total_le']}"
 
-    def test_delete_paid_order_reverses_revenue(self, admin, order):
+    def test_delete_paid_order_preserves_revenue(self, admin, order):
         stats_before = _get_stats(admin)
         r = admin.delete(f"{API}/admin/orders/{order['id']}")
         assert r.status_code == 200
         _created_orders.remove(order["id"])
         stats_after = _get_stats(admin)
         delta = stats_after["current"]["EGP"]["revenue"] - stats_before["current"]["EGP"]["revenue"]
-        assert round(delta, 2) == -round(order["total_le"], 2), \
-            f"revenue not reversed: delta={delta}"
+        # Revenue remains preserved because deleting an order no longer deletes finance records
+        assert round(delta, 2) == 0, \
+            f"revenue changed unexpectedly upon order deletion: delta={delta}"
 
 
 # ---------- Cleanup ----------

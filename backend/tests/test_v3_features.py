@@ -155,9 +155,9 @@ class TestDeleteOrderFinance:
 
         # order gone
         assert admin.get(f"{API}/admin/orders/{oid_}").status_code == 404
-        # revenue gone
+        # revenue preserved (separated order deletion from finance records)
         txns = admin.get(f"{API}/admin/finance/transactions?type=order_revenue").json()
-        assert not any(t.get("related_order_id") == oid_ for t in txns), "revenue not removed"
+        assert any(t.get("related_order_id") == oid_ for t in txns), "revenue should be preserved on order deletion"
 
     def test_sub_admin_without_delete_data_gets_403(self, admin, rak):
         # create sub-admin without delete_data

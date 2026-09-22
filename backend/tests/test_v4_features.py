@@ -147,9 +147,9 @@ class TestDeleteOrder:
 
         # delete order
         assert admin.delete(f"{API}/admin/orders/{oid_}").status_code == 200
-        # revenue removed
+        # revenue preserved (separated order deletion from finance records)
         txns2 = admin.get(f"{API}/admin/finance/transactions?type=order_revenue").json()
-        assert not any(t.get("related_order_id") == oid_ for t in txns2)
+        assert any(t.get("related_order_id") == oid_ for t in txns2)
         # manual survived
         all_txns = admin.get(f"{API}/admin/finance/transactions").json()
         assert any(t.get("description") == f"TEST_manual_{UNIQUE}" for t in all_txns)
