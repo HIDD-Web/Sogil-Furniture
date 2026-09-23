@@ -1,6 +1,6 @@
 import "@/App.css";
 import React, { useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, useLocation, Navigate } from "react-router-dom";
 import { Toaster } from "sonner";
 import api from "./lib/api";
 import { AuthProvider } from "./context/AuthContext";
@@ -30,7 +30,6 @@ import AdminOrders from "./pages/admin/AdminOrders";
 import AdminOrderDetail from "./pages/admin/AdminOrderDetail";
 import AdminProducts from "./pages/admin/AdminProducts";
 import AdminProductEdit from "./pages/admin/AdminProductEdit";
-import AdminCategories from "./pages/admin/AdminCategories";
 import AdminCustomRequests from "./pages/admin/AdminCustomRequests";
 import AdminSettings from "./pages/admin/AdminSettings";
 import AdminAnalytics from "./pages/admin/AdminAnalytics";
@@ -97,7 +96,7 @@ function Layout() {
           <Route path="orders/:id" element={<AdminOrderDetail />} />
           <Route path="products" element={<AdminProducts />} />
           <Route path="products/:id" element={<AdminProductEdit />} />
-          <Route path="categories" element={<AdminCategories />} />
+          <Route path="categories" element={<Navigate to="/admin/products" replace />} />
           <Route path="custom-requests" element={<AdminCustomRequests />} />
           <Route path="analytics" element={<AdminAnalytics />} />
           <Route path="finance" element={<AdminFinance />} />

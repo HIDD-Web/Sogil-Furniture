@@ -47,10 +47,16 @@ export function buildProductPreviews(product) {
   if (category !== "custom" && category !== "meja" && category !== "meja_rak" && Array.isArray(pricing.groups) && pricing.groups.length > 0) {
     const combos = cartesianGroups(pricing.groups);
     combos.forEach((cfg, idx) => {
-      // Find matching photo
+      // Find matching photo that has a valid image URL and matches all group keys
       const matchedPhoto = photos.find((ph) => {
         const attr = ph.attributes || {};
-        return pricing.groups.every((g) => !cfg[g.key] || !attr[g.key] || String(attr[g.key]) === String(cfg[g.key]));
+        return (
+          Boolean(getPhotoUrl(ph)) &&
+          pricing.groups.every((g) => {
+            if (!cfg[g.key]) return true;
+            return attr[g.key] !== undefined && String(attr[g.key]) === String(cfg[g.key]);
+          })
+        );
       });
 
       const imageUrl = matchedPhoto ? getPhotoUrl(matchedPhoto) : priceListFallback;
@@ -121,6 +127,8 @@ export function buildProductPreviews(product) {
             finishing: "Natural",
           });
 
+          const sortWeight = (types.indexOf(type) * 1000) + (parseInt(length, 10) * 10) + parseInt(level, 10);
+
           previews.push({
             id: `${product.id || product._id || product.slug}-${length}_${level}_${type}`,
             productSlug: product.slug,
@@ -132,10 +140,7 @@ export function buildProductPreviews(product) {
             image: imageUrl,
             url: `/produk/${product.slug}?${searchParams.toString()}`,
             config,
-            sortWeight:
-              Number(length) * 100 +
-              Number(level) * 10 +
-              (type === "B" ? 1 : 2),
+            sortWeight,
           });
         });
       });
@@ -146,8 +151,10 @@ export function buildProductPreviews(product) {
   }
 
   // 3. Meja: Standar (Ukuran × Tinggi) + Khusus Finishing Lapis HPL (Ukuran × Tinggi × Lapis HPL)
+  // Catalog listing preview focuses on representative size 50x80 cm
   if (category === "meja") {
-    const sizes = pricing.sizes || ["40x80", "50x80"];
+    const rawSizes = pricing.sizes || ["40x80", "50x80"];
+    const sizes = rawSizes.includes("50x80") ? ["50x80"] : [rawSizes[0]];
     const heights = pricing.heights || ["30", "75"];
 
     // 3a. Standar (Natural)
@@ -248,12 +255,15 @@ export function buildProductPreviews(product) {
   }
 
   // 4. Meja Rak: Ukuran Meja × Jumlah Tingkat Rak × Tinggi Meja (tanpa finishing)
+  // Catalog listing preview focuses on representative size 50x80 cm
   if (category === "meja_rak") {
-    const sizeOpts = pricing.groups?.find((g) => g.key === "size")?.options || ["Meja 40x80 cm", "Meja 50x80 cm"];
+    const rawSizeOpts = pricing.groups?.find((g) => g.key === "size")?.options || ["Meja 40x80 cm", "Meja 50x80 cm"];
+    const sizeOpts = rawSizeOpts.filter((s) => s.includes("50x80"));
+    const finalSizeOpts = sizeOpts.length > 0 ? sizeOpts : [rawSizeOpts[0]];
     const levelOpts = pricing.groups?.find((g) => g.key === "levels")?.options || ["2 Tingkat", "3 Tingkat", "4 Tingkat", "5 Tingkat"];
     const heightOpts = pricing.groups?.find((g) => g.key === "height")?.options || ["30 cm (Lesehan)", "75 cm (Kursi)"];
 
-    sizeOpts.forEach((sz) => {
+    finalSizeOpts.forEach((sz) => {
       levelOpts.forEach((lvl) => {
         heightOpts.forEach((h) => {
           const matchedPhoto = photos.find((ph) => {

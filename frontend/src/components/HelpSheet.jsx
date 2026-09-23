@@ -60,7 +60,7 @@ export default function HelpSheet() {
           type="button"
           aria-label={t("help.aria_label")}
           data-testid="home-help-button"
-          className="fixed bottom-5 right-5 z-30 flex h-12 w-12 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#8B5A2B] shadow-lg transition-transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-[#8B5A2B] focus:ring-offset-2"
+          className="fixed bottom-20 right-4 sm:bottom-5 sm:right-5 z-40 flex h-12 w-12 items-center justify-center rounded-full border border-[#E5DCC5] bg-white text-[#8B5A2B] shadow-lg transition-transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-[#8B5A2B] focus:ring-offset-2"
         >
           <HelpCircle size={23} />
         </button>

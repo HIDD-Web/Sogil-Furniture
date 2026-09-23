@@ -64,7 +64,16 @@ export default function ProductConfigure() {
       const grps = Array.isArray(pr.groups) ? pr.groups : null;
       let init = { custom_size: false };
       if (grps) {
-        grps.forEach((g) => { if ((g.options || []).length) init[g.key] = g.options[0]; });
+        grps.forEach((g) => {
+          if ((g.options || []).length) {
+            if (p.data.category === "meja_rak" && g.key === "size") {
+              const opt50 = g.options.find((o) => o.includes("50x80"));
+              init[g.key] = opt50 || g.options[0];
+            } else {
+              init[g.key] = g.options[0];
+            }
+          }
+        });
       }
       else if (p.data.category === "rak") {
         init = {
@@ -76,16 +85,20 @@ export default function ProductConfigure() {
         };
       }
       else if (p.data.category === "meja") {
+        const sizes = pr.sizes || [];
+        const defaultSize = sizes.includes("50x80") ? "50x80" : sizes[0];
         init = {
-          size: (pr.sizes || [])[0],
+          size: defaultSize,
           height: (pr.heights || [])[0],
           finishing: "Natural",
           custom_size: false,
         };
       }
       else if (p.data.category === "meja_rak") {
+        const variants = pr.variants || [];
+        const defaultVariant = variants.find((v) => v.includes("50x80")) || variants[0];
         init = {
-          variant: (pr.variants || [])[0],
+          variant: defaultVariant,
           type: "B",
           finishing: "Natural",
           custom_size: false,
