@@ -33,31 +33,112 @@ export default function Checkout() {
   const [ref, setRef] = useState({ code: "", amount: 0, applied: false });
   const [pts, setPts] = useState(0);
 
-  const applyReferral = async () => {
-    if (!ref.code.trim()) return;
-    if (!customer) return toast.error("Login sebagai pelanggan untuk memakai referral");
+  // Helper: Save current checkout form state to sessionStorage before navigating to login/register
+  const saveDraft = (pendingPromoCode, pendingReferralCode) => {
     try {
-      const { data } = await api.post("/referral/validate", { code: ref.code, subtotal: productSubtotal });
-      if (data.valid) { setRef((r) => ({ ...r, amount: data.discount_amount, applied: true })); toast.success("Referral diterapkan"); }
-      else { setRef((r) => ({ ...r, amount: 0, applied: false })); toast.error(data.message); }
-    } catch { toast.error("Kode referral tidak valid"); }
+      const draft = {
+        cust,
+        delivery,
+        pendingPromo: pendingPromoCode !== undefined ? pendingPromoCode : (disc.code || null),
+        pendingReferral: pendingReferralCode !== undefined ? pendingReferralCode : (ref.code || null),
+      };
+      sessionStorage.setItem("sogil_checkout_draft", JSON.stringify(draft));
+    } catch {
+      // Ignore storage errors
+    }
   };
+
+  const applyReferral = async (overrideCode) => {
+    const codeToApply = (typeof overrideCode === "string" ? overrideCode : ref.code).trim();
+    if (!codeToApply) return;
+    if (!customer) {
+      toast.info(t("sum.promo_require_auth"));
+      saveDraft(disc.code, codeToApply);
+      navigate("/akun?returnUrl=/checkout");
+      return;
+    }
+    try {
+      const { data } = await api.post("/referral/validate", { code: codeToApply, subtotal: productSubtotal });
+      if (data.valid) {
+        setRef({ code: codeToApply, amount: data.discount_amount, applied: true });
+        toast.success("Referral diterapkan");
+      } else {
+        setRef((r) => ({ ...r, amount: 0, applied: false }));
+        toast.error(data.message || "Kode referral tidak valid");
+        if (data.require_auth) {
+          saveDraft(disc.code, codeToApply);
+          navigate("/akun?returnUrl=/checkout");
+        }
+      }
+    } catch {
+      toast.error("Kode referral tidak valid");
+    }
+  };
+
   const maxPts = customer ? Math.min(customer.points_available || 0, productSubtotal * ((store?.point_redeem_max_pct || 50) / 100)) : 0;
   const usedPts = Math.max(0, Math.min(Number(pts) || 0, maxPts));
 
-  const applyDiscount = async () => {
-    if (!disc.code.trim()) return;
+  const applyDiscount = async (overrideCode) => {
+    const codeToApply = (typeof overrideCode === "string" ? overrideCode : disc.code).trim();
+    if (!codeToApply) return;
+    if (!customer) {
+      toast.info(t("sum.promo_require_auth"));
+      saveDraft(codeToApply, ref.code);
+      navigate("/akun?returnUrl=/checkout");
+      return;
+    }
     try {
-      const { data } = await api.post("/discounts/validate", { code: disc.code, subtotal: productSubtotal });
-      if (data.valid) { setDisc((d) => ({ ...d, amount: data.discount_amount, applied: true })); toast.success(t("sum.discount_ok")); }
-      else { setDisc((d) => ({ ...d, amount: 0, applied: false })); toast.error(data.message || t("sum.discount_bad")); }
-    } catch { toast.error(t("sum.discount_bad")); }
+      const { data } = await api.post("/discounts/validate", { code: codeToApply, subtotal: productSubtotal });
+      if (data.valid) {
+        setDisc({ code: codeToApply, amount: data.discount_amount, applied: true });
+        toast.success(t("sum.discount_ok"));
+      } else {
+        setDisc((d) => ({ ...d, amount: 0, applied: false }));
+        toast.error(data.message || t("sum.discount_bad"));
+        if (data.require_auth) {
+          saveDraft(codeToApply, ref.code);
+          navigate("/akun?returnUrl=/checkout");
+        }
+      }
+    } catch {
+      toast.error(t("sum.discount_bad"));
+    }
   };
 
   useEffect(() => {
     api.get("/delivery-zones").then((r) => setZones(r.data));
     api.get("/store-info").then((r) => setStore(r.data));
+
+    // Restore draft from sessionStorage if returning from /akun
+    try {
+      const raw = sessionStorage.getItem("sogil_checkout_draft");
+      if (raw) {
+        const draft = JSON.parse(raw);
+        sessionStorage.removeItem("sogil_checkout_draft");
+        if (draft.cust) setCust((prev) => ({ ...prev, ...draft.cust }));
+        if (draft.delivery) setDelivery((prev) => ({ ...prev, ...draft.delivery }));
+        if (draft.pendingPromo) {
+          setDisc((prev) => ({ ...prev, code: draft.pendingPromo }));
+        }
+        if (draft.pendingReferral) {
+          setRef((prev) => ({ ...prev, code: draft.pendingReferral }));
+        }
+      }
+    } catch {
+      // Ignore parse errors
+    }
   }, []);
+
+  // When customer becomes authenticated and we have a restored pending promo/referral, revalidate server-side
+  useEffect(() => {
+    if (customer && productSubtotal > 0) {
+      if (disc.code && !disc.applied) {
+        applyDiscount(disc.code);
+      } else if (ref.code && !ref.applied) {
+        applyReferral(ref.code);
+      }
+    }
+  }, [customer, productSubtotal]);
 
   const rate = store?.exchange_rate_idr_per_le || 357;
   const deliveryFee = useMemo(() => {

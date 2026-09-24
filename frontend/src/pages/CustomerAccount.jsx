@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import api from "../lib/api";
 import { fmtLE, copyToClipboard } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
@@ -11,12 +12,17 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
-import { User, Gift, Copy, LogOut, Eye, EyeOff } from "lucide-react";
+import { User, Gift, Copy, LogOut, Eye, EyeOff, Sparkles } from "lucide-react";
 
 export default function CustomerAccount() {
   const { t } = useLang();
   const { customer, checked, register, login, logout } = useCustomer();
-  const [mode, setMode] = useState("login");
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const returnUrl = searchParams.get("returnUrl");
+  const isFromCheckout = returnUrl === "/checkout" || (returnUrl && returnUrl.startsWith("/checkout"));
+
+  const [mode, setMode] = useState(searchParams.get("mode") === "register" ? "register" : "login");
   const [showPassword, setShowPassword] = useState(false);
   const [f, setF] = useState({ username: "", phone: "", password: "", identifier: "" });
   const [orders, setOrders] = useState([]);
@@ -29,10 +35,14 @@ export default function CustomerAccount() {
 
   useEffect(() => {
     if (customer) {
+      if (returnUrl) {
+        navigate(returnUrl, { replace: true });
+        return;
+      }
       api.get("/customer/orders").then((r) => setOrders(r.data)).catch(() => {});
       api.get("/customer/points").then((r) => setPoints(r.data)).catch(() => {});
     }
-  }, [customer]);
+  }, [customer, returnUrl, navigate]);
 
   const claimOrder = async () => {
     if (!claim.order_number || !claim.phone) return toast.error(t("auth.claim_err_fill"));
@@ -65,11 +75,25 @@ export default function CustomerAccount() {
         if (mode === "register") await register({ username: f.username, phone: f.phone, password: f.password });
         else await login(f.identifier, f.password);
         toast.success(t("auth.login_success"));
+        if (returnUrl) {
+          navigate(returnUrl, { replace: true });
+        }
       } catch (err) { toast.error(formatApiError(err.response?.data?.detail)); }
     };
     return (
       <div className="mx-auto max-w-sm px-4 py-12 sm:px-6">
         <div className="rounded-2xl border border-[#E5DCC5] bg-white p-6 shadow-sm">
+          {isFromCheckout && (
+            <div className="mb-4 rounded-xl border border-[#8B5A2B]/20 bg-[#EFE6D5]/60 p-3 text-xs text-[#5C4A3D]">
+              <div className="flex items-center gap-1.5 font-semibold text-[#2C1E16]">
+                <Sparkles size={14} className="text-[#8B5A2B]" />
+                <span>Klaim Promo & Referral</span>
+              </div>
+              <p className="mt-1">
+                Silakan masuk atau daftar akun untuk menggunakan promo Anda. Setelah masuk, Anda akan langsung dikembalikan ke halaman checkout dengan pesanan tetap utuh.
+              </p>
+            </div>
+          )}
           <div className="flex justify-center"><div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#EFE6D5] text-[#8B5A2B]"><User /></div></div>
           <h1 className="mt-3 text-center font-heading text-xl font-bold text-[#2C1E16]">{mode === "register" ? t("auth.title_register") : t("auth.title_login")}</h1>
           <p className="mt-1 text-center text-xs text-[#8B7355]">{t("auth.subtitle")}</p>

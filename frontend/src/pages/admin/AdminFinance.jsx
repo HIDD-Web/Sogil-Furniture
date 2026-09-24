@@ -66,7 +66,10 @@ export default function AdminFinance() {
       if (r.data?.exchange_rate_idr_per_le) {
         const rate = Number(r.data.exchange_rate_idr_per_le);
         setDefaultRate(rate);
-        setForm((prev) => ({ ...prev, exchange_rate: prev.exchange_rate || String(rate) }));
+        setForm((prev) => ({
+          ...prev,
+          exchange_rate: String(rate),
+        }));
       }
     }).catch(() => {});
   };

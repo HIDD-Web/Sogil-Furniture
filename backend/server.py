@@ -963,9 +963,12 @@ async def create_order(request: Request, data: OrderInput):
                          "owner_name": owner.get("username") if owner else "", "percentage": _num(rdoc.get("discount_percentage")),
                          "discount_le": rdisc, "points_per_order": _num(rdoc.get("points_per_order"))}
     else:
-        discount_le, disc_doc, disc_err = await validate_discount(data.discount_code, subtotal_le)
-        if data.discount_code and disc_err:
-            raise HTTPException(status_code=400, detail=disc_err)
+        if data.discount_code:
+            if not buyer:
+                raise HTTPException(status_code=401, detail="Login atau buat akun untuk memakai kode promo")
+            discount_le, disc_doc, disc_err = await validate_discount(data.discount_code, subtotal_le)
+            if disc_err:
+                raise HTTPException(status_code=400, detail=disc_err)
     # Points redemption (logged-in only, max % of subtotal)
     points_redeemed = 0.0
     redeem_req = _num(data.redeem_points)
@@ -2298,7 +2301,10 @@ async def validate_discount(code, subtotal):
     return round(disc, 2), d, None
 
 @api_router.post("/discounts/validate")
-async def discount_validate(payload: Dict[str, Any]):
+async def discount_validate(payload: Dict[str, Any], request: Request):
+    buyer = await get_optional_customer(request)
+    if not buyer:
+        return {"valid": False, "message": "Untuk menggunakan kode promo, silakan buat akun atau masuk terlebih dahulu", "require_auth": True, "discount_amount": 0}
     disc, d, err = await validate_discount(payload.get("code"), _num(payload.get("subtotal")))
     if err:
         return {"valid": False, "message": err, "discount_amount": 0}
@@ -2665,6 +2671,8 @@ async def validate_referral(code, subtotal, buyer_id):
 @api_router.post("/referral/validate")
 async def referral_validate(payload: Dict[str, Any], request: Request):
     buyer = await get_optional_customer(request)
+    if not buyer:
+        return {"valid": False, "message": "Untuk menggunakan kode referral, silakan buat akun atau masuk terlebih dahulu", "require_auth": True, "discount_amount": 0}
     disc, r, err = await validate_referral(payload.get("code"), _num(payload.get("subtotal")), str(buyer["_id"]) if buyer else None)
     if err:
         return {"valid": False, "message": err, "discount_amount": 0}
