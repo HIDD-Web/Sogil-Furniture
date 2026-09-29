@@ -105,6 +105,8 @@ export default function Checkout() {
     }
   };
 
+  const [pendingBenefit, setPendingBenefit] = useState(null);
+
   useEffect(() => {
     api.get("/delivery-zones").then((r) => setZones(r.data));
     api.get("/store-info").then((r) => setStore(r.data));
@@ -114,14 +116,14 @@ export default function Checkout() {
       const raw = sessionStorage.getItem("sogil_checkout_draft");
       if (raw) {
         const draft = JSON.parse(raw);
-        sessionStorage.removeItem("sogil_checkout_draft");
         if (draft.cust) setCust((prev) => ({ ...prev, ...draft.cust }));
         if (draft.delivery) setDelivery((prev) => ({ ...prev, ...draft.delivery }));
         if (draft.pendingPromo) {
           setDisc((prev) => ({ ...prev, code: draft.pendingPromo }));
-        }
-        if (draft.pendingReferral) {
+          setPendingBenefit({ type: "promo", code: draft.pendingPromo });
+        } else if (draft.pendingReferral) {
           setRef((prev) => ({ ...prev, code: draft.pendingReferral }));
+          setPendingBenefit({ type: "referral", code: draft.pendingReferral });
         }
       }
     } catch {
@@ -129,16 +131,19 @@ export default function Checkout() {
     }
   }, []);
 
-  // When customer becomes authenticated and we have a restored pending promo/referral, revalidate server-side
+  // When customer is authenticated and productSubtotal is ready, automatically revalidate restored promo/referral
   useEffect(() => {
-    if (customer && productSubtotal > 0) {
-      if (disc.code && !disc.applied) {
-        applyDiscount(disc.code);
-      } else if (ref.code && !ref.applied) {
-        applyReferral(ref.code);
+    if (customer && productSubtotal > 0 && pendingBenefit) {
+      const benefit = pendingBenefit;
+      setPendingBenefit(null);
+      sessionStorage.removeItem("sogil_checkout_draft");
+      if (benefit.type === "promo") {
+        applyDiscount(benefit.code);
+      } else if (benefit.type === "referral") {
+        applyReferral(benefit.code);
       }
     }
-  }, [customer, productSubtotal]);
+  }, [customer, productSubtotal, pendingBenefit]);
 
   const rate = store?.exchange_rate_idr_per_le || 357;
   const deliveryFee = useMemo(() => {

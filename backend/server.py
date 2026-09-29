@@ -195,6 +195,16 @@ async def get_optional_customer(request: Request):
         if h.startswith("Bearer "):
             token = h[7:]
     if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            raw = auth[7:]
+            try:
+                p = jwt.decode(raw, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+                if p.get("type") == "customer":
+                    token = raw
+            except jwt.InvalidTokenError:
+                pass
+    if not token:
         return None
     try:
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
@@ -2552,8 +2562,11 @@ async def customer_register(data: CustomerRegister, response: Response):
         "start_date": None, "end_date": None, "discount_percentage": 5, "max_discount_le": 100,
         "max_claim_orders": 0, "max_reward_orders": 0, "max_total_points": 0, "points_per_order": 20,
         "claims": 0, "reward_orders": 0, "points_awarded": 0, "created_at": now})
-    response.set_cookie("customer_token", create_customer_token(cid), httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
-    return clean_customer(await db.customers.find_one({"_id": r.inserted_id}))
+    token = create_customer_token(cid)
+    response.set_cookie("customer_token", token, httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
+    res = clean_customer(await db.customers.find_one({"_id": r.inserted_id}))
+    res["token"] = token
+    return res
 
 @api_router.post("/customer/login")
 async def customer_login(data: CustomerLogin, response: Response):
@@ -2564,8 +2577,11 @@ async def customer_login(data: CustomerLogin, response: Response):
     if c.get("active") is False:
         raise HTTPException(status_code=403, detail="Akun dinonaktifkan. Silakan hubungi admin.")
     await db.customers.update_one({"_id": c["_id"]}, {"$set": {"last_login": datetime.now(timezone.utc).isoformat()}})
-    response.set_cookie("customer_token", create_customer_token(str(c["_id"])), httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
-    return clean_customer(c)
+    token = create_customer_token(str(c["_id"]))
+    response.set_cookie("customer_token", token, httponly=True, secure=True, samesite="none", max_age=2592000, path="/")
+    res = clean_customer(c)
+    res["token"] = token
+    return res
 
 @api_router.post("/customer/logout")
 async def customer_logout(response: Response):

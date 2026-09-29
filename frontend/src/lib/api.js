@@ -9,9 +9,17 @@ const api = axios.create({
 });
 
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("admin_token");
-  if (token && !config.headers.Authorization) {
-    config.headers.Authorization = `Bearer ${token}`;
+  const adminToken = localStorage.getItem("admin_token");
+  const customerToken = localStorage.getItem("customer_token");
+
+  if (customerToken) {
+    config.headers["X-Customer-Authorization"] = `Bearer ${customerToken}`;
+  }
+
+  if (adminToken && !config.headers.Authorization) {
+    config.headers.Authorization = `Bearer ${adminToken}`;
+  } else if (customerToken && !config.headers.Authorization) {
+    config.headers.Authorization = `Bearer ${customerToken}`;
   }
   return config;
 });

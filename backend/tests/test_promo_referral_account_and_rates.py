@@ -128,6 +128,78 @@ class TestFeature1CustomerAuthForPromoAndReferral(unittest.TestCase):
         self.assertEqual(draft["delivery"]["method"], "delivery")
         self.assertEqual(draft["pendingPromo"], "HEMAT20")
 
+    def test_safe_return_url_validation(self):
+        """returnUrl must only allow relative paths to prevent open redirects."""
+        def is_safe_return_url(url):
+            if not url or not isinstance(url, str):
+                return False
+            url = url.strip()
+            return url.startswith("/") and not url.startswith("//") and not url.startswith("/\\")
+
+        self.assertTrue(is_safe_return_url("/checkout"))
+        self.assertTrue(is_safe_return_url("/checkout?step=2"))
+        self.assertTrue(is_safe_return_url("/lacak"))
+        self.assertFalse(is_safe_return_url("https://evil.com"))
+        self.assertFalse(is_safe_return_url("//evil.com"))
+        self.assertFalse(is_safe_return_url("javascript:alert(1)"))
+        self.assertFalse(is_safe_return_url(None))
+
+    def test_customer_token_creation_and_type(self):
+        """Customer tokens must encode type='customer' and be verifiable with secret."""
+        cid = "65a1234567890abcdef12345"
+        token = server.create_customer_token(cid)
+        import jwt
+        payload = jwt.decode(token, server.get_jwt_secret(), algorithms=[server.JWT_ALGORITHM])
+        self.assertEqual(payload["sub"], cid)
+        self.assertEqual(payload["type"], "customer")
+
+    @patch("server.db")
+    def test_get_optional_customer_via_x_customer_authorization(self, mock_db):
+        """Customer token sent via X-Customer-Authorization header resolves correctly."""
+        cid = "65a1234567890abcdef12345"
+        token = server.create_customer_token(cid)
+        mock_customer = {"_id": cid, "username": "budi_kairo", "active": True}
+        mock_db.customers.find_one = AsyncMock(return_value=mock_customer)
+
+        req = MagicMock()
+        req.cookies = {}
+        req.headers = {"X-Customer-Authorization": f"Bearer {token}"}
+
+        import asyncio
+        resolved = asyncio.run(server.get_optional_customer(req))
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["username"], "budi_kairo")
+
+    @patch("server.db")
+    def test_get_optional_customer_via_authorization_header(self, mock_db):
+        """Customer token sent via standard Authorization header resolves correctly."""
+        cid = "65a1234567890abcdef12345"
+        token = server.create_customer_token(cid)
+        mock_customer = {"_id": cid, "username": "budi_kairo", "active": True}
+        mock_db.customers.find_one = AsyncMock(return_value=mock_customer)
+
+        req = MagicMock()
+        req.cookies = {}
+        req.headers = {"Authorization": f"Bearer {token}"}
+
+        import asyncio
+        resolved = asyncio.run(server.get_optional_customer(req))
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["username"], "budi_kairo")
+
+    @patch("server.db")
+    def test_get_optional_customer_ignores_admin_token_in_auth_header(self, mock_db):
+        """If Authorization header contains an admin token (type != 'customer'), do not treat as customer."""
+        import jwt
+        admin_token = jwt.encode({"sub": "admin_123", "role": "admin", "type": "admin"}, server.get_jwt_secret(), algorithm=server.JWT_ALGORITHM)
+        req = MagicMock()
+        req.cookies = {}
+        req.headers = {"Authorization": f"Bearer {admin_token}"}
+
+        import asyncio
+        resolved = asyncio.run(server.get_optional_customer(req))
+        self.assertIsNone(resolved)
+
 
 class TestFeature2ExchangeRateSingleSourceOfTruth(unittest.TestCase):
     """Verifies Settings exchange rate as single authoritative default, snapshot preservation, and manual overrides."""

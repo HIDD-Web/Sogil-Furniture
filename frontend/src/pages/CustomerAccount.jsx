@@ -19,7 +19,8 @@ export default function CustomerAccount() {
   const { customer, checked, register, login, logout } = useCustomer();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const returnUrl = searchParams.get("returnUrl");
+  const rawReturnUrl = searchParams.get("returnUrl");
+  const returnUrl = rawReturnUrl && rawReturnUrl.startsWith("/") && !rawReturnUrl.startsWith("//") && !rawReturnUrl.startsWith("/\\") ? rawReturnUrl : null;
   const isFromCheckout = returnUrl === "/checkout" || (returnUrl && returnUrl.startsWith("/checkout"));
 
   const [mode, setMode] = useState(searchParams.get("mode") === "register" ? "register" : "login");
