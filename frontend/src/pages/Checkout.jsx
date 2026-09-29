@@ -22,11 +22,13 @@ const Chip = ({ active, onClick, children, testid }) => (
 export default function Checkout() {
   const { items, productSubtotal, clear } = useCart();
   const { t } = useLang();
-  const { customer } = useCustomer();
+  const { customer, checked: customerChecked, customerLoading } = useCustomer();
   const navigate = useNavigate();
   const [zones, setZones] = useState([]);
   const [store, setStore] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [validatingPromo, setValidatingPromo] = useState(false);
+  const [validatingReferral, setValidatingReferral] = useState(false);
   const [delivery, setDelivery] = useState({ method: "", zone_id: "" });
   const [cust, setCust] = useState({ name: "", phone: "", phone_number: "", address: "", maps: "", payment: "", notes: "" });
   const [disc, setDisc] = useState({ code: "", amount: 0, applied: false });
@@ -49,14 +51,24 @@ export default function Checkout() {
   };
 
   const applyReferral = async (overrideCode) => {
+    if (validatingReferral) return;
     const codeToApply = (typeof overrideCode === "string" ? overrideCode : ref.code).trim();
     if (!codeToApply) return;
+
+    // If customer authentication is still loading/resolving from token, do not treat as guest
+    if (customerLoading) {
+      toast.info("Memeriksa status akun, silakan coba sesaat lagi...");
+      return;
+    }
+
     if (!customer) {
       toast.info(t("sum.promo_require_auth"));
       saveDraft(disc.code, codeToApply);
       navigate("/akun?returnUrl=/checkout");
       return;
     }
+
+    setValidatingReferral(true);
     try {
       const { data } = await api.post("/referral/validate", { code: codeToApply, subtotal: productSubtotal });
       if (data.valid) {
@@ -72,6 +84,8 @@ export default function Checkout() {
       }
     } catch {
       toast.error("Kode referral tidak valid");
+    } finally {
+      setValidatingReferral(false);
     }
   };
 
@@ -79,14 +93,24 @@ export default function Checkout() {
   const usedPts = Math.max(0, Math.min(Number(pts) || 0, maxPts));
 
   const applyDiscount = async (overrideCode) => {
+    if (validatingPromo) return;
     const codeToApply = (typeof overrideCode === "string" ? overrideCode : disc.code).trim();
     if (!codeToApply) return;
+
+    // If customer authentication is still loading/resolving from token, do not treat as guest
+    if (customerLoading) {
+      toast.info("Memeriksa status akun, silakan coba sesaat lagi...");
+      return;
+    }
+
     if (!customer) {
       toast.info(t("sum.promo_require_auth"));
       saveDraft(codeToApply, ref.code);
       navigate("/akun?returnUrl=/checkout");
       return;
     }
+
+    setValidatingPromo(true);
     try {
       const { data } = await api.post("/discounts/validate", { code: codeToApply, subtotal: productSubtotal });
       if (data.valid) {
@@ -102,6 +126,8 @@ export default function Checkout() {
       }
     } catch {
       toast.error(t("sum.discount_bad"));
+    } finally {
+      setValidatingPromo(false);
     }
   };
 
@@ -131,9 +157,9 @@ export default function Checkout() {
     }
   }, []);
 
-  // When customer is authenticated and productSubtotal is ready, automatically revalidate restored promo/referral
+  // When customer authentication is confirmed resolved and productSubtotal is ready, automatically revalidate restored promo/referral
   useEffect(() => {
-    if (customer && productSubtotal > 0 && pendingBenefit) {
+    if (customerChecked && customer && productSubtotal > 0 && pendingBenefit && !validatingPromo && !validatingReferral) {
       const benefit = pendingBenefit;
       setPendingBenefit(null);
       sessionStorage.removeItem("sogil_checkout_draft");
@@ -143,7 +169,8 @@ export default function Checkout() {
         applyReferral(benefit.code);
       }
     }
-  }, [customer, productSubtotal, pendingBenefit]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customerChecked, customer, productSubtotal, pendingBenefit, validatingPromo, validatingReferral]);
 
   const rate = store?.exchange_rate_idr_per_le || 357;
   const deliveryFee = useMemo(() => {
@@ -282,14 +309,54 @@ export default function Checkout() {
               <div className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{t("sum.pengiriman")}</span><span className="font-medium">{fmtLE(deliveryFee)} LE</span></div>
             </div>
             <div className="mt-3 flex gap-2">
-              <Input value={disc.code} onChange={(e) => setDisc({ ...disc, code: e.target.value, applied: false })} placeholder={t("sum.discount_ph")} data-testid="discount-code" className="h-10 bg-white" />
-              <Button onClick={applyDiscount} data-testid="apply-discount" variant="outline" className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]">{t("sum.discount_apply")}</Button>
+              <Input
+                value={disc.code}
+                onChange={(e) => setDisc({ ...disc, code: e.target.value, applied: false })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    applyDiscount();
+                  }
+                }}
+                placeholder={t("sum.discount_ph")}
+                data-testid="discount-code"
+                className="h-10 bg-white"
+              />
+              <Button
+                onClick={() => applyDiscount()}
+                disabled={validatingPromo}
+                data-testid="apply-discount"
+                variant="outline"
+                className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]"
+              >
+                {validatingPromo ? "..." : t("sum.discount_apply")}
+              </Button>
             </div>
             {customer && (<>
               {ref.applied && <div className="mt-2 flex justify-between text-sm text-[#738678]"><span>Referral ({ref.code})</span><span className="font-medium">-{fmtLE(ref.amount)} LE</span></div>}
               <div className="mt-2 flex gap-2">
-                <Input value={ref.code} onChange={(e) => setRef({ ...ref, code: e.target.value, applied: false })} placeholder="Kode referral" data-testid="referral-code" className="h-10 bg-white" />
-                <Button onClick={applyReferral} data-testid="apply-referral" variant="outline" className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]">Pakai</Button>
+                <Input
+                  value={ref.code}
+                  onChange={(e) => setRef({ ...ref, code: e.target.value, applied: false })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      applyReferral();
+                    }
+                  }}
+                  placeholder="Kode referral"
+                  data-testid="referral-code"
+                  className="h-10 bg-white"
+                />
+                <Button
+                  onClick={() => applyReferral()}
+                  disabled={validatingReferral}
+                  data-testid="apply-referral"
+                  variant="outline"
+                  className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]"
+                >
+                  {validatingReferral ? "..." : "Pakai"}
+                </Button>
               </div>
               {maxPts > 0 && (
                 <div className="mt-2">

@@ -8,11 +8,18 @@ export const CustomerProvider = ({ children }) => {
   const [checked, setChecked] = useState(false);
 
   useEffect(() => {
+    const token = localStorage.getItem("customer_token");
+    if (!token) {
+      setCustomer(null);
+      setChecked(true);
+      return;
+    }
+
     api.get("/customer/me")
       .then((r) => setCustomer(r.data))
       .catch(() => {
         localStorage.removeItem("customer_token");
-        setCustomer(false);
+        setCustomer(null);
       })
       .finally(() => setChecked(true));
   }, []);
@@ -23,6 +30,7 @@ export const CustomerProvider = ({ children }) => {
       localStorage.setItem("customer_token", data.token);
     }
     setCustomer(data);
+    setChecked(true);
     return data;
   };
 
@@ -32,16 +40,36 @@ export const CustomerProvider = ({ children }) => {
       localStorage.setItem("customer_token", data.token);
     }
     setCustomer(data);
+    setChecked(true);
     return data;
   };
 
   const logout = async () => {
     localStorage.removeItem("customer_token");
     try { await api.post("/customer/logout"); } catch (e) {}
-    setCustomer(false);
+    setCustomer(null);
+    setChecked(true);
   };
 
-  return <CustomerContext.Provider value={{ customer, checked, register, login, logout, setCustomer }}>{children}</CustomerContext.Provider>;
+  const customerLoading = !checked;
+  const customerAuthChecked = checked;
+
+  return (
+    <CustomerContext.Provider
+      value={{
+        customer,
+        checked,
+        customerLoading,
+        customerAuthChecked,
+        register,
+        login,
+        logout,
+        setCustomer,
+      }}
+    >
+      {children}
+    </CustomerContext.Provider>
+  );
 };
 
 export const useCustomer = () => useContext(CustomerContext);

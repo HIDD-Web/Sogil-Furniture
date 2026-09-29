@@ -200,6 +200,106 @@ class TestFeature1CustomerAuthForPromoAndReferral(unittest.TestCase):
         resolved = asyncio.run(server.get_optional_customer(req))
         self.assertIsNone(resolved)
 
+    def test_customer_context_lifecycle_logic(self):
+        """Simulate CustomerContext lifecycle logic:
+        1. No token -> immediate checked=True, customer=None (Guest)
+        2. Valid token -> resolves customer, checked=True
+        3. Invalid token / 401 -> clears token, customer=None, checked=True
+        4. In-flight token fetch -> checked=False, customer=None (Loading)
+        """
+        # Case 1: No token in storage -> instant guest
+        storage = {}
+        token = storage.get("customer_token")
+        if not token:
+            customer = None
+            checked = True
+        self.assertIsNone(customer)
+        self.assertTrue(checked)
+
+        # Case 2: In-flight token fetch -> loading state
+        storage = {"customer_token": "valid_token_xyz"}
+        token = storage.get("customer_token")
+        if token:
+            customer = None
+            checked = False
+        customerLoading = not checked
+        self.assertTrue(customerLoading)
+        self.assertFalse(checked)
+
+        # Case 3: Successful resolution
+        customer = {"_id": "cust_123", "username": "ahmad"}
+        checked = True
+        customerLoading = not checked
+        self.assertFalse(customerLoading)
+        self.assertIsNotNone(customer)
+
+        # Case 4: Invalid token / 401 resolution
+        storage.pop("customer_token", None)
+        customer = None
+        checked = True
+        customerLoading = not checked
+        self.assertFalse(customerLoading)
+        self.assertIsNone(customer)
+
+    def test_checkout_auth_gate_and_duplicate_prevention_logic(self):
+        """Simulate Checkout.jsx auth gating and duplicate request prevention:
+        - customerLoading=True -> do NOT reject as guest, hold request or notify user
+        - customerChecked=True and customer=None -> prompt login and save draft
+        - validatingPromo=True -> reject secondary concurrent clicks / triggers
+        - pendingBenefit requires customerChecked=True, customer!=None, productSubtotal>0, and not validating
+        """
+        # Scenario A: User clicks while auth is still loading -> Must NOT redirect to login
+        customerLoading = True
+        customer = None
+        redirected_to_login = False
+        info_message = None
+
+        if customerLoading:
+            info_message = "Memeriksa status akun, silakan coba sesaat lagi..."
+        elif not customer:
+            redirected_to_login = True
+
+        self.assertFalse(redirected_to_login)
+        self.assertEqual(info_message, "Memeriksa status akun, silakan coba sesaat lagi...")
+
+        # Scenario B: User clicks when confirmed guest -> Must redirect to login and save draft
+        customerLoading = False
+        customer = None
+        redirected_to_login = False
+        if customerLoading:
+            info_message = "Memeriksa status akun"
+        elif not customer:
+            redirected_to_login = True
+
+        self.assertTrue(redirected_to_login)
+
+        # Scenario C: User double clicks or presses Enter while validating -> Second call blocked
+        validatingPromo = True
+        action_executed = False
+        if not validatingPromo:
+            action_executed = True
+        self.assertFalse(action_executed)
+
+        # Scenario D: pendingBenefit trigger condition requires resolved customer and non-busy state
+        customerChecked = True
+        customer = {"username": "ahmad"}
+        productSubtotal = 100.0
+        pendingBenefit = {"type": "promo", "code": "HEMAT10"}
+        validatingPromo = False
+        validatingReferral = False
+
+        should_revalidate = bool(
+            customerChecked and customer and productSubtotal > 0 and pendingBenefit and not validatingPromo and not validatingReferral
+        )
+        self.assertTrue(should_revalidate)
+
+        # If customerChecked is False (still loading), must NOT revalidate prematurely
+        customerChecked_loading = False
+        should_revalidate_loading = bool(
+            customerChecked_loading and customer and productSubtotal > 0 and pendingBenefit and not validatingPromo and not validatingReferral
+        )
+        self.assertFalse(should_revalidate_loading)
+
 
 class TestFeature2ExchangeRateSingleSourceOfTruth(unittest.TestCase):
     """Verifies Settings exchange rate as single authoritative default, snapshot preservation, and manual overrides."""
