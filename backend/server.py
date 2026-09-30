@@ -13,6 +13,7 @@ import logging
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uuid
+import secrets
 import json
 import re
 import urllib.parse
@@ -269,6 +270,7 @@ class OrderInput(BaseModel):
     referral_code: Optional[str] = None
     redeem_points: Optional[float] = 0
     phone_number: Optional[str] = None
+    invoice_id: Optional[str] = None
 
 class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
@@ -365,6 +367,10 @@ class InvoiceConvertInput(BaseModel):
     customer_address: Optional[str] = None
     customer_maps_url: Optional[str] = None
     notes: Optional[str] = None
+
+class CustomerClaimInput(BaseModel):
+    invoice_number: str
+    claim_code: str
 
 class AdminCreateInput(BaseModel):
     name: str
@@ -962,8 +968,337 @@ async def generate_order_number():
         seq += 1
     return f"{prefix}{seq:03d}"
 
+CLAIM_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+def generate_claim_code(length: int = 8) -> str:
+    return "".join(secrets.choice(CLAIM_CHARSET) for _ in range(length))
+
+def hash_claim_code(code: str) -> str:
+    return bcrypt.hashpw(code.strip().upper().encode(), bcrypt.gensalt()).decode()
+
+def verify_claim_code(code: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(code.strip().upper().encode(), hashed.encode())
+    except Exception:
+        return False
+
+class ConcurrencyConflictError(Exception):
+    pass
+
+async def execute_transaction_with_safety(motor_client, coro_func):
+    """
+    Executes coro_func(session) inside a MongoDB multi-document transaction.
+    If the deployment is a local standalone MongoDB instance lacking replica set support,
+    falls back gracefully to atomic operations with compensating rollback.
+    In production (Atlas replica set), transactions are strictly executed and
+    any error inside coro_func will properly abort the transaction without fallback.
+    """
+    session = None
+    use_tx = False
+    if hasattr(motor_client, "start_session"):
+        try:
+            session = await motor_client.start_session()
+            use_tx = True
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation):
+            session = None
+            use_tx = False
+        except Exception as e:
+            session = None
+            use_tx = False
+
+    if use_tx and session:
+        try:
+            async with session:
+                async with session.start_transaction():
+                    return await coro_func(session)
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation) as e:
+            logger.warning(f"Standalone deployment detected during transaction start ({e}); using atomic fallback.")
+            return await coro_func(None)
+    else:
+        return await coro_func(None)
+
+async def record_failed_claim_attempt(request: Request, customer_id: Optional[str], invoice_number: str):
+    ip = request.client.host if request.client else "unknown"
+    now = datetime.now(timezone.utc)
+    try:
+        await db.claim_attempts.insert_one({
+            "ip": ip,
+            "customer_id": customer_id,
+            "invoice_number": invoice_number,
+            "created_at": now
+        })
+    except Exception as e:
+        logger.error(f"Error recording failed claim attempt: {e}")
+
+async def enforce_claim_rate_limit(request: Request, customer_id: Optional[str], invoice_number: str):
+    ip = request.client.host if request.client else "unknown"
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    or_clauses = [{"ip": ip}]
+    if customer_id:
+        or_clauses.append({"customer_id": customer_id})
+    try:
+        failures = await db.claim_attempts.count_documents({
+            "created_at": {"$gte": cutoff},
+            "$or": or_clauses
+        })
+        if failures >= 5:
+            raise HTTPException(status_code=429, detail="Terlalu banyak percobaan klaim gagal. Silakan coba lagi 15 menit kemudian.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking claim rate limit: {e}")
+
+def clean_customer_invoice(inv: dict) -> dict:
+    d = clean(inv)
+    d.pop("internal_note", None)
+    if "claim" in d and isinstance(d["claim"], dict):
+        d["claim"].pop("code_hash", None)
+    return d
+
+async def _create_invoice_order(request: Request, data: OrderInput):
+    buyer = await get_optional_customer(request)
+    if not buyer:
+        raise HTTPException(status_code=401, detail="Silakan login untuk memproses pesanan invoice.")
+    buyer_id = str(buyer["_id"])
+
+    inv = await db.invoices.find_one({"_id": id_query(data.invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    # Idempotency check before transaction
+    if inv.get("status") == "CONVERTED" and inv.get("order_id"):
+        existing_order = await db.orders.find_one({"_id": id_query(inv["order_id"])})
+        if existing_order:
+            existing_order = clean(existing_order)
+            existing_order["whatsapp_message"] = build_whatsapp_message(existing_order)
+            existing_order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+            return existing_order
+
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat diproses.")
+    if inv.get("status") != "CLAIMED":
+        raise HTTPException(status_code=400, detail=f"Invoice dalam status {inv.get('status')} tidak dapat diproses.")
+
+    claimed_by = inv.get("claim", {}).get("claimed_by_customer_id")
+    if claimed_by != buyer_id:
+        raise HTTPException(status_code=403, detail="Anda bukan pemilik klaim invoice ini.")
+
+    # Validate delivery & address inputs
+    if not data.customer_name.strip():
+        raise HTTPException(status_code=400, detail="Nama tidak boleh kosong.")
+    phone = normalize_phone(data.customer_phone)
+    if not phone or not valid_intl_phone(phone):
+        raise HTTPException(status_code=400, detail="No HP harus diawali + dan kode negara. Contoh: +62xxxxxxxxxx")
+    egypt_phone = normalize_egypt_phone(data.phone_number) if data.phone_number else None
+    if not data.customer_address.strip():
+        raise HTTPException(status_code=400, detail="Alamat tidak boleh kosong.")
+    if data.delivery_method not in ("delivery", "pickup"):
+        raise HTTPException(status_code=400, detail="Silakan pilih metode penerimaan barang.")
+    if data.payment_method not in ("cash", "transfer"):
+        raise HTTPException(status_code=400, detail="Silakan pilih metode pembayaran.")
+
+    maps = (data.customer_maps_url or "").strip()
+    if maps and not re.match(r"^https?://", maps):
+        raise HTTPException(status_code=400, detail="Link Maps tidak valid.")
+
+    delivery_fee = 0.0; zone_name = None; zone_id = None
+    if data.delivery_method == "delivery":
+        if not data.delivery_zone_id:
+            raise HTTPException(status_code=400, detail="Silakan pilih zona pengiriman.")
+        zone = await db.delivery_zones.find_one({"_id": id_query(data.delivery_zone_id)})
+        if not zone or not zone.get("active"):
+            raise HTTPException(status_code=400, detail="Zona pengiriman tidak valid.")
+        delivery_fee = _num(zone["fee_le"]); zone_name = zone["name"]; zone_id = str(zone["_id"])
+
+    items_input = inv.get("items") or []
+    if not items_input:
+        raise HTTPException(status_code=400, detail="Invoice tidak memiliki item.")
+
+    order_items = []
+    for it in items_input:
+        product_id = it.get("product_id") or str(inv["_id"])
+        category = "custom" if it.get("item_type") == "custom" or not it.get("product_id") else "catalog"
+        order_items.append({
+            "product_id": str(product_id),
+            "product_name_snapshot": it.get("name"),
+            "category": category,
+            "configuration_snapshot": {
+                "invoice_number": inv.get("invoice_number"),
+                "item_type": it.get("item_type"),
+                "product_slug": it.get("product_slug"),
+                "description": it.get("description"),
+                "dimensions": it.get("dimensions") or {},
+                "material": it.get("material") or "",
+                "finishing": it.get("finishing") or "",
+                "notes": it.get("notes") or "",
+                "custom_size": True if category == "custom" else False,
+            },
+            "quantity": int(it.get("quantity") or 1),
+            "unit_price_le": _num(it.get("unit_price")),
+            "subtotal_le": _num(it.get("line_total")),
+        })
+
+    subtotal_le = _num(inv.get("subtotal"))
+    invoice_discount_le = _num(inv.get("discount_amount"))
+    additional_fee_le = _num(inv.get("additional_fee"))
+
+    # Promo discount (optional)
+    promo_discount_le = 0.0
+    disc_doc = None
+    if data.discount_code:
+        promo_discount_le, disc_doc, disc_err = await validate_discount(data.discount_code, subtotal_le)
+        if disc_err:
+            raise HTTPException(status_code=400, detail=disc_err)
+
+    # Points redemption (optional)
+    points_redeemed = 0.0
+    redeem_req = _num(data.redeem_points)
+    if redeem_req > 0:
+        max_pct = _num(await get_setting("point_redeem_max_pct", 50), 50)
+        cap = min(subtotal_le * max_pct / 100.0, _num(buyer.get("points_available")))
+        points_redeemed = round(min(redeem_req, cap), 2)
+        if points_redeemed < 0:
+            points_redeemed = 0.0
+
+    total_le = max(0.0, subtotal_le - invoice_discount_le - promo_discount_le - points_redeemed + delivery_fee + additional_fee_le)
+    rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    now = datetime.now(timezone.utc).isoformat()
+    order_num = await generate_order_number()
+
+    order_doc = {
+        "order_number": order_num,
+        "customer_name": data.customer_name.strip(),
+        "customer_phone": phone,
+        "phone_number": egypt_phone,
+        "customer_address": data.customer_address.strip(),
+        "customer_maps_url": maps,
+        "delivery_method": data.delivery_method,
+        "delivery_zone_id": zone_id,
+        "delivery_zone_name": zone_name,
+        "delivery_fee_le": delivery_fee,
+        "payment_method": data.payment_method,
+        "payment_status": "belum_dibayar",
+        "order_status": "pesanan_masuk",
+        "notes": (data.notes or "").strip(),
+        "admin_note": f"Dibuat dari Invoice {inv.get('invoice_number')}",
+        "items": order_items,
+        "item": order_items[0],
+        "subtotal_le": subtotal_le,
+        "invoice_discount_le": invoice_discount_le,
+        "discount_code": (disc_doc.get("code") if disc_doc else None),
+        "discount_percentage": (_num(disc_doc.get("percentage")) if disc_doc else 0),
+        "discount_le": promo_discount_le,
+        "referral": None,
+        "referral_discount_le": 0.0,
+        "points_redeemed_le": points_redeemed,
+        "customer_id": buyer_id,
+        "customer_username": (buyer.get("username") if buyer else None),
+        "total_le": total_le,
+        "additional_fee_le": additional_fee_le,
+        "invoice_id": str(inv["_id"]),
+        "invoice_number": inv.get("invoice_number"),
+        "exchange_rate_idr_per_le": rate,
+        "estimated_total_idr": round(total_le * rate),
+        "rate_timestamp": now,
+        "requires_admin_confirmation": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    async def _execute_conversion_tx(session):
+        ins_kw = {"session": session} if session else {}
+        order_res = await db.orders.insert_one(order_doc, **ins_kw)
+        created_order_id = str(order_res.inserted_id)
+
+        try:
+            upd_kw = {"session": session} if session else {}
+            inv_upd = await db.invoices.find_one_and_update(
+                {
+                    "_id": inv["_id"],
+                    "status": "CLAIMED",
+                    "order_id": None
+                },
+                {
+                    "$set": {
+                        "status": "CONVERTED",
+                        "order_id": created_order_id,
+                        "order_number": order_num,
+                        "converted_at": now,
+                        "updated_at": now,
+                        "updated_by": f"Customer ({buyer.get('username')})"
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+                **upd_kw
+            )
+            if not inv_upd:
+                # Concurrency race: someone else converted it
+                raise ConcurrencyConflictError("Invoice sudah dikonversi sebelumnya.")
+
+            if disc_doc:
+                await db.discounts.update_one({"_id": disc_doc["_id"]}, {"$inc": {"claims": 1}}, **ins_kw)
+            if points_redeemed > 0:
+                newb = _num(buyer.get("points_available")) - points_redeemed
+                await db.customers.update_one(
+                    {"_id": id_query(buyer_id)},
+                    {"$inc": {"points_available": -points_redeemed, "points_redeemed": points_redeemed}},
+                    **ins_kw
+                )
+                await db.point_transactions.insert_one({
+                    "customer_id": buyer_id, "type": "redeem", "amount": -points_redeemed,
+                    "order_id": created_order_id, "reason": f"Penukaran poin invoice {inv.get('invoice_number')}",
+                    "balance_after": newb, "created_at": now
+                }, **ins_kw)
+
+            # Update custom request if source linked
+            src_cr_id = inv.get("source", {}).get("custom_request_id")
+            if src_cr_id:
+                await db.custom_requests.update_one(
+                    {"_id": id_query(src_cr_id)},
+                    {"$set": {
+                        "status": "dipesan",
+                        "converted_order_id": created_order_id,
+                        "invoice_id": str(inv["_id"]),
+                        "updated_at": now,
+                    }},
+                    **ins_kw
+                )
+        except Exception:
+            if not session:
+                # Compensation rollback in standalone dev mode
+                await db.orders.delete_one({"_id": order_res.inserted_id})
+                await db.invoices.update_one(
+                    {"_id": inv["_id"], "order_id": created_order_id},
+                    {"$set": {"status": "CLAIMED", "order_id": None, "order_number": None, "converted_at": None}}
+                )
+            raise
+
+        return created_order_id
+
+    try:
+        created_id = await execute_transaction_with_safety(client, _execute_conversion_tx)
+    except ConcurrencyConflictError:
+        fresh_inv = await db.invoices.find_one({"_id": inv["_id"]})
+        if fresh_inv and fresh_inv.get("order_id"):
+            ex_order = await db.orders.find_one({"_id": id_query(fresh_inv["order_id"])})
+            if ex_order:
+                ex_order = clean(ex_order)
+                ex_order["whatsapp_message"] = build_whatsapp_message(ex_order)
+                ex_order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+                return ex_order
+        raise HTTPException(status_code=409, detail="Invoice sudah dikonversi sebelumnya.")
+
+    created_order = await db.orders.find_one({"_id": id_query(created_id)})
+    created_order = clean(created_order)
+    created_order["whatsapp_message"] = build_whatsapp_message(created_order)
+    created_order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+    return created_order
+
 @api_router.post("/orders")
 async def create_order(request: Request, data: OrderInput):
+    if data.invoice_id:
+        return await _create_invoice_order(request, data)
+
     if not data.customer_name.strip():
         raise HTTPException(status_code=400, detail="Nama tidak boleh kosong.")
     phone = normalize_phone(data.customer_phone)
@@ -2080,6 +2415,12 @@ async def admin_create_invoice(data: InvoiceInput, admin: dict = Depends(require
     invoice_doc = {
         "status": init_status,
         "customer": customer_snapshot,
+        "claim": {
+            "code_hash": None,
+            "claimed_by_customer_id": None,
+            "claimed_at": None,
+            "generated_at": None,
+        },
         "source": {
             "custom_request_id": source_custom_request_id
         },
@@ -2126,6 +2467,9 @@ async def admin_update_invoice(invoice_id: str, data: InvoiceUpdateInput, admin:
         raise HTTPException(status_code=400, detail="Invoice yang sudah dikonversi menjadi pesanan tidak dapat diubah.")
     if inv.get("status") == "CANCELLED":
         raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat diubah.")
+    if inv.get("status") == "CLAIMED":
+        if data.items is not None or data.discount_amount is not None or data.delivery_fee is not None or data.additional_fee is not None or data.customer is not None:
+            raise HTTPException(status_code=400, detail="Invoice yang sudah diklaim oleh pelanggan tidak dapat diubah rincian produk, harga, atau pemiliknya.")
 
     now = datetime.now(timezone.utc).isoformat()
     upd = {
@@ -2199,6 +2543,8 @@ async def admin_send_invoice(invoice_id: str, admin: dict = Depends(require_perm
         raise HTTPException(status_code=400, detail="Invoice sudah dikonversi menjadi pesanan.")
     if inv.get("status") == "CANCELLED":
         raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat dikirim.")
+    if inv.get("status") == "CLAIMED":
+        raise HTTPException(status_code=400, detail="Invoice sudah diklaim oleh pelanggan.")
 
     now = datetime.now(timezone.utc).isoformat()
     await db.invoices.update_one(
@@ -2236,6 +2582,138 @@ async def admin_cancel_invoice(invoice_id: str, admin: dict = Depends(require_pe
     )
     updated = await db.invoices.find_one({"_id": inv["_id"]})
     return clean(updated)
+
+@api_router.post("/admin/invoices/{invoice_id}/claim-code")
+async def admin_generate_claim_code_endpoint(
+    invoice_id: str,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    if inv.get("status") == "CONVERTED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dikonversi tidak dapat dibuatkan kode klaim.")
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat dibuatkan kode klaim.")
+
+    raw_code = generate_claim_code(8)
+    code_hash = hash_claim_code(raw_code)
+    now = datetime.now(timezone.utc).isoformat()
+
+    new_status = "SENT" if inv.get("status") == "DRAFT" else inv.get("status")
+    upd = {
+        "status": new_status,
+        "claim.code_hash": code_hash,
+        "claim.generated_at": now,
+        "updated_at": now,
+        "updated_by": admin.get("name", "Admin")
+    }
+    if new_status == "SENT" and not inv.get("sent_at"):
+        upd["sent_at"] = now
+
+    await db.invoices.update_one({"_id": inv["_id"]}, {"$set": upd})
+
+    return {
+        "ok": True,
+        "claim_code": raw_code,
+        "generated_at": now,
+        "status": new_status,
+        "message": "Kode klaim baru berhasil dibuat."
+    }
+
+@api_router.post("/customer/invoices/claim")
+async def customer_claim_invoice(
+    payload: CustomerClaimInput,
+    request: Request,
+    c: dict = Depends(get_current_customer)
+):
+    inv_num = (payload.invoice_number or "").strip().upper()
+    raw_code = (payload.claim_code or "").strip().upper()
+    current_cid = str(c["_id"])
+
+    if not inv_num or not raw_code:
+        raise HTTPException(status_code=400, detail="Nomor invoice dan kode klaim wajib diisi.")
+
+    await enforce_claim_rate_limit(request, current_cid, inv_num)
+
+    inv = await db.invoices.find_one({"invoice_number": inv_num})
+    if not inv:
+        await record_failed_claim_attempt(request, current_cid, inv_num)
+        raise HTTPException(status_code=400, detail="Nomor invoice atau kode klaim salah.")
+
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Invoice ini sudah dibatalkan dan tidak dapat diklaim.")
+    if inv.get("status") == "CONVERTED":
+        raise HTTPException(status_code=400, detail="Invoice ini sudah diproses menjadi pesanan.")
+    if inv.get("status") == "DRAFT":
+        raise HTTPException(status_code=400, detail="Invoice belum siap diklaim. Silakan hubungi admin.")
+
+    # Authoritative claim ownership verification
+    claimed_by = inv.get("claim", {}).get("claimed_by_customer_id")
+    if claimed_by:
+        if claimed_by == current_cid:
+            # Idempotent return: already claimed by THIS customer
+            return clean_customer_invoice(inv)
+        else:
+            # Claimed by a DIFFERENT customer account
+            raise HTTPException(status_code=409, detail="Invoice sudah terhubung ke akun pelanggan lain.")
+
+    # Verify claim code
+    code_hash = inv.get("claim", {}).get("code_hash")
+    if not code_hash or not verify_claim_code(raw_code, code_hash):
+        await record_failed_claim_attempt(request, current_cid, inv_num)
+        raise HTTPException(status_code=400, detail="Nomor invoice atau kode klaim salah.")
+
+    # Atomic transition from SENT to CLAIMED
+    now = datetime.now(timezone.utc).isoformat()
+    claimed_inv = await db.invoices.find_one_and_update(
+        {
+            "_id": inv["_id"],
+            "status": "SENT",
+            "claim.claimed_by_customer_id": None
+        },
+        {
+            "$set": {
+                "status": "CLAIMED",
+                "claim.claimed_by_customer_id": current_cid,
+                "claim.claimed_at": now,
+                "customer.customer_id": current_cid,
+                "updated_at": now
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+
+    if not claimed_inv:
+        fresh = await db.invoices.find_one({"_id": inv["_id"]})
+        if fresh and fresh.get("claim", {}).get("claimed_by_customer_id") == current_cid:
+            return clean_customer_invoice(fresh)
+        raise HTTPException(status_code=409, detail="Invoice sudah terhubung ke akun pelanggan lain.")
+
+    return clean_customer_invoice(claimed_inv)
+
+@api_router.get("/customer/invoices")
+async def customer_list_invoices(c: dict = Depends(get_current_customer)):
+    current_cid = str(c["_id"])
+    cursor = db.invoices.find(
+        {"claim.claimed_by_customer_id": current_cid}
+    ).sort("created_at", -1)
+    invoices = []
+    async for doc in cursor:
+        invoices.append(clean_customer_invoice(doc))
+    return invoices
+
+@api_router.get("/customer/invoices/{invoice_id}")
+async def customer_get_invoice(invoice_id: str, c: dict = Depends(get_current_customer)):
+    current_cid = str(c["_id"])
+    inv = await db.invoices.find_one({
+        "_id": id_query(invoice_id),
+        "claim.claimed_by_customer_id": current_cid
+    })
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+    return clean_customer_invoice(inv)
 
 @api_router.post("/admin/invoices/{invoice_id}/convert")
 async def admin_convert_invoice_to_order(
@@ -2288,7 +2766,6 @@ async def admin_convert_invoice_to_order(
             "subtotal_le": _num(it.get("line_total")),
         })
 
-    # Call EXACT existing order numbering generator
     order_num = await generate_order_number()
     rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
     now = datetime.now(timezone.utc).isoformat()
@@ -2348,6 +2825,7 @@ async def admin_convert_invoice_to_order(
         "items": order_items,
         "item": order_items[0],
         "subtotal_le": subtotal_le,
+        "invoice_discount_le": discount_le,
         "discount_code": None,
         "discount_percentage": 0,
         "discount_le": discount_le,
@@ -2368,22 +2846,55 @@ async def admin_convert_invoice_to_order(
         "updated_at": now,
     }
 
-    # Atomic condition check on invoice conversion transition
-    # Only update invoice if status is not already CONVERTED
-    converted_upd = await db.invoices.find_one_and_update(
-        {"_id": inv["_id"], "status": {"$ne": "CONVERTED"}, "order_id": None},
-        {"$set": {
-            "status": "CONVERTED",
-            "order_number": order_num,
-            "converted_at": now,
-            "updated_at": now,
-            "updated_by": admin.get("name", "Admin")
-        }},
-        return_document=ReturnDocument.AFTER
-    )
+    async def _execute_admin_conv_tx(session):
+        ins_kw = {"session": session} if session else {}
+        order_res = await db.orders.insert_one(order_doc, **ins_kw)
+        created_order_id = str(order_res.inserted_id)
 
-    if not converted_upd:
-        # Race condition handled: another simultaneous request completed conversion first
+        try:
+            upd_kw = {"session": session} if session else {}
+            inv_upd = await db.invoices.find_one_and_update(
+                {"_id": inv["_id"], "status": {"$in": ["SENT", "CLAIMED", "DRAFT"]}, "order_id": None},
+                {"$set": {
+                    "status": "CONVERTED",
+                    "order_id": created_order_id,
+                    "order_number": order_num,
+                    "converted_at": now,
+                    "updated_at": now,
+                    "updated_by": admin.get("name", "Admin")
+                }},
+                return_document=ReturnDocument.AFTER,
+                **upd_kw
+            )
+            if not inv_upd:
+                raise ConcurrencyConflictError("Invoice sudah dikonversi sebelumnya.")
+
+            src_cr_id = inv.get("source", {}).get("custom_request_id")
+            if src_cr_id:
+                await db.custom_requests.update_one(
+                    {"_id": id_query(src_cr_id)},
+                    {"$set": {
+                        "status": "dipesan",
+                        "converted_order_id": created_order_id,
+                        "invoice_id": str(inv["_id"]),
+                        "updated_at": now,
+                    }},
+                    **ins_kw
+                )
+        except Exception:
+            if not session:
+                await db.orders.delete_one({"_id": order_res.inserted_id})
+                await db.invoices.update_one(
+                    {"_id": inv["_id"], "order_id": created_order_id},
+                    {"$set": {"status": inv.get("status", "SENT"), "order_id": None, "order_number": None, "converted_at": None}}
+                )
+            raise
+
+        return created_order_id, inv_upd
+
+    try:
+        created_order_id, inv_upd = await execute_transaction_with_safety(client, _execute_admin_conv_tx)
+    except ConcurrencyConflictError:
         fresh_inv = await db.invoices.find_one({"_id": inv["_id"]})
         fresh_ord = await db.orders.find_one({"_id": id_query(fresh_inv.get("order_id"))}) if fresh_inv else None
         return {
@@ -2392,29 +2903,10 @@ async def admin_convert_invoice_to_order(
             "message": "Invoice sudah dikonversi sebelumnya (idempotent)."
         }
 
-    order_result = await db.orders.insert_one(order_doc)
-    order_id = str(order_result.inserted_id)
-
-    # Link created order ID back to invoice
-    await db.invoices.update_one({"_id": inv["_id"]}, {"$set": {"order_id": order_id}})
-    converted_upd["order_id"] = order_id
-
-    # If linked to a Custom Request, update its status
-    src_cr_id = inv.get("source", {}).get("custom_request_id")
-    if src_cr_id:
-        await db.custom_requests.update_one(
-            {"_id": id_query(src_cr_id)},
-            {"$set": {
-                "status": "dipesan",
-                "converted_order_id": order_id,
-                "invoice_id": str(inv["_id"]),
-                "updated_at": now,
-            }}
-        )
-
-    created_order = await db.orders.find_one({"_id": order_result.inserted_id})
+    fresh_inv = inv_upd or await db.invoices.find_one({"_id": inv["_id"]})
+    created_order = await db.orders.find_one({"_id": id_query(created_order_id)}) or order_doc
     return {
-        "invoice": clean(converted_upd),
+        "invoice": clean(fresh_inv),
         "order": clean(created_order),
         "message": "Invoice berhasil dikonversi menjadi pesanan."
     }
@@ -3428,6 +3920,11 @@ async def seed():
     await db.invoices.create_index([("created_at", -1)])
     await db.invoices.create_index("customer.whatsapp")
     await db.invoices.create_index("customer.name")
+    await db.invoices.create_index("claim.claimed_by_customer_id", sparse=True)
+    await db.invoices.create_index([("claim.claimed_by_customer_id", 1), ("created_at", -1)])
+    await db.claim_attempts.create_index("created_at", expireAfterSeconds=900)
+    await db.claim_attempts.create_index([("ip", 1), ("created_at", -1)])
+    await db.claim_attempts.create_index([("customer_id", 1), ("created_at", -1)])
 
     defaults = {
         "store_name": "Sogil Furniture",

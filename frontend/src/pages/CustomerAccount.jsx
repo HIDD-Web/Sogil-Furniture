@@ -1,10 +1,10 @@
-import React, { useEffect, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import api from "../lib/api";
 import { fmtLE, copyToClipboard } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
-import { ORDER_STATUS, PAYMENT_STATUS } from "../lib/constants";
+import { ORDER_STATUS, PAYMENT_STATUS, INVOICE_STATUS } from "../lib/constants";
 import { useCustomer } from "../context/CustomerContext";
+import { useCart } from "../context/CartContext";
 import { useLang } from "../context/LanguageContext";
 import { formatApiError } from "../lib/format";
 import { Button } from "../components/ui/button";
@@ -12,11 +12,12 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Badge } from "../components/ui/badge";
 import { toast } from "sonner";
-import { User, Gift, Copy, LogOut, Eye, EyeOff, Sparkles } from "lucide-react";
+import { User, Gift, Copy, LogOut, Eye, EyeOff, Sparkles, FileText, ArrowRight } from "lucide-react";
 
 export default function CustomerAccount() {
   const { t } = useLang();
   const { customer, checked, register, login, logout } = useCustomer();
+  const { loadInvoiceBundle } = useCart();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const rawReturnUrl = searchParams.get("returnUrl");
@@ -27,6 +28,7 @@ export default function CustomerAccount() {
   const [showPassword, setShowPassword] = useState(false);
   const [f, setF] = useState({ username: "", phone: "", password: "", identifier: "" });
   const [orders, setOrders] = useState([]);
+  const [invoices, setInvoices] = useState([]);
   const [points, setPoints] = useState(null);
   const [claim, setClaim] = useState({ order_number: "", phone: "" });
   const [showRecover, setShowRecover] = useState(false);
@@ -41,6 +43,7 @@ export default function CustomerAccount() {
         return;
       }
       api.get("/customer/orders").then((r) => setOrders(r.data)).catch(() => {});
+      api.get("/customer/invoices").then((r) => setInvoices(Array.isArray(r.data) ? r.data : [])).catch(() => {});
       api.get("/customer/points").then((r) => setPoints(r.data)).catch(() => {});
     }
   }, [customer, returnUrl, navigate]);
@@ -202,6 +205,97 @@ export default function CustomerAccount() {
         </div>
         <Button onClick={changePw} data-testid="pw-submit" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">{t("auth.pw_btn")}</Button>
       </div>
+
+      {/* Invoice Saya Section */}
+      <div className="mt-8 flex items-center justify-between">
+        <div>
+          <h2 className="font-heading text-lg font-bold text-[#2C1E16]">Invoice Saya</h2>
+          <p className="text-xs text-[#8B7355]">Penawaran & invoice khusus yang telah Anda klaim</p>
+        </div>
+        <Link to="/klaim-invoice">
+          <Button variant="outline" size="sm" className="rounded-xl border-[#8B5A2B] text-[#8B5A2B] text-xs hover:bg-[#FAF5EE]">
+            + Klaim Invoice Baru
+          </Button>
+        </Link>
+      </div>
+
+      {invoices.length === 0 ? (
+        <div className="mt-3 rounded-2xl border border-dashed border-[#E5DCC5] bg-white p-6 text-center text-xs text-[#8B7355]">
+          Belum ada invoice yang diklaim. Punya penawaran khusus dari admin?{" "}
+          <Link to="/klaim-invoice" className="text-[#8B5A2B] font-semibold underline">
+            Klaim di sini
+          </Link>
+        </div>
+      ) : (
+        <div className="mt-3 space-y-3">
+          {invoices.map((inv) => {
+            const isClaimed = inv.status === "CLAIMED";
+            const isConverted = inv.status === "CONVERTED";
+            const badgeMeta = INVOICE_STATUS[inv.status] || { label: inv.status, color: "bg-stone-100 text-stone-700" };
+
+            return (
+              <div
+                key={inv.id || inv._id}
+                className="rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 shadow-sm space-y-3"
+                data-testid={`cust-invoice-${inv.invoice_number}`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <FileText size={16} className="text-[#8B5A2B]" />
+                    <span className="font-heading font-bold text-sm text-[#2C1E16]">{inv.invoice_number}</span>
+                    <span className="text-xs text-[#8B7355]">
+                      · {inv.created_at ? new Date(inv.created_at).toLocaleDateString("id-ID") : ""}
+                    </span>
+                  </div>
+                  <Badge variant="outline" className={`${badgeMeta.color} text-xs px-2.5 py-0.5 font-medium`}>
+                    {isClaimed ? "Siap Dipesan" : badgeMeta.label}
+                  </Badge>
+                </div>
+
+                <div className="text-xs text-[#5C4A3D] space-y-1">
+                  {(inv.items || []).map((it, idx) => (
+                    <div key={idx} className="flex justify-between">
+                      <span>{it.name} ×{it.quantity}</span>
+                      <span className="font-mono text-[#8B7355]">{fmtLE(it.line_total)} LE</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="border-t border-[#F1EBE0] pt-2 flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-xs">
+                    <span className="text-[#8B7355]">Total Produk: </span>
+                    <strong className="font-heading text-sm text-[#8B5A2B]">{fmtLE(inv.total)} LE</strong>
+                    {Number(inv.discount_amount) > 0 && (
+                      <span className="ml-2 text-green-700 font-medium">
+                        (Diskon -{fmtLE(inv.discount_amount)} LE)
+                      </span>
+                    )}
+                  </div>
+
+                  {isClaimed && (
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        loadInvoiceBundle(inv);
+                        navigate("/checkout");
+                      }}
+                      className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-xs font-semibold text-white shadow-xs"
+                    >
+                      Lanjutkan Pesanan <ArrowRight size={13} className="ml-1.5" />
+                    </Button>
+                  )}
+
+                  {isConverted && inv.order_number && (
+                    <span className="text-xs font-medium text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200">
+                      Pesanan #{inv.order_number}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <h2 className="mt-8 font-heading text-lg font-bold text-[#2C1E16]">{t("auth.order_history")}</h2>
       {orders.length === 0 ? <div className="mt-3 rounded-2xl border border-dashed border-[#E5DCC5] bg-white p-8 text-center text-[#8B7355]">{t("auth.no_orders")}</div> : (

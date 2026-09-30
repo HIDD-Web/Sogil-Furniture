@@ -25,6 +25,7 @@ export default function AdminInvoices() {
     all: 0,
     draft: 0,
     sent: 0,
+    claimed: 0,
     converted: 0,
     cancelled: 0,
   });
@@ -37,6 +38,7 @@ export default function AdminInvoices() {
           all: allList.length,
           draft: allList.filter((x) => x.status === "DRAFT").length,
           sent: allList.filter((x) => x.status === "SENT").length,
+          claimed: allList.filter((x) => x.status === "CLAIMED").length,
           converted: allList.filter((x) => x.status === "CONVERTED").length,
           cancelled: allList.filter((x) => x.status === "CANCELLED").length,
         });
@@ -127,11 +129,12 @@ export default function AdminInvoices() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5 sm:gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3">
         {[
           { id: "all", label: "Semua", count: globalCounts.all, color: "text-[#2C1E16]" },
           { id: "DRAFT", label: "Draft", count: globalCounts.draft, color: "text-stone-700" },
-          { id: "SENT", label: "Menunggu Konfirmasi", count: globalCounts.sent, color: "text-blue-700" },
+          { id: "SENT", label: "Menunggu Klaim", count: globalCounts.sent, color: "text-blue-700" },
+          { id: "CLAIMED", label: "Sudah Diklaim", count: globalCounts.claimed, color: "text-amber-700" },
           { id: "CONVERTED", label: "Masuk Pesanan", count: globalCounts.converted, color: "text-emerald-700" },
           { id: "CANCELLED", label: "Dibatalkan", count: globalCounts.cancelled, color: "text-red-700" },
         ].map((card) => {
@@ -162,7 +165,8 @@ export default function AdminInvoices() {
           {[
             { id: "all", label: "Semua" },
             { id: "DRAFT", label: "Draft" },
-            { id: "SENT", label: "Menunggu Konfirmasi" },
+            { id: "SENT", label: "Menunggu Klaim" },
+            { id: "CLAIMED", label: "Sudah Diklaim" },
             { id: "CONVERTED", label: "Masuk Pesanan" },
             { id: "CANCELLED", label: "Dibatalkan" },
           ].map((tab) => (

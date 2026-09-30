@@ -22,6 +22,7 @@ import CaraPesan from "./pages/CaraPesan";
 import Kontak from "./pages/Kontak";
 import CustomerAccount from "./pages/CustomerAccount";
 import GuestTrackOrder from "./pages/GuestTrackOrder";
+import InvoiceClaim from "./pages/InvoiceClaim";
 
 import AdminLogin from "./pages/admin/AdminLogin";
 import AdminLayout from "./pages/admin/AdminLayout";
@@ -140,6 +141,8 @@ function Layout() {
         <Route path="/cara-pesan" element={<CaraPesan />} />
         <Route path="/kontak" element={<Kontak />} />
         <Route path="/akun" element={<CustomerAccount />} />
+        <Route path="/klaim-invoice" element={<InvoiceClaim />} />
+        <Route path="/klaim" element={<Navigate to="/klaim-invoice" replace />} />
         <Route path="/lacak" element={<GuestTrackOrder />} />
       </Routes>
     </CustomerShell>

@@ -20,7 +20,7 @@ const Chip = ({ active, onClick, children, testid }) => (
 );
 
 export default function Checkout() {
-  const { items, productSubtotal, clear } = useCart();
+  const { items, productSubtotal, clear, isInvoiceCart, activeInvoice } = useCart();
   const { t } = useLang();
   const { customer, checked: customerChecked, customerLoading } = useCustomer();
   const navigate = useNavigate();
@@ -178,7 +178,8 @@ export default function Checkout() {
     const z = zones.find((z) => z.id === delivery.zone_id);
     return z ? Number(z.fee_le) : 0;
   }, [delivery, zones]);
-  const totalLE = Math.max(0, productSubtotal - (ref.applied ? ref.amount : (disc.applied ? disc.amount : 0)) - usedPts + deliveryFee);
+  const invoiceDiscount = isInvoiceCart ? (activeInvoice?.invoice_discount_le || 0) : 0;
+  const totalLE = Math.max(0, productSubtotal - invoiceDiscount - (ref.applied ? ref.amount : (disc.applied ? disc.amount : 0)) - usedPts + deliveryFee);
 
   if (!items.length) {
     return (
@@ -209,9 +210,9 @@ export default function Checkout() {
     if (cust.maps && !/^https?:\/\//.test(cust.maps)) return toast.error(t("err.maps"));
 
     setSubmitting(true);
-    const notes = [cust.notes, ...items.filter((i) => i.config?.custom_size && i.config?.custom_note).map((i) => `Custom (${i.product.name}): ${i.config.custom_note}`)].filter(Boolean).join(" | ");
+    const notes = [cust.notes, ...items.filter((i) => i.config?.custom_size && i.config?.custom_note).map((i) => `Custom (${i.product?.name || i.name}): ${i.config.custom_note}`)].filter(Boolean).join(" | ");
     try {
-      const { data } = await api.post("/orders", {
+      const orderPayload = {
         customer_name: cust.name, customer_phone: phone, phone_number: normEgyptPhone, customer_address: cust.address,
         customer_maps_url: cust.maps, delivery_method: delivery.method,
         delivery_zone_id: delivery.method === "delivery" ? delivery.zone_id : null,
@@ -219,8 +220,12 @@ export default function Checkout() {
         discount_code: !ref.applied && disc.applied ? disc.code : null,
         referral_code: ref.applied ? ref.code : null,
         redeem_points: usedPts,
-        items: items.map((i) => ({ product_id: i.product.id, config: i.config, quantity: i.quantity })),
-      });
+        items: items.map((i) => ({ product_id: i.product?.id || i.product_id, config: i.config, quantity: i.quantity })),
+      };
+      if (isInvoiceCart && activeInvoice?.invoice_id) {
+        orderPayload.invoice_id = activeInvoice.invoice_id;
+      }
+      const { data } = await api.post("/orders", orderPayload);
       clear();
       navigate(`/pesanan/${data.id}`, { state: { order: data } });
     } catch (e) {
@@ -300,11 +305,17 @@ export default function Checkout() {
             <div className="mt-3 space-y-2">
               {items.map((it) => (
                 <div key={it.cartId} className="flex justify-between gap-3 text-sm">
-                  <span className="text-[#5C4A3D]">{it.product.name} <span className="text-[#8B7355]">×{it.quantity}</span><br /><span className="text-xs text-[#8B7355]">{config_summary_client(it.product.category, it.config, t)}</span></span>
+                  <span className="text-[#5C4A3D]">{it.product?.name || it.name} <span className="text-[#8B7355]">×{it.quantity}</span><br /><span className="text-xs text-[#8B7355]">{config_summary_client(it.product?.category, it.config, t)}</span></span>
                   <span className="font-medium text-[#2C1E16]">{it.breakdown?.requiresConfirm ? "—" : `${fmtLE(it.breakdown?.subtotal || 0)} LE`}</span>
                 </div>
               ))}
               <div className="flex justify-between border-t border-dashed border-[#E5DCC5] pt-2 text-sm"><span className="text-[#5C4A3D]">{t("sum.subtotal")}</span><span className="font-medium">{fmtLE(productSubtotal)} LE</span></div>
+              {invoiceDiscount > 0 && (
+                <div className="flex justify-between text-sm text-green-700 font-medium">
+                  <span>Diskon Invoice ({activeInvoice?.invoice_number})</span>
+                  <span>-{fmtLE(invoiceDiscount)} LE</span>
+                </div>
+              )}
               {disc.applied && <div className="flex justify-between text-sm text-[#738678]"><span>{t("sum.discount_line")} ({disc.code})</span><span className="font-medium">-{fmtLE(disc.amount)} LE</span></div>}
               <div className="flex justify-between text-sm"><span className="text-[#5C4A3D]">{t("sum.pengiriman")}</span><span className="font-medium">{fmtLE(deliveryFee)} LE</span></div>
             </div>

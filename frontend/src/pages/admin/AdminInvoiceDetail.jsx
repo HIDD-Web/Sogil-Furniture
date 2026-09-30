@@ -26,6 +26,8 @@ import {
   ShoppingBag,
   X,
   AlertTriangle,
+  KeyRound,
+  Copy,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
@@ -53,6 +55,29 @@ export default function AdminInvoiceDetail() {
     customer_maps_url: "",
     notes: "",
   });
+
+  // Claim Code Modal State
+  const [claimCodeModalOpen, setClaimCodeModalOpen] = useState(false);
+  const [claimCodeResult, setClaimCodeResult] = useState(null);
+  const [claimCodeLoading, setClaimCodeLoading] = useState(false);
+
+  const handleGenerateClaimCode = async () => {
+    if (!window.confirm("Buat kode klaim baru untuk invoice ini? Kode klaim sebelumnya (jika ada) akan kedaluwarsa.")) {
+      return;
+    }
+    setClaimCodeLoading(true);
+    try {
+      const { data } = await api.post(`/admin/invoices/${id}/claim-code`);
+      setClaimCodeResult(data);
+      setClaimCodeModalOpen(true);
+      toast.success("Kode klaim baru berhasil dibuat!");
+      loadInvoice();
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail) || "Gagal membuat kode klaim");
+    } finally {
+      setClaimCodeLoading(false);
+    }
+  };
 
   const loadInvoice = () => {
     setLoading(true);
@@ -163,6 +188,7 @@ export default function AdminInvoiceDetail() {
   const statusCfg = INVOICE_STATUS[invoice.status] || INVOICE_STATUS.DRAFT;
   const isDraft = invoice.status === "DRAFT";
   const isSent = invoice.status === "SENT";
+  const isClaimed = invoice.status === "CLAIMED";
   const isConverted = invoice.status === "CONVERTED" || Boolean(invoice.order_id);
   const isCancelled = invoice.status === "CANCELLED";
 
@@ -259,6 +285,47 @@ export default function AdminInvoiceDetail() {
                 <Pencil size={14} className="mr-1.5" /> Edit
               </Button>
               <Button
+                variant="outline"
+                size="sm"
+                disabled={claimCodeLoading}
+                onClick={handleGenerateClaimCode}
+                className="rounded-xl border-[#8B5A2B] text-xs font-semibold text-[#8B5A2B] hover:bg-[#FAF5EE]"
+              >
+                <KeyRound size={14} className="mr-1.5" /> Buat Kode Klaim
+              </Button>
+              <Button
+                size="sm"
+                disabled={actionLoading}
+                onClick={() => setConvertModalOpen(true)}
+                className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-xs font-semibold text-white shadow-xs"
+              >
+                <CheckCircle size={14} className="mr-1.5" /> Konversi ke Pesanan
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={actionLoading}
+                onClick={handleCancel}
+                className="rounded-xl border-red-200 text-xs text-red-600 hover:bg-red-50"
+              >
+                <Ban size={14} className="mr-1.5" /> Batalkan
+              </Button>
+            </>
+          )}
+
+          {/* CLAIMED Actions */}
+          {isClaimed && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={claimCodeLoading}
+                onClick={handleGenerateClaimCode}
+                className="rounded-xl border-[#8B5A2B] text-xs font-semibold text-[#8B5A2B] hover:bg-[#FAF5EE]"
+              >
+                <KeyRound size={14} className="mr-1.5" /> Buat Kode Klaim Baru
+              </Button>
+              <Button
                 size="sm"
                 disabled={actionLoading}
                 onClick={() => setConvertModalOpen(true)}
@@ -315,6 +382,27 @@ export default function AdminInvoiceDetail() {
               Buka Pesanan <ExternalLink size={12} className="ml-1" />
             </Button>
           )}
+        </div>
+      )}
+
+      {/* Claimed Banner */}
+      {isClaimed && (
+        <div className="rounded-2xl border border-amber-300 bg-amber-50/80 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-start gap-3">
+            <Lock className="h-5 w-5 text-amber-700 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-sm text-amber-950">
+                Invoice Ini Sudah Diklaim oleh Pelanggan
+              </div>
+              <p className="text-xs text-amber-800 mt-0.5">
+                Terkoneksi ke Akun ID: <strong className="font-mono">{invoice.claim?.claimed_by_customer_id || invoice.customer?.customer_id}</strong>
+                {invoice.claim?.claimed_at && ` · Diklaim pada ${new Date(invoice.claim.claimed_at).toLocaleString("id-ID")}`}
+              </p>
+              <p className="text-[11px] text-amber-700 mt-0.5">
+                Item invoice terkunci untuk proses checkout mandiri pelanggan via website. Anda tetap dapat menekan "Konversi ke Pesanan" jika customer meminta bantuan admin.
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
@@ -688,6 +776,115 @@ export default function AdminInvoiceDetail() {
                 </div>
               </form>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Claim Code Modal */}
+      {claimCodeModalOpen && claimCodeResult && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl space-y-4">
+            <div className="flex items-center justify-between border-b border-[#F1EBE0] pb-3">
+              <div className="flex items-center gap-2">
+                <KeyRound size={20} className="text-[#8B5A2B]" />
+                <h3 className="font-heading text-lg font-bold text-[#2C1E16]">
+                  Kode Klaim Invoice
+                </h3>
+              </div>
+              <button
+                onClick={() => setClaimCodeModalOpen(false)}
+                className="p-1 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-100"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <p className="text-xs text-[#5C4A3D]">
+              Berikan kode klaim ini atau bagikan link langsung kepada pelanggan untuk menghubungkan invoice ke akun mereka.
+            </p>
+
+            {/* Big Code Box */}
+            <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-center space-y-1">
+              <div className="text-xs font-medium text-amber-800 uppercase tracking-wider">
+                Kode Klaim Rahasia
+              </div>
+              <div className="font-mono text-3xl font-extrabold tracking-widest text-[#8B5A2B]">
+                {claimCodeResult.claim_code}
+              </div>
+              <p className="text-[11px] text-amber-700">
+                Hanya ditampilkan sekali. Segera simpan atau bagikan ke pelanggan.
+              </p>
+            </div>
+
+            {/* Copy Link Section */}
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold text-[#2C1E16]">Link Klaim Langsung</Label>
+              <div className="flex gap-2">
+                <Input
+                  readOnly
+                  value={`${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}`}
+                  className="h-10 text-xs font-mono bg-stone-50"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const link = `${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}`;
+                    navigator.clipboard.writeText(link);
+                    toast.success("Link klaim berhasil disalin!");
+                  }}
+                  className="rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B] shrink-0"
+                >
+                  <Copy size={13} className="mr-1" /> Salin Link
+                </Button>
+              </div>
+            </div>
+
+            {/* WhatsApp Message Preview */}
+            <div className="space-y-1.5">
+              <Label className="text-xs font-semibold text-[#2C1E16]">Pesan WhatsApp Siap Kirim</Label>
+              <Textarea
+                readOnly
+                rows={4}
+                value={`Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}\n\nTerima kasih!`}
+                className="text-xs font-mono bg-stone-50"
+              />
+              <div className="flex justify-end gap-2 pt-1">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const msg = `Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}\n\nTerima kasih!`;
+                    navigator.clipboard.writeText(msg);
+                    toast.success("Pesan WhatsApp berhasil disalin!");
+                  }}
+                  className="rounded-xl text-xs"
+                >
+                  <Copy size={13} className="mr-1" /> Salin Pesan WA
+                </Button>
+                {invoice.customer?.whatsapp && (
+                  <a
+                    href={`https://wa.me/${invoice.customer.whatsapp.replace(/\+/g, "")}?text=${encodeURIComponent(`Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}\n\nTerima kasih!`)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    <Button size="sm" className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs text-white">
+                      <MessageCircle size={13} className="mr-1" /> Kirim via WhatsApp
+                    </Button>
+                  </a>
+                )}
+              </div>
+            </div>
+
+            <div className="flex justify-end border-t border-[#F1EBE0] pt-3">
+              <Button
+                size="sm"
+                onClick={() => setClaimCodeModalOpen(false)}
+                className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-xs text-white"
+              >
+                Selesai
+              </Button>
+            </div>
           </div>
         </div>
       )}
