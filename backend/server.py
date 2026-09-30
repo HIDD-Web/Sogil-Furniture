@@ -23,6 +23,8 @@ import boto3
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
+import pymongo
+from pymongo import ReturnDocument
 
 import certifi
 
@@ -302,6 +304,64 @@ class ConvertCustomToOrderInput(BaseModel):
     delivery_method: str = "pickup"
     delivery_zone_id: Optional[str] = None
     payment_method: str = "transfer"
+    customer_address: Optional[str] = None
+    customer_maps_url: Optional[str] = None
+    notes: Optional[str] = None
+
+class InvoiceCustomerInput(BaseModel):
+    customer_id: Optional[str] = None
+    name: str
+    whatsapp: str
+    egypt_phone: Optional[str] = None
+    address: Optional[str] = None
+
+class InvoiceDimensionsInput(BaseModel):
+    length: Optional[str] = None
+    width: Optional[str] = None
+    height: Optional[str] = None
+    notes: Optional[str] = None
+
+class InvoiceItemInput(BaseModel):
+    item_id: Optional[str] = None
+    item_type: str = "custom"  # "catalog" | "custom"
+    product_id: Optional[str] = None
+    product_slug: Optional[str] = None
+    name: str
+    description: Optional[str] = ""
+    quantity: int = 1
+    dimensions: Optional[InvoiceDimensionsInput] = None
+    material: Optional[str] = ""
+    finishing: Optional[str] = ""
+    unit_price: float = 0.0
+    notes: Optional[str] = ""
+
+class InvoiceSourceInput(BaseModel):
+    custom_request_id: Optional[str] = None
+
+class InvoiceInput(BaseModel):
+    status: Optional[str] = "DRAFT"  # DRAFT | SENT
+    customer: InvoiceCustomerInput
+    source: Optional[InvoiceSourceInput] = None
+    items: List[InvoiceItemInput]
+    discount_amount: Optional[float] = 0.0
+    delivery_fee: Optional[float] = 0.0
+    additional_fee: Optional[float] = 0.0
+    customer_note: Optional[str] = ""
+    internal_note: Optional[str] = ""
+
+class InvoiceUpdateInput(BaseModel):
+    customer: Optional[InvoiceCustomerInput] = None
+    items: Optional[List[InvoiceItemInput]] = None
+    discount_amount: Optional[float] = None
+    delivery_fee: Optional[float] = None
+    additional_fee: Optional[float] = None
+    customer_note: Optional[str] = None
+    internal_note: Optional[str] = None
+
+class InvoiceConvertInput(BaseModel):
+    delivery_method: Optional[str] = "pickup"
+    delivery_zone_id: Optional[str] = None
+    payment_method: Optional[str] = "transfer"
     customer_address: Optional[str] = None
     customer_maps_url: Optional[str] = None
     notes: Optional[str] = None
@@ -1852,6 +1912,537 @@ async def admin_delete_zone(zone_id: str, admin: dict = Depends(require_perm("ma
     return {"ok": True}
 
 # --------------------------------------------------------------------------
+# Admin: Invoices Management
+# --------------------------------------------------------------------------
+async def get_next_invoice_number():
+    year = datetime.now(timezone.utc).strftime("%Y")
+    counter_id = f"invoice_{year}"
+    prefix = f"INV-{year}-"
+
+    # Self-healing synchronization on first call for this counter_id
+    existing_counter = await db.counters.find_one({"_id": counter_id})
+    if existing_counter is None:
+        last_inv = await db.invoices.find_one(
+            {"invoice_number": {"$regex": f"^{prefix}"}},
+            sort=[("invoice_number", -1)]
+        )
+        current_max = 0
+        if last_inv and "invoice_number" in last_inv:
+            try:
+                current_max = int(last_inv["invoice_number"].split("-")[-1])
+            except (ValueError, IndexError):
+                current_max = 0
+        await db.counters.update_one(
+            {"_id": counter_id},
+            {"$set": {"seq": current_max}},
+            upsert=True
+        )
+
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
+def calculate_invoice_totals(items_data: list, discount_amount: float = 0.0, delivery_fee: float = 0.0, additional_fee: float = 0.0):
+    processed_items = []
+    subtotal = 0.0
+    for idx, it in enumerate(items_data):
+        it_dict = it.dict() if hasattr(it, "dict") else dict(it)
+        name = (it_dict.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail=f"Nama item ke-{idx+1} wajib diisi.")
+        raw_qty = it_dict.get("quantity")
+        qty = int(raw_qty) if raw_qty is not None else 1
+        if qty < 1:
+            raise HTTPException(status_code=400, detail=f"Jumlah item '{name}' minimal 1.")
+        price = _num(it_dict.get("unit_price", 0.0))
+        if price < 0:
+            raise HTTPException(status_code=400, detail=f"Harga item '{name}' tidak boleh negatif.")
+
+        line_total = round(qty * price, 2)
+        subtotal += line_total
+
+        item_id = it_dict.get("item_id") or f"item_{uuid.uuid4().hex[:8]}"
+        dims = it_dict.get("dimensions") or {}
+        if hasattr(dims, "dict"):
+            dims = dims.dict()
+
+        processed_items.append({
+            "item_id": item_id,
+            "item_type": it_dict.get("item_type", "custom"),
+            "product_id": it_dict.get("product_id") or None,
+            "product_slug": it_dict.get("product_slug") or None,
+            "name": name,
+            "description": (it_dict.get("description") or "").strip(),
+            "quantity": qty,
+            "dimensions": {
+                "length": dims.get("length") or None,
+                "width": dims.get("width") or None,
+                "height": dims.get("height") or None,
+                "notes": dims.get("notes") or None,
+            },
+            "material": (it_dict.get("material") or "").strip(),
+            "finishing": (it_dict.get("finishing") or "").strip(),
+            "unit_price": round(price, 2),
+            "line_total": line_total,
+            "notes": (it_dict.get("notes") or "").strip(),
+        })
+
+    disc = max(0.0, _num(discount_amount))
+    deliv = max(0.0, _num(delivery_fee))
+    add_fee = max(0.0, _num(additional_fee))
+    subtotal = round(subtotal, 2)
+    total = max(0.0, round(subtotal - disc + deliv + add_fee, 2))
+
+    return processed_items, subtotal, disc, deliv, add_fee, total
+
+@api_router.get("/admin/invoices")
+async def admin_list_invoices(
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    query = {}
+    if status and status != "all":
+        query["status"] = status.upper()
+    if q:
+        escaped = re.escape(q.strip())
+        regex = {"$regex": escaped, "$options": "i"}
+        query["$or"] = [
+            {"invoice_number": regex},
+            {"customer.name": regex},
+            {"customer.whatsapp": regex},
+            {"order_number": regex},
+        ]
+
+    cursor = db.invoices.find(query).sort("created_at", -1)
+    invoices = []
+    async for doc in cursor:
+        invoices.append(clean(doc))
+    return invoices
+
+@api_router.get("/admin/invoices/{invoice_id}")
+async def admin_get_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+    return clean(inv)
+
+@api_router.post("/admin/invoices")
+async def admin_create_invoice(data: InvoiceInput, admin: dict = Depends(require_perm("manage_orders"))):
+    cust_name = (data.customer.name or "").strip()
+    if not cust_name:
+        raise HTTPException(status_code=400, detail="Nama customer tidak boleh kosong.")
+
+    wa = normalize_phone(data.customer.whatsapp)
+    if not wa or not valid_intl_phone(wa):
+        raise HTTPException(status_code=400, detail="No WhatsApp customer harus diawali + dan kode negara valid.")
+
+    egypt_phone = normalize_egypt_phone(data.customer.egypt_phone) if data.customer.egypt_phone else None
+
+    # Load master customer snapshot if customer_id provided
+    customer_id = data.customer.customer_id
+    if customer_id:
+        c_doc = await db.customers.find_one({"_id": id_query(customer_id)})
+        if c_doc:
+            customer_id = str(c_doc["_id"])
+
+    customer_snapshot = {
+        "customer_id": customer_id,
+        "name": cust_name,
+        "whatsapp": wa,
+        "egypt_phone": egypt_phone,
+        "address": (data.customer.address or "").strip() or None,
+    }
+
+    if not data.items:
+        raise HTTPException(status_code=400, detail="Invoice minimal harus memiliki 1 item.")
+
+    items, subtotal, disc, deliv, add_fee, total = calculate_invoice_totals(
+        data.items, data.discount_amount, data.delivery_fee, data.additional_fee
+    )
+
+    # Check custom request source if supplied
+    source_custom_request_id = None
+    if data.source and data.source.custom_request_id:
+        cr = await db.custom_requests.find_one({"_id": id_query(data.source.custom_request_id)})
+        if cr:
+            source_custom_request_id = str(cr["_id"])
+
+    init_status = "SENT" if data.status == "SENT" else "DRAFT"
+    now = datetime.now(timezone.utc).isoformat()
+    sent_at = now if init_status == "SENT" else None
+
+    invoice_doc = {
+        "status": init_status,
+        "customer": customer_snapshot,
+        "source": {
+            "custom_request_id": source_custom_request_id
+        },
+        "items": items,
+        "subtotal": subtotal,
+        "discount_amount": disc,
+        "delivery_fee": deliv,
+        "additional_fee": add_fee,
+        "total": total,
+        "currency": "EGP",
+        "customer_note": (data.customer_note or "").strip(),
+        "internal_note": (data.internal_note or "").strip(),
+        "order_id": None,
+        "order_number": None,
+        "created_by": admin.get("name", "Admin"),
+        "updated_by": admin.get("name", "Admin"),
+        "created_at": now,
+        "updated_at": now,
+        "sent_at": sent_at,
+        "converted_at": None,
+        "cancelled_at": None,
+    }
+
+    # Concurrency-safe insertion with unique invoice_number retry loop
+    for attempt in range(5):
+        try:
+            inv_num = await get_next_invoice_number()
+            invoice_doc["invoice_number"] = inv_num
+            res = await db.invoices.insert_one(invoice_doc)
+            saved = await db.invoices.find_one({"_id": res.inserted_id})
+            return clean(saved)
+        except pymongo.errors.DuplicateKeyError:
+            if attempt == 4:
+                raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor invoice unik. Silakan coba kembali.")
+            continue
+
+@api_router.put("/admin/invoices/{invoice_id}")
+async def admin_update_invoice(invoice_id: str, data: InvoiceUpdateInput, admin: dict = Depends(require_perm("manage_orders"))):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    if inv.get("status") == "CONVERTED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dikonversi menjadi pesanan tidak dapat diubah.")
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat diubah.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    upd = {
+        "updated_by": admin.get("name", "Admin"),
+        "updated_at": now,
+    }
+
+    if data.customer is not None:
+        c_name = (data.customer.name or "").strip()
+        if not c_name:
+            raise HTTPException(status_code=400, detail="Nama customer tidak boleh kosong.")
+        wa = normalize_phone(data.customer.whatsapp)
+        if not wa or not valid_intl_phone(wa):
+            raise HTTPException(status_code=400, detail="No WhatsApp customer harus diawali + dan kode negara valid.")
+        egypt_phone = normalize_egypt_phone(data.customer.egypt_phone) if data.customer.egypt_phone else None
+
+        customer_id = data.customer.customer_id or inv.get("customer", {}).get("customer_id")
+        upd["customer"] = {
+            "customer_id": customer_id,
+            "name": c_name,
+            "whatsapp": wa,
+            "egypt_phone": egypt_phone,
+            "address": (data.customer.address or "").strip() or None,
+        }
+
+    raw_items = data.items if data.items is not None else inv.get("items", [])
+    if not raw_items:
+        raise HTTPException(status_code=400, detail="Invoice minimal harus memiliki 1 item.")
+
+    disc = data.discount_amount if data.discount_amount is not None else inv.get("discount_amount", 0.0)
+    deliv = data.delivery_fee if data.delivery_fee is not None else inv.get("delivery_fee", 0.0)
+    add_fee = data.additional_fee if data.additional_fee is not None else inv.get("additional_fee", 0.0)
+
+    items, subtotal, disc, deliv, add_fee, total = calculate_invoice_totals(raw_items, disc, deliv, add_fee)
+
+    upd["items"] = items
+    upd["subtotal"] = subtotal
+    upd["discount_amount"] = disc
+    upd["delivery_fee"] = deliv
+    upd["additional_fee"] = add_fee
+    upd["total"] = total
+
+    if data.customer_note is not None:
+        upd["customer_note"] = data.customer_note.strip()
+    if data.internal_note is not None:
+        upd["internal_note"] = data.internal_note.strip()
+
+    await db.invoices.update_one({"_id": inv["_id"]}, {"$set": upd})
+    updated = await db.invoices.find_one({"_id": inv["_id"]})
+    return clean(updated)
+
+@api_router.delete("/admin/invoices/{invoice_id}")
+async def admin_delete_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    if inv.get("status") != "DRAFT":
+        raise HTTPException(status_code=400, detail="Hanya invoice berstatus DRAFT yang dapat dihapus. Invoice yang pernah dikirim/dikonversi tidak boleh dihapus.")
+
+    await db.invoices.delete_one({"_id": inv["_id"]})
+    return {"ok": True, "message": "Invoice draft berhasil dihapus."}
+
+@api_router.post("/admin/invoices/{invoice_id}/send")
+async def admin_send_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    if inv.get("status") == "CONVERTED":
+        raise HTTPException(status_code=400, detail="Invoice sudah dikonversi menjadi pesanan.")
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat dikirim.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.invoices.update_one(
+        {"_id": inv["_id"]},
+        {"$set": {
+            "status": "SENT",
+            "sent_at": inv.get("sent_at") or now,
+            "updated_at": now,
+            "updated_by": admin.get("name", "Admin")
+        }}
+    )
+    updated = await db.invoices.find_one({"_id": inv["_id"]})
+    return clean(updated)
+
+@api_router.post("/admin/invoices/{invoice_id}/cancel")
+async def admin_cancel_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    if inv.get("status") == "CONVERTED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dikonversi menjadi pesanan tidak dapat dibatalkan dari invoice.")
+    if inv.get("status") == "CANCELLED":
+        return clean(inv)
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.invoices.update_one(
+        {"_id": inv["_id"]},
+        {"$set": {
+            "status": "CANCELLED",
+            "cancelled_at": now,
+            "updated_at": now,
+            "updated_by": admin.get("name", "Admin")
+        }}
+    )
+    updated = await db.invoices.find_one({"_id": inv["_id"]})
+    return clean(updated)
+
+@api_router.post("/admin/invoices/{invoice_id}/convert")
+async def admin_convert_invoice_to_order(
+    invoice_id: str,
+    data: Optional[InvoiceConvertInput] = None,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    # Strict idempotency check
+    if inv.get("status") == "CONVERTED" or inv.get("order_id"):
+        linked_order = await db.orders.find_one({"_id": id_query(inv.get("order_id"))})
+        return {
+            "invoice": clean(inv),
+            "order": clean(linked_order),
+            "message": "Invoice sudah dikonversi sebelumnya (idempotent)."
+        }
+
+    if inv.get("status") == "CANCELLED":
+        raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat dikonversi.")
+
+    items_input = inv.get("items") or []
+    if not items_input:
+        raise HTTPException(status_code=400, detail="Invoice tidak memiliki item untuk dikonversi.")
+
+    # Map invoice items to Order items model
+    order_items = []
+    for it in items_input:
+        product_id = it.get("product_id") or str(inv["_id"])
+        category = "custom" if it.get("item_type") == "custom" or not it.get("product_id") else "catalog"
+        order_items.append({
+            "product_id": str(product_id),
+            "product_name_snapshot": it.get("name"),
+            "category": category,
+            "configuration_snapshot": {
+                "invoice_number": inv.get("invoice_number"),
+                "item_type": it.get("item_type"),
+                "product_slug": it.get("product_slug"),
+                "description": it.get("description"),
+                "dimensions": it.get("dimensions") or {},
+                "material": it.get("material") or "",
+                "finishing": it.get("finishing") or "",
+                "notes": it.get("notes") or "",
+                "custom_size": True if category == "custom" else False,
+            },
+            "quantity": int(it.get("quantity") or 1),
+            "unit_price_le": _num(it.get("unit_price")),
+            "subtotal_le": _num(it.get("line_total")),
+        })
+
+    # Call EXACT existing order numbering generator
+    order_num = await generate_order_number()
+    rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    now = datetime.now(timezone.utc).isoformat()
+
+    subtotal_le = _num(inv.get("subtotal"))
+    discount_le = _num(inv.get("discount_amount"))
+    delivery_fee_le = _num(inv.get("delivery_fee"))
+    additional_fee_le = _num(inv.get("additional_fee"))
+    total_le = max(0.0, _num(inv.get("total")))
+
+    cust_snap = inv.get("customer") or {}
+    cust_name = cust_snap.get("name") or "Pelanggan"
+    cust_phone = cust_snap.get("whatsapp") or ""
+    egypt_phone = cust_snap.get("egypt_phone") or None
+
+    conv_data = data or InvoiceConvertInput()
+    delivery_method = conv_data.delivery_method or "pickup"
+    delivery_zone_id = conv_data.delivery_zone_id or None
+    zone_name = None
+    if delivery_zone_id:
+        z = await db.delivery_zones.find_one({"_id": id_query(delivery_zone_id)})
+        if z:
+            zone_name = z.get("name")
+
+    payment_method = conv_data.payment_method or "transfer"
+    cust_address = (conv_data.customer_address or cust_snap.get("address") or "Dikonfirmasi via Invoice").strip()
+    cust_maps = (conv_data.customer_maps_url or "").strip()
+
+    combined_notes = f"[Invoice {inv.get('invoice_number')}] {conv_data.notes or inv.get('customer_note') or ''}".strip()
+    admin_note = f"Dikonversi dari invoice {inv.get('invoice_number')} oleh {admin.get('name')}".strip()
+    if inv.get("internal_note"):
+        admin_note += f" | Catatan internal invoice: {inv.get('internal_note')}"
+
+    buyer_id = cust_snap.get("customer_id")
+    buyer_username = None
+    if buyer_id:
+        c_doc = await db.customers.find_one({"_id": id_query(buyer_id)})
+        if c_doc:
+            buyer_username = c_doc.get("username")
+
+    order_doc = {
+        "order_number": order_num,
+        "customer_name": cust_name,
+        "customer_phone": cust_phone,
+        "phone_number": egypt_phone,
+        "customer_address": cust_address,
+        "customer_maps_url": cust_maps,
+        "delivery_method": delivery_method,
+        "delivery_zone_id": delivery_zone_id,
+        "delivery_zone_name": zone_name,
+        "delivery_fee_le": delivery_fee_le,
+        "payment_method": payment_method,
+        "payment_status": "belum_dibayar",
+        "order_status": "dikonfirmasi",
+        "notes": combined_notes,
+        "admin_note": admin_note,
+        "items": order_items,
+        "item": order_items[0],
+        "subtotal_le": subtotal_le,
+        "discount_code": None,
+        "discount_percentage": 0,
+        "discount_le": discount_le,
+        "referral": None,
+        "referral_discount_le": 0,
+        "points_redeemed_le": 0,
+        "customer_id": buyer_id,
+        "customer_username": buyer_username,
+        "total_le": total_le,
+        "additional_fee_le": additional_fee_le,
+        "invoice_id": str(inv["_id"]),
+        "invoice_number": inv.get("invoice_number"),
+        "exchange_rate_idr_per_le": rate,
+        "estimated_total_idr": round(total_le * rate),
+        "rate_timestamp": now,
+        "requires_admin_confirmation": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    # Atomic condition check on invoice conversion transition
+    # Only update invoice if status is not already CONVERTED
+    converted_upd = await db.invoices.find_one_and_update(
+        {"_id": inv["_id"], "status": {"$ne": "CONVERTED"}, "order_id": None},
+        {"$set": {
+            "status": "CONVERTED",
+            "order_number": order_num,
+            "converted_at": now,
+            "updated_at": now,
+            "updated_by": admin.get("name", "Admin")
+        }},
+        return_document=ReturnDocument.AFTER
+    )
+
+    if not converted_upd:
+        # Race condition handled: another simultaneous request completed conversion first
+        fresh_inv = await db.invoices.find_one({"_id": inv["_id"]})
+        fresh_ord = await db.orders.find_one({"_id": id_query(fresh_inv.get("order_id"))}) if fresh_inv else None
+        return {
+            "invoice": clean(fresh_inv),
+            "order": clean(fresh_ord),
+            "message": "Invoice sudah dikonversi sebelumnya (idempotent)."
+        }
+
+    order_result = await db.orders.insert_one(order_doc)
+    order_id = str(order_result.inserted_id)
+
+    # Link created order ID back to invoice
+    await db.invoices.update_one({"_id": inv["_id"]}, {"$set": {"order_id": order_id}})
+    converted_upd["order_id"] = order_id
+
+    # If linked to a Custom Request, update its status
+    src_cr_id = inv.get("source", {}).get("custom_request_id")
+    if src_cr_id:
+        await db.custom_requests.update_one(
+            {"_id": id_query(src_cr_id)},
+            {"$set": {
+                "status": "dipesan",
+                "converted_order_id": order_id,
+                "invoice_id": str(inv["_id"]),
+                "updated_at": now,
+            }}
+        )
+
+    created_order = await db.orders.find_one({"_id": order_result.inserted_id})
+    return {
+        "invoice": clean(converted_upd),
+        "order": clean(created_order),
+        "message": "Invoice berhasil dikonversi menjadi pesanan."
+    }
+
+@api_router.get("/admin/invoices/{invoice_id}/print")
+async def admin_get_invoice_print_data(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+
+    store = await store_info()
+    data = clean(inv)
+    # Explicit security check: internal_note is stripped from print payload
+    data.pop("internal_note", None)
+
+    return {
+        "invoice": data,
+        "store_info": {
+            "store_name": store.get("store_name", "Sogil Furniture"),
+            "tagline": store.get("tagline", "Kualitas Terbaik, Untuk Ruang Terbaik"),
+            "store_address": store.get("store_address", ""),
+            "whatsapp_number": store.get("whatsapp_number", ""),
+            "logo_url": store.get("logo_url", ""),
+            "bank_info": store.get("bank_info", ""),
+        }
+    }
+
+# --------------------------------------------------------------------------
 # Admin: settings
 # --------------------------------------------------------------------------
 @api_router.get("/admin/settings")
@@ -2829,6 +3420,14 @@ async def seed():
     await db.point_transactions.create_index("order_id")
     await db.finance_transactions.create_index("related_order_id")
     await db.referrals.create_index("code")
+    # Invoices indexes
+    await db.invoices.create_index("invoice_number", unique=True)
+    await db.invoices.create_index("status")
+    await db.invoices.create_index("order_id")
+    await db.invoices.create_index("source.custom_request_id")
+    await db.invoices.create_index([("created_at", -1)])
+    await db.invoices.create_index("customer.whatsapp")
+    await db.invoices.create_index("customer.name")
 
     defaults = {
         "store_name": "Sogil Furniture",

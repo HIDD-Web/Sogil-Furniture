@@ -32,3 +32,10 @@ export const CATEGORY_PRICELISTS = {
   papan_tulis: "/pricelists/papan_tulis.jpg",
   blockboard: "/pricelists/blockboard.jpg",
 };
+
+export const INVOICE_STATUS = {
+  DRAFT: { label: "Draft", color: "bg-stone-100 text-stone-700 border-stone-300" },
+  SENT: { label: "Menunggu Konfirmasi", color: "bg-blue-100 text-blue-800 border-blue-200" },
+  CONVERTED: { label: "Masuk Pesanan", color: "bg-emerald-100 text-emerald-800 border-emerald-200" },
+  CANCELLED: { label: "Dibatalkan", color: "bg-red-100 text-red-700 border-red-200" },
+};

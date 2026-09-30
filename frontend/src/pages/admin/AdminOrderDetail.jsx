@@ -9,7 +9,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
@@ -147,6 +147,30 @@ export default function AdminOrderDetail() {
             {canDelete && <Button variant="outline" onClick={doDelete} data-testid="delete-order" className="rounded-xl border-red-300 text-red-600 hover:bg-red-50"><Trash2 size={16} className="mr-1" /> Hapus Pesanan</Button>}
           </div>
         </div>
+
+        {order.invoice_number && (
+          <div className="rounded-2xl border border-[#8B5A2B]/20 bg-[#FAF5EE] p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-center gap-2.5">
+              <FileText className="h-5 w-5 text-[#8B5A2B] shrink-0" />
+              <div>
+                <span className="text-xs text-[#8B7355]">Sumber Invoice:</span>
+                <div className="font-mono text-sm font-bold text-[#8B5A2B]">
+                  {order.invoice_number}
+                </div>
+              </div>
+            </div>
+            {order.invoice_id && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigate(`/admin/invoices/${order.invoice_id}`)}
+                className="h-8 rounded-xl border-[#8B5A2B]/40 text-[#8B5A2B] text-xs font-semibold hover:bg-[#8B5A2B] hover:text-white"
+              >
+                Lihat Invoice &rarr;
+              </Button>
+            )}
+          </div>
+        )}
 
         <Block title="Customer">
           <Row k="Nama" v={order.customer_name} />

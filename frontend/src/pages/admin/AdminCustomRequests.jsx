@@ -9,7 +9,7 @@ import { Badge } from "../../components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
 import { fmtLE } from "../../lib/format";
 import { useAuth } from "../../context/AuthContext";
-import { Search, MessageCircle, ExternalLink, ShoppingBag, Eye, Trash2, X, ChevronRight, CheckCircle, Sparkles } from "lucide-react";
+import { Search, MessageCircle, ExternalLink, ShoppingBag, Eye, Trash2, X, ChevronRight, CheckCircle, Sparkles, FileText } from "lucide-react";
 import { toast } from "sonner";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
 
@@ -303,12 +303,18 @@ export default function AdminCustomRequests() {
                       >
                         <MessageCircle size={14} /> WA
                       </a>
+                      <button
+                        onClick={() => navigate(`/admin/invoices/new?custom_request_id=${reqId}`)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-[#8B5A2B]/40 bg-[#FAF5EE] px-2.5 py-1 text-xs font-semibold text-[#8B5A2B] hover:bg-[#F3ECE0]"
+                      >
+                        <FileText size={13} /> Invoice
+                      </button>
                       {req.converted_order_id ? (
                         <button
                           onClick={() => navigate(`/admin/orders/${req.converted_order_id}`)}
                           className="inline-flex items-center gap-1 rounded-lg border border-purple-200 bg-purple-50 px-2.5 py-1 text-xs font-semibold text-purple-700"
                         >
-                          <ShoppingBag size={14} /> Buka Order
+                          <ShoppingBag size={14} /> Order
                         </button>
                       ) : (
                         <button
@@ -426,6 +432,16 @@ export default function AdminCustomRequests() {
                             className="h-8 rounded-lg border-[#E5DCC5] text-xs text-[#5C4A3D]"
                           >
                             <Eye size={13} className="mr-1" /> Detail
+                          </Button>
+
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => navigate(`/admin/invoices/new?custom_request_id=${reqId}`)}
+                            className="h-8 rounded-lg border-[#8B5A2B]/40 bg-[#FAF5EE] text-xs font-semibold text-[#8B5A2B] hover:bg-[#F3ECE0]"
+                            title="Buat Invoice Pra-Order"
+                          >
+                            <FileText size={13} className="mr-1" /> Buat Invoice
                           </Button>
 
                           {req.converted_order_id ? (
@@ -658,15 +674,27 @@ export default function AdminCustomRequests() {
               )}
 
               {!selectedReq.converted_order_id && (
-                <Button
-                  onClick={() => {
-                    setDetailModalOpen(false);
-                    openConvertModal(selectedReq);
-                  }}
-                  className="rounded-xl bg-purple-700 hover:bg-purple-800 text-white"
-                >
-                  <CheckCircle size={15} className="mr-1" /> Jadikan Pesanan
-                </Button>
+                <>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setDetailModalOpen(false);
+                      navigate(`/admin/invoices/new?custom_request_id=${selectedReq.id || selectedReq._id}`);
+                    }}
+                    className="rounded-xl border-[#8B5A2B]/40 bg-[#FAF5EE] text-[#8B5A2B] hover:bg-[#F3ECE0]"
+                  >
+                    <FileText size={15} className="mr-1" /> Buat Invoice
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      setDetailModalOpen(false);
+                      openConvertModal(selectedReq);
+                    }}
+                    className="rounded-xl bg-purple-700 hover:bg-purple-800 text-white"
+                  >
+                    <CheckCircle size={15} className="mr-1" /> Jadikan Pesanan
+                  </Button>
+                </>
               )}
             </div>
           </div>

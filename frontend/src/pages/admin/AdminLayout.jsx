@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import api from "../../lib/api";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import PwaInstallModal from "../../components/PwaInstallModal";
 
@@ -28,6 +28,7 @@ export default function AdminLayout() {
   const LINKS = [
     { to: "/admin", label: "Overview", icon: LayoutDashboard, end: true, show: true },
     { to: "/admin/orders", label: "Pesanan", icon: ShoppingBag, show: perms.manage_orders || isOwner },
+    { to: "/admin/invoices", label: "Invoice", icon: FileText, show: perms.manage_orders || isOwner },
     { to: "/admin/custom-requests", label: "Request Custom", icon: Sparkles, show: perms.manage_orders || isOwner },
     { to: "/admin/analytics", label: "Analitik", icon: BarChart3, show: perms.manage_orders || isOwner },
     { to: "/admin/products", label: "Produk", icon: Package, show: perms.modify_products || isOwner },
