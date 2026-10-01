@@ -434,6 +434,13 @@ class MaterialPurchaseInput(BaseModel):
 class VoidPurchaseInput(BaseModel):
     void_reason: Optional[str] = ""
 
+class MaterialStockAdjustmentInput(BaseModel):
+    adjustment_type: str  # "adjustment_in" | "adjustment_out"
+    quantity: float
+    movement_date: Optional[str] = None
+    reason: str
+    notes: Optional[str] = ""
+
 class FinanceTxnInput(BaseModel):
     date: Optional[str] = None
     type: str  # income | expense
@@ -4312,6 +4319,26 @@ async def seed():
     except Exception:
         pass
 
+    # Ensure indexes for material_stocks (Phase 3)
+    try:
+        await db.material_stocks.create_index(
+            [("movement_number", 1)],
+            unique=True,
+            name="uniq_movement_number"
+        )
+        await db.material_stocks.create_index(
+            [("material_id", 1), ("movement_date", -1), ("created_at", -1)],
+            name="idx_stock_material_date"
+        )
+        await db.material_stocks.create_index(
+            [("related_purchase_id", 1), ("movement_type", 1)],
+            unique=True,
+            sparse=True,
+            name="uniq_purchase_stock_movement"
+        )
+    except Exception:
+        pass
+
 @app.on_event("startup")
 async def startup():
     await seed()
@@ -4788,8 +4815,9 @@ async def archive_material(
 # --------------------------------------------------------------------------
 # Material Purchases & Price History (Phase 2)
 # --------------------------------------------------------------------------
-async def get_next_purchase_number(date_str: Optional[str] = None) -> str:
+async def get_next_purchase_number(date_str: Optional[str] = None, session=None) -> str:
     # date_str format YYYY-MM-DD or default today
+    kw = {"session": session} if session else {}
     try:
         if date_str and len(date_str) >= 10:
             dt_part = date_str[:10].replace("-", "")
@@ -4801,11 +4829,12 @@ async def get_next_purchase_number(date_str: Optional[str] = None) -> str:
     counter_id = f"purchase_{dt_part}"
     prefix = f"PB-{dt_part}-"
 
-    existing_counter = await db.counters.find_one({"_id": counter_id})
+    existing_counter = await db.counters.find_one({"_id": counter_id}, **kw)
     if existing_counter is None:
         last_pb = await db.material_purchases.find_one(
             {"purchase_number": {"$regex": f"^{prefix}"}},
-            sort=[("purchase_number", -1)]
+            sort=[("purchase_number", -1)],
+            **kw
         )
         current_max = 0
         if last_pb and "purchase_number" in last_pb:
@@ -4817,23 +4846,27 @@ async def get_next_purchase_number(date_str: Optional[str] = None) -> str:
         await db.counters.update_one(
             {"_id": counter_id},
             {"$set": {"seq": current_max}},
-            upsert=True
+            upsert=True,
+            **kw
         )
 
     res = await db.counters.find_one_and_update(
         {"_id": counter_id},
         {"$inc": {"seq": 1}},
         upsert=True,
-        return_document=ReturnDocument.AFTER
+        return_document=ReturnDocument.AFTER,
+        **kw
     )
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
 
-async def recalculate_material_latest_price(material_id: str):
+async def recalculate_material_latest_price(material_id: str, session=None):
+    kw = {"session": session} if session else {}
     # Find the latest valid purchase ordered by purchase_date desc, created_at desc
     latest_pb = await db.material_purchases.find_one(
         {"material_id": material_id, "is_void": {"$ne": True}},
-        sort=[("purchase_date", -1), ("created_at", -1)]
+        sort=[("purchase_date", -1), ("created_at", -1)],
+        **kw
     )
 
     if latest_pb:
@@ -4851,7 +4884,8 @@ async def recalculate_material_latest_price(material_id: str):
 
     await db.materials.update_one(
         {"_id": id_query(material_id)},
-        {"$set": upd}
+        {"$set": upd},
+        **kw
     )
 
 @api_router.get("/admin/materials/purchases")
@@ -4969,22 +5003,36 @@ async def create_material_purchase(
         "created_by_name": admin.get("name", "Admin"),
     }
 
-    # Concurrency-safe insert with purchase_number retry loop
-    for attempt in range(5):
-        try:
-            pb_num = await get_next_purchase_number(p_date)
-            doc["purchase_number"] = pb_num
-            res = await db.material_purchases.insert_one(doc)
-            doc["_id"] = res.inserted_id
-            break
-        except pymongo.errors.DuplicateKeyError:
-            if attempt == 4:
-                raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pembelian unik. Silakan coba kembali.")
+    async def _execute_create_purchase_tx(session):
+        ins_kw = {"session": session} if session else {}
 
-    # Update material latest price snapshot if this purchase is the latest
-    await recalculate_material_latest_price(material_canonical_id)
+        # 1. Allocate unique purchase number
+        for attempt in range(5):
+            try:
+                pb_num = await get_next_purchase_number(p_date, session=session)
+                doc["purchase_number"] = pb_num
+                res = await db.material_purchases.insert_one(doc, **ins_kw)
+                doc["_id"] = res.inserted_id
+                break
+            except pymongo.errors.DuplicateKeyError:
+                if attempt == 4:
+                    raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pembelian unik. Silakan coba kembali.")
 
-    return clean(doc)
+        # 2. Recalculate material latest price snapshot inside transaction
+        await recalculate_material_latest_price(material_canonical_id, session=session)
+
+        # 3. Create purchase_in stock movement & update current_stock inside transaction
+        await apply_purchase_stock_in(doc, admin, session=session)
+        return doc
+
+    try:
+        final_doc = await execute_transaction_with_safety(client, _execute_create_purchase_tx)
+        return clean(final_doc)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed transaction while creating material purchase: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal mencatat transaksi pembelian dan stok bahan: {str(e)}")
 
 @api_router.get("/admin/materials/purchases/{pb_id}")
 async def get_material_purchase_detail(
@@ -5013,25 +5061,64 @@ async def void_material_purchase(
     if doc.get("is_void"):
         raise HTTPException(status_code=400, detail="Pembelian bahan ini sudah berstatus void")
 
+    mat_id = str(doc["material_id"])
+    mat = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not mat:
+        raise HTTPException(status_code=404, detail="Bahan terkait tidak ditemukan")
+
+    current_stock = round(float(mat.get("current_stock") or 0.0), 4)
+    purchase_qty = round(float(doc.get("quantity") or 0.0), 4)
+    unit_str = mat.get("unit", "satuan")
+
+    # STRICT NON-NEGATIVE INVARIANT: Reject void if current stock is insufficient
+    if current_stock < purchase_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Pembelian tidak dapat dibatalkan karena stok saat ini ({current_stock} {unit_str}) "
+                f"lebih kecil dari jumlah pembelian ({purchase_qty} {unit_str}). "
+                f"Bahan kemungkinan sudah digunakan. Lakukan penyesuaian stok terlebih dahulu sebelum membatalkan pembelian."
+            )
+        )
+
     now = datetime.now(timezone.utc).isoformat()
+    void_reason = (data.void_reason or "").strip() or "Dibatalkan oleh admin"
     upd = {
         "is_void": True,
         "voided_at": now,
         "voided_by_id": admin.get("id"),
         "voided_by_name": admin.get("name", "Admin"),
-        "void_reason": (data.void_reason or "").strip() or "Dibatalkan oleh admin",
+        "void_reason": void_reason,
     }
 
-    updated = await db.material_purchases.find_one_and_update(
-        {"_id": doc["_id"]},
-        {"$set": upd},
-        return_document=ReturnDocument.AFTER
-    )
+    async def _execute_void_purchase_tx(session):
+        tx_kw = {"session": session} if session else {}
 
-    # Recalculate material latest price snapshot
-    await recalculate_material_latest_price(doc["material_id"])
+        # 1. Reverse stock movement with strict non-negative policy inside transaction
+        await apply_purchase_stock_reversal(doc, void_reason, admin, session=session)
 
-    return {"ok": True, "message": "Pembelian bahan berhasil di-void", "purchase": clean(updated)}
+        # 2. Mark purchase as voided inside transaction
+        updated_doc = await db.material_purchases.find_one_and_update(
+            {"_id": doc["_id"], "is_void": False},
+            {"$set": upd},
+            return_document=ReturnDocument.AFTER,
+            **tx_kw
+        )
+        if not updated_doc:
+            raise HTTPException(status_code=400, detail="Pembelian bahan ini sudah dibatalkan sebelumnya.")
+
+        # 3. Recalculate material latest price snapshot inside transaction
+        await recalculate_material_latest_price(doc["material_id"], session=session)
+        return updated_doc
+
+    try:
+        updated = await execute_transaction_with_safety(client, _execute_void_purchase_tx)
+        return {"ok": True, "message": "Pembelian bahan berhasil di-void", "purchase": clean(updated)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed transaction while voiding material purchase: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal membatalkan pembelian bahan: {str(e)}")
 
 @api_router.get("/admin/materials/{mat_id}/price-history")
 async def get_material_price_history(
@@ -5051,6 +5138,354 @@ async def get_material_price_history(
         "material": clean(mat),
         "history": [clean(d) for d in docs]
     }
+
+# --------------------------------------------------------------------------
+# Material Stock & Movements (Phase 3)
+# --------------------------------------------------------------------------
+async def get_next_movement_number(date_str: Optional[str] = None, session=None) -> str:
+    kw = {"session": session} if session else {}
+    try:
+        if date_str and len(date_str) >= 10:
+            dt_part = date_str[:10].replace("-", "")
+        else:
+            dt_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+    except Exception:
+        dt_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    counter_id = f"stock_{dt_part}"
+    prefix = f"ST-{dt_part}-"
+
+    existing_counter = await db.counters.find_one({"_id": counter_id}, **kw)
+    if existing_counter is None:
+        last_st = await db.material_stocks.find_one(
+            {"movement_number": {"$regex": f"^{prefix}"}},
+            sort=[("movement_number", -1)],
+            **kw
+        )
+        current_max = 0
+        if last_st and "movement_number" in last_st:
+            try:
+                current_max = int(last_st["movement_number"].split("-")[-1])
+            except (ValueError, IndexError):
+                current_max = 0
+
+        await db.counters.update_one(
+            {"_id": counter_id},
+            {"$set": {"seq": current_max}},
+            upsert=True,
+            **kw
+        )
+
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+        **kw
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
+async def apply_stock_movement_atomic(
+    material_id: str,
+    movement_type: str,
+    quantity_delta: float,
+    movement_date: str,
+    reason: str,
+    admin: dict,
+    related_purchase_id: Optional[str] = None,
+    related_purchase_number: Optional[str] = None,
+    notes: Optional[str] = "",
+    allow_negative: bool = False,
+    session=None
+) -> dict:
+    kw = {"session": session} if session else {}
+    mat = await db.materials.find_one({"_id": id_query(material_id)}, **kw)
+    if not mat:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    if mat.get("status") == "archived" and not movement_type.startswith("purchase_"):
+        raise HTTPException(status_code=400, detail="Tidak dapat mengubah stok untuk bahan yang diarsipkan")
+
+    canonical_mat_id = str(mat["_id"])
+    delta = round(float(quantity_delta), 4)
+
+    # Concurrency-safe atomic update loop with optimistic concurrency
+    max_retries = 10
+    updated_mat = None
+    prev_stock = 0.0
+    target_new_stock = 0.0
+
+    for attempt in range(max_retries):
+        current_doc = await db.materials.find_one({"_id": mat["_id"]}, **kw)
+        if not current_doc:
+            raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+        prev_stock = round(float(current_doc.get("current_stock") or 0.0), 4)
+        target_new_stock = round(prev_stock + delta, 4)
+
+        if not allow_negative and target_new_stock < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Stok bahan tidak mencukupi (stok saat ini: {prev_stock} {mat.get('unit', '')}, pengurangan: {abs(delta)})"
+            )
+
+        # Atomic compare-and-swap
+        cond = {"_id": mat["_id"]}
+        if "current_stock" in current_doc and current_doc["current_stock"] is not None:
+            cond["current_stock"] = current_doc["current_stock"]
+        else:
+            cond["$or"] = [{"current_stock": {"$exists": False}}, {"current_stock": None}, {"current_stock": 0.0}]
+
+        updated_mat = await db.materials.find_one_and_update(
+            cond,
+            {"$set": {"current_stock": target_new_stock}},
+            return_document=ReturnDocument.AFTER,
+            **kw
+        )
+        if updated_mat:
+            break
+        if attempt == max_retries - 1:
+            raise HTTPException(status_code=409, detail="Konflik konkurensi saat mengubah stok. Silakan coba kembali.")
+
+    # Record movement document
+    now = datetime.now(timezone.utc).isoformat()
+    movement_doc = {
+        "material_id": canonical_mat_id,
+        "material_name_snapshot": mat.get("name", ""),
+        "material_specs_snapshot": mat.get("specs", ""),
+        "unit": mat.get("unit", "pcs"),
+        "movement_type": movement_type,
+        "quantity_delta": delta,
+        "previous_stock": prev_stock,
+        "new_stock": target_new_stock,
+        "movement_date": movement_date[:10],
+        "related_purchase_id": related_purchase_id,
+        "related_purchase_number": related_purchase_number,
+        "reason": reason.strip(),
+        "notes": (notes or "").strip(),
+        "created_at": now,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+    }
+
+    # Unique movement_number retry loop
+    for attempt in range(5):
+        try:
+            m_num = await get_next_movement_number(movement_date, session=session)
+            movement_doc["movement_number"] = m_num
+            res = await db.material_stocks.insert_one(movement_doc, **kw)
+            movement_doc["_id"] = res.inserted_id
+            break
+        except pymongo.errors.DuplicateKeyError as dke:
+            # Check if this duplicate is on related_purchase_id idempotency index
+            if "uniq_purchase_stock_movement" in str(dke):
+                # Rollback current_stock since this purchase was already applied
+                await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                raise HTTPException(status_code=409, detail="Stok untuk pembelian ini sudah pernah dicatat.")
+            if attempt == 4:
+                # Rollback on fatal failure
+                await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pergerakan stok unik.")
+
+    return clean(movement_doc)
+
+async def apply_purchase_stock_in(purchase_doc: dict, admin: dict, session=None):
+    kw = {"session": session} if session else {}
+    # Idempotent check
+    mat_id = str(purchase_doc["material_id"])
+    pb_id = str(purchase_doc["_id"])
+    pb_num = purchase_doc.get("purchase_number")
+    qty = float(purchase_doc.get("quantity") or 0.0)
+    p_date = purchase_doc.get("purchase_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Check if already recorded
+    existing = await db.material_stocks.find_one({
+        "related_purchase_id": pb_id,
+        "movement_type": "purchase_in"
+    }, **kw)
+    if existing:
+        return existing
+
+    return await apply_stock_movement_atomic(
+        material_id=mat_id,
+        movement_type="purchase_in",
+        quantity_delta=qty,
+        movement_date=p_date,
+        reason=f"Pembelian {pb_num}",
+        admin=admin,
+        related_purchase_id=pb_id,
+        related_purchase_number=pb_num,
+        notes=purchase_doc.get("notes", ""),
+        allow_negative=False,
+        session=session
+    )
+
+async def apply_purchase_stock_reversal(purchase_doc: dict, void_reason: str, admin: dict, session=None):
+    kw = {"session": session} if session else {}
+    mat_id = str(purchase_doc["material_id"])
+    pb_id = str(purchase_doc["_id"])
+    pb_num = purchase_doc.get("purchase_number")
+    qty = float(purchase_doc.get("quantity") or 0.0)
+
+    # Check if purchase_in movement exists for this purchase
+    orig_movement = await db.material_stocks.find_one({
+        "related_purchase_id": pb_id,
+        "movement_type": "purchase_in"
+    }, **kw)
+    if not orig_movement:
+        return None
+
+    # Check if reversal already recorded
+    existing_reversal = await db.material_stocks.find_one({
+        "related_purchase_id": pb_id,
+        "movement_type": "adjustment_out",
+        "reason": {"$regex": f"^Reversal pembelian {re.escape(pb_num)}"}
+    }, **kw)
+    if existing_reversal:
+        return existing_reversal
+
+    now_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return await apply_stock_movement_atomic(
+        material_id=mat_id,
+        movement_type="adjustment_out",
+        quantity_delta=-qty,
+        movement_date=now_date,
+        reason=f"Reversal pembelian {pb_num} (Void: {void_reason})",
+        admin=admin,
+        related_purchase_id=pb_id,
+        related_purchase_number=pb_num,
+        notes=f"Pembatalan transaksi pembelian {pb_num}",
+        allow_negative=False,
+        session=session
+    )
+
+@api_router.get("/admin/materials/stock")
+async def get_materials_stock_summary(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    admin: dict = Depends(require_material_perm())
+):
+    query: Dict[str, Any] = {}
+    if category and category != "all":
+        query["category"] = category
+    if status and status != "all":
+        query["status"] = status
+    if q and q.strip():
+        search_term = re.escape(q.strip())
+        query["$or"] = [
+            {"name": {"$regex": search_term, "$options": "i"}},
+            {"specs": {"$regex": search_term, "$options": "i"}},
+            {"sku": {"$regex": search_term, "$options": "i"}},
+        ]
+    materials = await db.materials.find(query).sort("created_at", -1).to_list(1000)
+
+    # Attach last movement for each material
+    result = []
+    for m in materials:
+        m_id = str(m["_id"])
+        last_mov = await db.material_stocks.find_one(
+            {"material_id": m_id},
+            sort=[("movement_date", -1), ("created_at", -1)]
+        )
+        c_item = clean(m)
+        c_item["current_stock"] = round(float(c_item.get("current_stock") or 0.0), 4)
+        c_item["last_movement"] = clean(last_mov) if last_mov else None
+        result.append(c_item)
+
+    return result
+
+@api_router.get("/admin/materials/{material_id}/stock")
+async def get_material_stock_detail(
+    material_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    mat = await db.materials.find_one({"_id": id_query(material_id)})
+    if not mat:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    canonical_id = str(mat["_id"])
+    last_mov = await db.material_stocks.find_one(
+        {"material_id": canonical_id},
+        sort=[("movement_date", -1), ("created_at", -1)]
+    )
+
+    clean_mat = clean(mat)
+    clean_mat["current_stock"] = round(float(clean_mat.get("current_stock") or 0.0), 4)
+    clean_mat["last_movement"] = clean(last_mov) if last_mov else None
+    return clean_mat
+
+@api_router.get("/admin/materials/{material_id}/stock-movements")
+async def get_material_stock_movements(
+    material_id: str,
+    movement_type: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    admin: dict = Depends(require_material_perm())
+):
+    mat = await db.materials.find_one({"_id": id_query(material_id)})
+    if not mat:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    canonical_id = str(mat["_id"])
+    query: Dict[str, Any] = {"material_id": canonical_id}
+
+    if movement_type and movement_type != "all":
+        query["movement_type"] = movement_type
+
+    if start_date or end_date:
+        date_q = {}
+        if start_date:
+            date_q["$gte"] = start_date
+        if end_date:
+            date_q["$lte"] = end_date
+        query["movement_date"] = date_q
+
+    docs = await db.material_stocks.find(query).sort([("movement_date", -1), ("created_at", -1)]).to_list(1000)
+    return {
+        "material": clean(mat),
+        "movements": [clean(d) for d in docs]
+    }
+
+@api_router.post("/admin/materials/{material_id}/stock-adjustment")
+async def create_material_stock_adjustment(
+    material_id: str,
+    data: MaterialStockAdjustmentInput,
+    admin: dict = Depends(require_material_perm())
+):
+    adj_type = (data.adjustment_type or "").strip()
+    if adj_type not in ["adjustment_in", "adjustment_out"]:
+        raise HTTPException(status_code=400, detail="Tipe adjustment harus 'adjustment_in' atau 'adjustment_out'")
+
+    if data.quantity is None or _num(data.quantity) <= 0:
+        raise HTTPException(status_code=400, detail="Jumlah adjustment harus lebih besar dari 0")
+
+    reason = (data.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Alasan penyesuaian stok wajib diisi")
+
+    m_date = (data.movement_date or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(m_date[:10], "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format tanggal penyesuaian tidak valid (harus YYYY-MM-DD)")
+
+    qty_val = round(_num(data.quantity), 4)
+    delta = qty_val if adj_type == "adjustment_in" else -qty_val
+
+    movement = await apply_stock_movement_atomic(
+        material_id=material_id,
+        movement_type=adj_type,
+        quantity_delta=delta,
+        movement_date=m_date,
+        reason=reason,
+        admin=admin,
+        notes=(data.notes or "").strip(),
+        allow_negative=False
+    )
+
+    return {"ok": True, "message": "Penyesuaian stok berhasil disimpan", "movement": movement}
 
 app.include_router(api_router)
 

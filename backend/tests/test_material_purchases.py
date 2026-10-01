@@ -88,16 +88,27 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
             "unit": "batang",
             "sku": "MAT-BALOK-5X5",
             "status": "active",
+            "current_stock": 50.0,
             "latest_price": None,
             "latest_currency": None,
             "latest_purchase_date": None,
         }
+
+    def _setup_mock_db(self, mock_db):
+        mock_db.material_stocks.find_one = AsyncMock(return_value=None)
+        mock_db.material_stocks.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.material_stocks.update_one = AsyncMock(return_value=None)
+        mock_db.counters.find_one = AsyncMock(return_value={"seq": 1})
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 2})
+        mock_db.counters.update_one = AsyncMock(return_value=None)
+        mock_db.materials.find_one_and_update = AsyncMock(return_value={**self.sample_material, "current_stock": 50.0})
 
     # -------------------------------------------------------------
     # 1. Create Purchase Successfully
     # -------------------------------------------------------------
     @patch("server.db")
     def test_01_create_purchase_successfully(self, mock_db):
+        self._setup_mock_db(mock_db)
         mock_db.materials.find_one = AsyncMock(return_value=self.sample_material)
         mock_db.counters.find_one = AsyncMock(return_value={"_id": "purchase_20261001", "seq": 10})
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"_id": "purchase_20261001", "seq": 11})
@@ -212,6 +223,7 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
     # -------------------------------------------------------------
     @patch("server.db")
     def test_06_backend_calculates_total_correctly(self, mock_db):
+        self._setup_mock_db(mock_db)
         mock_db.materials.find_one = AsyncMock(return_value=self.sample_material)
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
         mock_db.counters.find_one = AsyncMock(return_value={"seq": 1})
@@ -248,6 +260,7 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
     # -------------------------------------------------------------
     @patch("server.db")
     def test_08_material_snapshot_stored_correctly(self, mock_db):
+        self._setup_mock_db(mock_db)
         mock_db.materials.find_one = AsyncMock(return_value=self.sample_material)
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
         mock_db.counters.find_one = AsyncMock(return_value={"seq": 1})
@@ -321,6 +334,7 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
     # -------------------------------------------------------------
     @patch("server.db")
     def test_14_15_16_void_purchase(self, mock_db):
+        self._setup_mock_db(mock_db)
         pb_oid = ObjectId()
         active_pb = {
             "_id": pb_oid,
@@ -328,13 +342,9 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
             "material_id": str(self.sample_mat_id),
             "is_void": False,
             "unit_price": 90.0,
+            "quantity": 10.0,
             "purchase_date": "2026-10-01"
         }
-        mock_db.material_purchases.find_one = AsyncMock(return_value=active_pb)
-
-        voided_doc = {**active_pb, "is_void": True, "void_reason": "Salah input"}
-        mock_db.material_purchases.find_one_and_update = AsyncMock(return_value=voided_doc)
-
         # After void, next latest valid purchase is from 2026-09-25 (80 LE)
         older_pb = {
             "_id": ObjectId(),
@@ -344,8 +354,12 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
             "currency": "EGP",
             "is_void": False,
         }
-        # In recalculate_material_latest_price:
-        mock_db.material_purchases.find_one.side_effect = [active_pb, older_pb]
+        # In void_material_purchase: 1st find_one is active_pb, 2nd find_one is in recalculate_material_latest_price (older_pb)
+        mock_db.material_purchases.find_one = AsyncMock(side_effect=[active_pb, older_pb])
+
+        voided_doc = {**active_pb, "is_void": True, "void_reason": "Salah input"}
+        mock_db.material_purchases.find_one_and_update = AsyncMock(return_value=voided_doc)
+        mock_db.materials.find_one = AsyncMock(return_value={**self.sample_material, "current_stock": 50.0})
         mock_db.materials.update_one = AsyncMock(return_value=None)
 
         res = asyncio.run(void_material_purchase(str(pb_oid), VoidPurchaseInput(void_reason="Salah input"), admin=self.owner_user))
@@ -361,11 +375,12 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
         self.assertEqual(set_args["latest_purchase_date"], "2026-09-25")
 
     # -------------------------------------------------------------
-    # 17 & 18. Scope Safety: No Stock or Finance collection touched
+    # 17 & 18. Scope Safety: Purchase -> Stock = YES, Purchase -> Finance = NO
     # -------------------------------------------------------------
     @patch("server.db")
     def test_17_18_no_stock_or_finance_mutations(self, mock_db):
-        mock_db.materials.find_one = AsyncMock(return_value=self.sample_material)
+        self._setup_mock_db(mock_db)
+        mock_db.materials.find_one = AsyncMock(return_value={**self.sample_material, "current_stock": 0.0})
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
         mock_db.counters.find_one = AsyncMock(return_value={"seq": 1})
         mock_db.material_purchases.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
@@ -380,11 +395,14 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
         )
         asyncio.run(create_material_purchase(inp, admin=self.owner_user))
 
-        # Check finance_transactions was never called
+        # 1. Purchase record created -> YES
+        mock_db.material_purchases.insert_one.assert_called_once()
+        # 2. Stock movement created (purchase_in) -> YES
+        self.assertTrue(mock_db.material_stocks.insert_one.called)
+        # 3. Current stock updated (+quantity) -> YES
+        self.assertTrue(mock_db.materials.update_one.called)
+        # 4. Finance transaction created -> NO (strictly isolated)
         self.assertFalse(hasattr(mock_db.finance_transactions, "insert_one") and mock_db.finance_transactions.insert_one.called)
-        # Check material_stocks or current_stock was never called
-        self.assertFalse(hasattr(mock_db.material_stocks, "insert_one") and mock_db.material_stocks.insert_one.called)
-        self.assertFalse(hasattr(mock_db.stocks, "insert_one") and mock_db.stocks.insert_one.called)
 
     # -------------------------------------------------------------
     # 19. RBAC Protection
