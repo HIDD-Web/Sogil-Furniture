@@ -26,7 +26,6 @@ export default function AdminLayout() {
   const perms = user.permissions || {};
   const isOwner = user.role === "owner";
   const LINKS = [
-    { to: "/admin", label: "Overview", icon: LayoutDashboard, end: true, show: true },
     { to: "/admin/orders", label: "Pesanan", icon: ShoppingBag, show: perms.manage_orders || isOwner },
     { to: "/admin/invoices", label: "Invoice", icon: FileText, show: perms.manage_orders || isOwner },
     { to: "/admin/custom-requests", label: "Request Custom", icon: Sparkles, show: perms.manage_orders || isOwner },

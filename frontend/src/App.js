@@ -97,7 +97,8 @@ function Layout() {
         <Route path="/admin/login" element={<AdminLogin />} />
         <Route path="/admin/invoices/:id/print" element={<AdminInvoicePrint />} />
         <Route path="/admin" element={<AdminLayout />}>
-          <Route index element={<AdminOverview />} />
+          <Route index element={<Navigate to="/admin/orders" replace />} />
+          <Route path="overview" element={<Navigate to="/admin/orders" replace />} />
           <Route path="orders" element={<AdminOrders />} />
           <Route path="orders/:id" element={<AdminOrderDetail />} />
           <Route path="invoices" element={<AdminInvoices />} />
