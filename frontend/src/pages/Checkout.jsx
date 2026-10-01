@@ -353,39 +353,37 @@ export default function Checkout() {
                 {validatingPromo ? "..." : t("sum.discount_apply")}
               </Button>
             </div>
-            {customer && (<>
-              {ref.applied && <div className="mt-2 flex justify-between text-sm text-[#738678]"><span>Referral ({ref.code})</span><span className="font-medium">-{fmtLE(ref.amount)} LE</span></div>}
-              <div className="mt-2 flex gap-2">
-                <Input
-                  value={ref.code}
-                  onChange={(e) => setRef({ ...ref, code: e.target.value, applied: false })}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      applyReferral();
-                    }
-                  }}
-                  placeholder="Kode referral"
-                  data-testid="referral-code"
-                  className="h-10 bg-white"
-                />
-                <Button
-                  onClick={() => applyReferral()}
-                  disabled={validatingReferral}
-                  data-testid="apply-referral"
-                  variant="outline"
-                  className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]"
-                >
-                  {validatingReferral ? "..." : "Pakai"}
-                </Button>
+            {ref.applied && <div className="mt-2 flex justify-between text-sm text-[#738678]"><span>Referral ({ref.code})</span><span className="font-medium">-{fmtLE(ref.amount)} LE</span></div>}
+            <div className="mt-2 flex gap-2">
+              <Input
+                value={ref.code}
+                onChange={(e) => setRef({ ...ref, code: e.target.value, applied: false })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    applyReferral();
+                  }
+                }}
+                placeholder="Kode referral"
+                data-testid="referral-code"
+                className="h-10 bg-white"
+              />
+              <Button
+                onClick={() => applyReferral()}
+                disabled={validatingReferral}
+                data-testid="apply-referral"
+                variant="outline"
+                className="h-10 rounded-xl border-[#8B5A2B] text-[#8B5A2B]"
+              >
+                {validatingReferral ? "..." : "Pakai"}
+              </Button>
+            </div>
+            {customer && maxPts > 0 && (
+              <div className="mt-2">
+                <div className="mb-1 flex justify-between text-xs text-[#8B7355]"><span>Tukar Poin (maks {fmtLE(maxPts)})</span>{usedPts > 0 && <span className="text-[#738678]">-{fmtLE(usedPts)} LE</span>}</div>
+                <Input type="number" value={pts} onChange={(e) => setPts(e.target.value)} placeholder="0" data-testid="redeem-points" className="h-10 bg-white" />
               </div>
-              {maxPts > 0 && (
-                <div className="mt-2">
-                  <div className="mb-1 flex justify-between text-xs text-[#8B7355]"><span>Tukar Poin (maks {fmtLE(maxPts)})</span>{usedPts > 0 && <span className="text-[#738678]">-{fmtLE(usedPts)} LE</span>}</div>
-                  <Input type="number" value={pts} onChange={(e) => setPts(e.target.value)} placeholder="0" data-testid="redeem-points" className="h-10 bg-white" />
-                </div>
-              )}
-            </>)}
+            )}
             <div className="mt-4 rounded-xl bg-[#EFE6D5] p-4">
               <div className="text-xs font-medium text-[#8B6B45]">{t("sum.estimasi_total")}</div>
               <div className="font-heading text-2xl font-bold text-[#8B5A2B]" data-testid="checkout-total-le">{fmtLE(totalLE)} LE</div>
