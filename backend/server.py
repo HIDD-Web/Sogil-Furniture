@@ -422,6 +422,18 @@ class MaterialUpdateInput(BaseModel):
     notes: Optional[str] = None
     status: Optional[str] = None  # "active" | "archived"
 
+class MaterialPurchaseInput(BaseModel):
+    material_id: str
+    purchase_date: str
+    unit_price: float
+    quantity: float
+    currency: Optional[str] = "EGP"
+    supplier_name: Optional[str] = ""
+    notes: Optional[str] = ""
+
+class VoidPurchaseInput(BaseModel):
+    void_reason: Optional[str] = ""
+
 class FinanceTxnInput(BaseModel):
     date: Optional[str] = None
     type: str  # income | expense
@@ -4282,6 +4294,24 @@ async def seed():
     except Exception:
         pass
 
+    # Ensure indexes for material_purchases
+    try:
+        await db.material_purchases.create_index(
+            [("purchase_number", 1)],
+            unique=True,
+            name="uniq_purchase_number"
+        )
+        await db.material_purchases.create_index(
+            [("material_id", 1), ("purchase_date", -1)],
+            name="idx_mat_purchase_date"
+        )
+        await db.material_purchases.create_index(
+            [("purchase_date", -1)],
+            name="idx_purchase_date"
+        )
+    except Exception:
+        pass
+
 @app.on_event("startup")
 async def startup():
     await seed()
@@ -4754,6 +4784,273 @@ async def archive_material(
         return_document=ReturnDocument.AFTER
     )
     return {"ok": True, "message": "Bahan berhasil diarsipkan", "material": clean(updated)}
+
+# --------------------------------------------------------------------------
+# Material Purchases & Price History (Phase 2)
+# --------------------------------------------------------------------------
+async def get_next_purchase_number(date_str: Optional[str] = None) -> str:
+    # date_str format YYYY-MM-DD or default today
+    try:
+        if date_str and len(date_str) >= 10:
+            dt_part = date_str[:10].replace("-", "")
+        else:
+            dt_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+    except Exception:
+        dt_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    counter_id = f"purchase_{dt_part}"
+    prefix = f"PB-{dt_part}-"
+
+    existing_counter = await db.counters.find_one({"_id": counter_id})
+    if existing_counter is None:
+        last_pb = await db.material_purchases.find_one(
+            {"purchase_number": {"$regex": f"^{prefix}"}},
+            sort=[("purchase_number", -1)]
+        )
+        current_max = 0
+        if last_pb and "purchase_number" in last_pb:
+            try:
+                current_max = int(last_pb["purchase_number"].split("-")[-1])
+            except (ValueError, IndexError):
+                current_max = 0
+
+        await db.counters.update_one(
+            {"_id": counter_id},
+            {"$set": {"seq": current_max}},
+            upsert=True
+        )
+
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
+async def recalculate_material_latest_price(material_id: str):
+    # Find the latest valid purchase ordered by purchase_date desc, created_at desc
+    latest_pb = await db.material_purchases.find_one(
+        {"material_id": material_id, "is_void": {"$ne": True}},
+        sort=[("purchase_date", -1), ("created_at", -1)]
+    )
+
+    if latest_pb:
+        upd = {
+            "latest_price": latest_pb.get("unit_price"),
+            "latest_currency": latest_pb.get("currency", "EGP"),
+            "latest_purchase_date": latest_pb.get("purchase_date"),
+        }
+    else:
+        upd = {
+            "latest_price": None,
+            "latest_currency": None,
+            "latest_purchase_date": None,
+        }
+
+    await db.materials.update_one(
+        {"_id": id_query(material_id)},
+        {"$set": upd}
+    )
+
+@api_router.get("/admin/materials/purchases")
+async def get_material_purchases(
+    material_id: Optional[str] = None,
+    status: Optional[str] = None,  # "all", "valid", "void"
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    q: Optional[str] = None,
+    admin: dict = Depends(require_material_perm())
+):
+    query: Dict[str, Any] = {}
+
+    if material_id and material_id != "all":
+        query["material_id"] = material_id
+
+    if status == "valid":
+        query["is_void"] = {"$ne": True}
+    elif status == "void":
+        query["is_void"] = True
+
+    if start_date or end_date:
+        date_q = {}
+        if start_date:
+            date_q["$gte"] = start_date
+        if end_date:
+            date_q["$lte"] = end_date
+        query["purchase_date"] = date_q
+
+    if q and q.strip():
+        search_term = re.escape(q.strip())
+        query["$or"] = [
+            {"purchase_number": {"$regex": search_term, "$options": "i"}},
+            {"material_name_snapshot": {"$regex": search_term, "$options": "i"}},
+            {"material_specs_snapshot": {"$regex": search_term, "$options": "i"}},
+            {"supplier_name": {"$regex": search_term, "$options": "i"}},
+        ]
+
+    docs = await db.material_purchases.find(query).sort([("purchase_date", -1), ("created_at", -1)]).to_list(1000)
+    return [clean(d) for d in docs]
+
+@api_router.post("/admin/materials/purchases")
+async def create_material_purchase(
+    data: MaterialPurchaseInput,
+    admin: dict = Depends(require_material_perm())
+):
+    mat_id = (data.material_id or "").strip()
+    if not mat_id:
+        raise HTTPException(status_code=400, detail="Bahan wajib dipilih")
+
+    # Fetch master material
+    mat = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not mat:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    if mat.get("status") == "archived":
+        raise HTTPException(status_code=400, detail="Tidak dapat mencatat pembelian untuk bahan yang diarsipkan")
+
+    p_date = (data.purchase_date or "").strip()
+    if not p_date:
+        raise HTTPException(status_code=400, detail="Tanggal pembelian wajib diisi")
+
+    # Validate date format (YYYY-MM-DD)
+    try:
+        datetime.strptime(p_date[:10], "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format tanggal pembelian tidak valid (harus YYYY-MM-DD)")
+
+    if data.quantity is None or _num(data.quantity) <= 0:
+        raise HTTPException(status_code=400, detail="Jumlah pembelian (quantity) harus lebih besar dari 0")
+
+    if data.unit_price is None or _num(data.unit_price) < 0:
+        raise HTTPException(status_code=400, detail="Harga satuan tidak boleh negatif")
+
+    qty = round(_num(data.quantity), 4)
+    unit_price = round(_num(data.unit_price), 2)
+    total_amount = round(qty * unit_price, 2)
+    currency = (data.currency or "EGP").strip().upper()
+    if currency not in ["EGP", "IDR"]:
+        currency = "EGP"
+
+    # Get exchange rate from store-info or settings
+    exchange_rate = 344.0
+    try:
+        rate_val = await get_setting("exchange_rate_idr_per_le")
+        if rate_val:
+            exchange_rate = float(rate_val)
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc).isoformat()
+    material_canonical_id = str(mat["_id"])
+
+    doc = {
+        "material_id": material_canonical_id,
+        "material_name_snapshot": mat.get("name", ""),
+        "material_specs_snapshot": mat.get("specs", ""),
+        "category": mat.get("category", "Material"),
+        "unit": mat.get("unit", "pcs"),
+        "purchase_date": p_date[:10],
+        "unit_price": unit_price,
+        "quantity": qty,
+        "total_amount": total_amount,
+        "currency": currency,
+        "exchange_rate": exchange_rate,
+        "supplier_name": (data.supplier_name or "").strip(),
+        "notes": (data.notes or "").strip(),
+        "is_void": False,
+        "voided_at": None,
+        "voided_by_id": None,
+        "voided_by_name": None,
+        "void_reason": None,
+        "created_at": now,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+    }
+
+    # Concurrency-safe insert with purchase_number retry loop
+    for attempt in range(5):
+        try:
+            pb_num = await get_next_purchase_number(p_date)
+            doc["purchase_number"] = pb_num
+            res = await db.material_purchases.insert_one(doc)
+            doc["_id"] = res.inserted_id
+            break
+        except pymongo.errors.DuplicateKeyError:
+            if attempt == 4:
+                raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pembelian unik. Silakan coba kembali.")
+
+    # Update material latest price snapshot if this purchase is the latest
+    await recalculate_material_latest_price(material_canonical_id)
+
+    return clean(doc)
+
+@api_router.get("/admin/materials/purchases/{pb_id}")
+async def get_material_purchase_detail(
+    pb_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.material_purchases.find_one({"_id": id_query(pb_id)})
+    if not doc:
+        doc = await db.material_purchases.find_one({"purchase_number": pb_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Data pembelian bahan tidak ditemukan")
+    return clean(doc)
+
+@api_router.post("/admin/materials/purchases/{pb_id}/void")
+async def void_material_purchase(
+    pb_id: str,
+    data: VoidPurchaseInput,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.material_purchases.find_one({"_id": id_query(pb_id)})
+    if not doc:
+        doc = await db.material_purchases.find_one({"purchase_number": pb_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Data pembelian bahan tidak ditemukan")
+
+    if doc.get("is_void"):
+        raise HTTPException(status_code=400, detail="Pembelian bahan ini sudah berstatus void")
+
+    now = datetime.now(timezone.utc).isoformat()
+    upd = {
+        "is_void": True,
+        "voided_at": now,
+        "voided_by_id": admin.get("id"),
+        "voided_by_name": admin.get("name", "Admin"),
+        "void_reason": (data.void_reason or "").strip() or "Dibatalkan oleh admin",
+    }
+
+    updated = await db.material_purchases.find_one_and_update(
+        {"_id": doc["_id"]},
+        {"$set": upd},
+        return_document=ReturnDocument.AFTER
+    )
+
+    # Recalculate material latest price snapshot
+    await recalculate_material_latest_price(doc["material_id"])
+
+    return {"ok": True, "message": "Pembelian bahan berhasil di-void", "purchase": clean(updated)}
+
+@api_router.get("/admin/materials/{mat_id}/price-history")
+async def get_material_price_history(
+    mat_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    mat = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not mat:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    canonical_id = str(mat["_id"])
+    docs = await db.material_purchases.find(
+        {"material_id": canonical_id, "is_void": {"$ne": True}}
+    ).sort([("purchase_date", -1), ("created_at", -1)]).to_list(500)
+
+    return {
+        "material": clean(mat),
+        "history": [clean(d) for d in docs]
+    }
 
 app.include_router(api_router)
 
