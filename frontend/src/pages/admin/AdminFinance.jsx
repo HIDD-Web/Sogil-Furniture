@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import api from "../../lib/api";
 import { formatApiError } from "../../lib/format";
 import { Button } from "../../components/ui/button";
@@ -6,7 +7,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { Trash2, ArrowRightLeft, TrendingUp, TrendingDown, Pencil, X } from "lucide-react";
+import { Trash2, ArrowRightLeft, TrendingUp, TrendingDown, Pencil, X, ChevronRight, ArrowRight } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { toast } from "sonner";
 
@@ -23,6 +24,7 @@ const money = (v, cur) => {
 const PERIODS = [["this_month", "Bulan Ini"], ["last_month", "Bulan Lalu"], ["this_year", "Tahun Ini"], ["last_year", "Tahun Lalu"], ["custom", "Kustom"]];
 
 export default function AdminFinance() {
+  const navigate = useNavigate();
   const [stats, setStats] = useState(null);
   const [txns, setTxns] = useState([]);
   const [cats, setCats] = useState({ income: [], expense: [] });
@@ -279,8 +281,26 @@ export default function AdminFinance() {
         {["EGP", "IDR"].map((cur) => {
           const c = stats?.current?.[cur]; const cmp = stats?.comparison?.[cur];
           return (
-            <div key={cur} className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-5 shadow-xs">
-              <div className="font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Statistik {cur}</div>
+            <div
+              key={cur}
+              role="button"
+              tabIndex={0}
+              onClick={() => navigate(`/admin/finance/statistik?currency=${cur}`)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  navigate(`/admin/finance/statistik?currency=${cur}`);
+                }
+              }}
+              data-testid={`stat-card-${cur.toLowerCase()}`}
+              className="group cursor-pointer rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-5 shadow-xs transition-all hover:border-[#8B5A2B]/50 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-[#8B5A2B]/40"
+            >
+              <div className="flex items-center justify-between">
+                <div className="font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Statistik {cur}</div>
+                <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#8B5A2B] group-hover:underline">
+                  Lihat Detail Statistik <ArrowRight size={13} className="transition-transform group-hover:translate-x-0.5" />
+                </span>
+              </div>
               <div className="mt-2.5 sm:mt-3 space-y-1.5 sm:space-y-2 text-xs sm:text-sm">
                 <div className="flex justify-between"><span className="text-[#5C4A3D]">Pendapatan</span><span className="font-medium">{money(c?.revenue || 0, cur)}<Cmp v={cmp?.revenue} /></span></div>
                 <div className="flex justify-between"><span className="text-[#5C4A3D]">Biaya</span><span className="font-medium">{money(c?.cost || 0, cur)}<Cmp v={cmp?.cost} reverseColor={true} /></span></div>

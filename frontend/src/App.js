@@ -47,6 +47,11 @@ import AdminReferrals from "./pages/admin/AdminReferrals";
 import AdminCustomers from "./pages/admin/AdminCustomers";
 import CustomOrderPage from "./pages/CustomOrderPage";
 
+function QueryRedirect({ to }) {
+  const location = useLocation();
+  return <Navigate to={`${to}${location.search || ""}`} replace />;
+}
+
 function CustomerShell({ children }) {
   const [store, setStore] = useState(null);
   const location = useLocation();
@@ -114,7 +119,9 @@ function Layout() {
           <Route path="custom-requests" element={<AdminCustomRequests />} />
           <Route path="analytics" element={<AdminAnalytics />} />
           <Route path="finance" element={<AdminFinance />} />
-          <Route path="finance/statistics" element={<AdminFinanceStats />} />
+          <Route path="finance/statistik" element={<AdminFinanceStats />} />
+          <Route path="finance/statistics" element={<QueryRedirect to="/admin/finance/statistik" />} />
+          <Route path="statistik" element={<QueryRedirect to="/admin/finance/statistik" />} />
           <Route path="export" element={<AdminExport />} />
           <Route path="discounts" element={<AdminDiscounts />} />
           <Route path="referrals" element={<AdminReferrals />} />
