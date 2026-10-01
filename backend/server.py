@@ -3730,12 +3730,13 @@ async def balance_adjust(payload: Dict[str, Any], admin: dict = Depends(require_
 
     conv = compute_currency_conversion(account, delta, rate)
 
+    desc = (payload.get("description") or "").strip() or "Set saldo saat ini"
     doc = {"date": payload.get("date") or now, "type": "balance_adjustment", "category": "Penyesuaian Saldo",
            "amount": conv["primary_amount"], "currency": account, "account": account, "previous_balance": prev, "new_balance": new_balance,
            "exchange_rate": rate,
            "counterpart_amount": conv["counterpart_amount"],
            "counterpart_currency": conv["counterpart_currency"],
-           "description": payload.get("description", ""), "created_by_name": admin.get("name"),
+           "description": desc, "created_by_name": admin.get("name"),
            "created_at": now, "updated_at": now}
     await db.finance_transactions.insert_one(doc)
     return {"ok": True, "account": account, "previous_balance": prev, "new_balance": new_balance, "adjustment": delta}

@@ -51,13 +51,19 @@ export default function AdminFinance() {
   const [employees, setEmployees] = useState([]);
   const [txnSearch, setTxnSearch] = useState("");
   const [txnInput, setTxnInput] = useState("");
+  const [txnTypeFilter, setTxnTypeFilter] = useState("all");
 
   const loadStats = () => {
     const p = { period };
     if (period === "custom") { p.start = range.start; p.end = range.end; }
     api.get("/admin/finance/stats", { params: p }).then((r) => setStats(r.data));
   };
-  const loadTxns = () => api.get("/admin/finance/transactions", { params: txnSearch ? { q: txnSearch } : {} }).then((r) => setTxns(r.data));
+  const loadTxns = () => {
+    const p = {};
+    if (txnSearch) p.q = txnSearch;
+    if (txnTypeFilter && txnTypeFilter !== "all") p.type = txnTypeFilter;
+    return api.get("/admin/finance/transactions", { params: p }).then((r) => setTxns(r.data));
+  };
   const loadChart = () => api.get("/admin/finance/monthly", { params: { year: chart.year, currency: chart.currency } })
     .then((r) => setChart((c) => ({ ...c, data: r.data.months.map((m) => ({ name: m.label.slice(5), Revenue: Math.round(m.revenue), Profit: Math.round(m.profit) })) })));
   const loadConfig = () => {
@@ -76,7 +82,7 @@ export default function AdminFinance() {
     }).catch(() => {});
   };
   useEffect(() => { loadConfig(); }, []);
-  useEffect(() => { loadTxns(); }, [txnSearch]);
+  useEffect(() => { loadTxns(); }, [txnSearch, txnTypeFilter]);
   useEffect(() => { loadStats(); }, [period, range.start, range.end]);
   useEffect(() => { loadChart(); }, [chart.currency, chart.year]);
 
@@ -160,9 +166,70 @@ export default function AdminFinance() {
     }
   };
 
+  const getTxnTypeLabel = (type) => {
+    if (type === "order_revenue") return "Pendapatan Pesanan";
+    if (type === "transfer") return "Transfer";
+    if (type === "income") return "Pemasukan";
+    if (type === "expense") return "Pengeluaran";
+    if (type === "balance_adjustment") return "Penyesuaian Saldo";
+    return type || "-";
+  };
+
+  const getTxnTypeBadge = (type) => {
+    if (type === "balance_adjustment") {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-amber-50 text-amber-800 border border-amber-200">
+          Penyesuaian Saldo
+        </span>
+      );
+    }
+    if (type === "order_revenue") {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
+          Pendapatan Pesanan
+        </span>
+      );
+    }
+    if (type === "income") {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+          Pemasukan
+        </span>
+      );
+    }
+    if (type === "transfer") {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-purple-50 text-purple-700 border border-purple-200">
+          Transfer
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-stone-100 text-stone-700 border border-stone-200">
+        Pengeluaran
+      </span>
+    );
+  };
+
   const formatTxnAmount = (t) => {
     if (t.type === "transfer") {
       return `${money(t.from_amount, t.from_account)} → ${money(t.to_amount, t.to_account)}`;
+    }
+    if (t.type === "balance_adjustment") {
+      const amt = Number(t.amount) || 0;
+      const sign = amt > 0 ? "+" : "";
+      const primary = `${sign}${money(amt, t.currency)}`;
+      if (t.counterpart_amount != null && t.counterpart_amount !== "") {
+        const cpCur = t.counterpart_currency || (t.currency === "EGP" ? "IDR" : "EGP");
+        const cpAmt = Number(t.counterpart_amount) || 0;
+        const cpSign = cpAmt > 0 ? "+" : "";
+        return (
+          <span>
+            {primary} <span className="text-xs font-normal text-[#8B7355]">(≈ {cpSign}{money(cpAmt, cpCur)})</span>
+          </span>
+        );
+      }
+      return primary;
     }
     const primary = money(t.amount, t.currency);
     if (t.counterpart_amount != null && t.counterpart_amount !== "") {
@@ -492,12 +559,35 @@ export default function AdminFinance() {
 
       {/* Transactions list */}
       <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-5 shadow-xs">
-        <div className="mb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <span className="font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Riwayat Transaksi</span>
-          <div className="flex flex-wrap sm:flex-nowrap gap-2">
-            <Input value={txnInput} onChange={(e) => setTxnInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && setTxnSearch(txnInput.trim())} placeholder="Cari transaksi..." data-testid="txn-search" className="flex-1 sm:w-64 bg-white text-xs sm:text-sm" />
-            <Button onClick={() => setTxnSearch(txnInput.trim())} data-testid="txn-search-btn" className="rounded-xl bg-[#8B5A2B] text-xs sm:text-sm hover:bg-[#6B4423]">Cari</Button>
-            {txnSearch && <Button variant="outline" onClick={() => { setTxnInput(""); setTxnSearch(""); }} data-testid="txn-search-clear" className="rounded-xl text-xs sm:text-sm">Reset</Button>}
+        <div className="mb-3 flex flex-col md:flex-row md:items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Riwayat Transaksi</span>
+            {txnTypeFilter !== "all" && (
+              <span className="text-xs text-[#8B7355] bg-[#FAF7F2] px-2 py-0.5 rounded-md border border-[#E5DCC5]">
+                Filter aktif
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+            <div className="w-full sm:w-44">
+              <Select value={txnTypeFilter} onValueChange={setTxnTypeFilter}>
+                <SelectTrigger data-testid="txn-type-filter" className="bg-white text-xs sm:text-sm h-9">
+                  <SelectValue placeholder="Semua Tipe" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Semua Tipe</SelectItem>
+                  <SelectItem value="income">Pemasukan</SelectItem>
+                  <SelectItem value="expense">Pengeluaran</SelectItem>
+                  <SelectItem value="transfer">Transfer</SelectItem>
+                  <SelectItem value="balance_adjustment">Penyesuaian Saldo</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <Input value={txnInput} onChange={(e) => setTxnInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && setTxnSearch(txnInput.trim())} placeholder="Cari transaksi..." data-testid="txn-search" className="flex-1 sm:w-56 bg-white text-xs sm:text-sm h-9" />
+            <Button onClick={() => setTxnSearch(txnInput.trim())} data-testid="txn-search-btn" className="rounded-xl bg-[#8B5A2B] text-xs sm:text-sm hover:bg-[#6B4423] h-9">Cari</Button>
+            {(txnSearch || txnTypeFilter !== "all") && (
+              <Button variant="outline" onClick={() => { setTxnInput(""); setTxnSearch(""); setTxnTypeFilter("all"); }} data-testid="txn-search-clear" className="rounded-xl text-xs sm:text-sm h-9">Reset</Button>
+            )}
           </div>
         </div>
 
@@ -506,10 +596,14 @@ export default function AdminFinance() {
           {txns.map((t) => (
             <div key={t.id} className="rounded-xl border border-[#F1EBE0] bg-[#FCFBF9] p-3 text-xs shadow-2xs" data-testid={`txn-card-${t.id}`}>
               <div className="flex items-start justify-between gap-2">
-                <div>
-                  <span className="font-semibold text-[#2C1E16] text-sm block">{t.category}</span>
-                  <span className="text-[11px] text-[#8B7355]">
-                    {(t.date || "").slice(0, 10)} · {t.type === "order_revenue" ? "Pendapatan" : t.type === "transfer" ? "Transfer" : t.type === "income" ? "Pemasukan" : "Pengeluaran"}
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="font-semibold text-[#2C1E16] text-sm">{t.category}</span>
+                    {getTxnTypeBadge(t.type)}
+                  </div>
+                  <span className="text-[11px] text-[#8B7355] block">
+                    {(t.date || "").slice(0, 10)}
+                    {t.type === "balance_adjustment" ? " · Set saldo saat ini" : ` · ${getTxnTypeLabel(t.type)}`}
                   </span>
                 </div>
                 <div className="text-right shrink-0">
@@ -548,8 +642,15 @@ export default function AdminFinance() {
               {txns.map((t) => (
                 <tr key={t.id} className="border-t border-[#F1EBE0] hover:bg-[#FCFBF9]" data-testid={`txn-row-${t.id}`}>
                   <td className="py-2.5 px-3 text-[#5C4A3D]">{(t.date || "").slice(0, 10)}</td>
-                  <td className="py-2.5 px-2 text-[#5C4A3D]">{t.type === "order_revenue" ? "Pendapatan Pesanan" : t.type === "transfer" ? "Transfer" : t.type === "income" ? "Pemasukan" : "Pengeluaran"}</td>
-                  <td className="py-2.5 px-2 text-[#5C4A3D] font-medium">{t.category}</td>
+                  <td className="py-2.5 px-2">
+                    {getTxnTypeBadge(t.type)}
+                  </td>
+                  <td className="py-2.5 px-2 text-[#5C4A3D] font-medium">
+                    <div>{t.category}</div>
+                    {t.type === "balance_adjustment" && (
+                      <span className="text-[11px] font-normal text-[#8B7355]">Set saldo saat ini</span>
+                    )}
+                  </td>
                   <td className="py-2.5 px-2 font-medium text-[#2C1E16]">{formatTxnAmount(t)}</td>
                   <td className="py-2.5 px-2 text-[#8B7355]">{t.created_by_name || "-"}</td>
                   <td className="py-2.5 px-3 text-right">

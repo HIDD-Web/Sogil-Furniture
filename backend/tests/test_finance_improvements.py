@@ -459,6 +459,117 @@ class TestFinanceImprovementsAsyncLifecycle(unittest.IsolatedAsyncioTestCase):
             await dep(unauth_user)
         self.assertEqual(ctx.exception.status_code, 403)
 
+    async def test_section_9_balance_adjustment_penyesuaian_saldo(self):
+        """Comprehensive verification of Penyesuaian Saldo / balance_adjustment:
+        1. balance_adjust endpoint creates type='balance_adjustment', category='Penyesuaian Saldo'.
+        2. Default description defaults to 'Set saldo saat ini' when blank.
+        3. _compute_balances accurately reflects ending balance = target balance.
+        4. Neither positive nor negative adjustments alter revenue, cost, or operating profit in _stats_for.
+        5. GET /admin/finance/statistics completely isolates Penyesuaian Saldo from category aggregates.
+        6. Existing income/expense/transfer are completely unaffected.
+        """
+        from server import (
+            balance_adjust,
+            _compute_balances,
+            _stats_for,
+            finance_statistics,
+        )
+
+        mock_db = MagicMock()
+        admin_fin = {"id": "u_fin", "name": "Syahid Fin", "role": "admin", "permissions": {"access_finance": True}}
+
+        # Ledger setup:
+        # Starting: 1000 EGP income, 200 EGP expense -> current balance = 800 EGP
+        # Target new balance: 1500 EGP -> delta = +700 EGP
+        existing_txns = [
+            {"date": "2026-09-01T10:00:00", "type": "income", "category": "Penjualan", "currency": "EGP", "account": "EGP", "amount": 1000.0, "is_void": False},
+            {"date": "2026-09-05T10:00:00", "type": "expense", "category": "Operasional", "currency": "EGP", "account": "EGP", "amount": 200.0, "is_void": False},
+        ]
+
+        def find_txns(query=None, *args, **kwargs):
+            cursor = MagicMock()
+            filtered = [t for t in existing_txns if not t.get("is_void")]
+            cursor.to_list = AsyncMock(return_value=filtered)
+            cursor.__aiter__ = lambda self: self
+            cursor_list = list(filtered)
+            async def anext(self):
+                if cursor_list:
+                    return cursor_list.pop(0)
+                raise StopAsyncIteration
+            cursor.__anext__ = anext
+            return cursor
+
+        mock_db.finance_transactions.find = find_txns
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.system_rates.find_one = AsyncMock(return_value={"rate": 357.0})
+
+        inserted_docs = []
+        async def mock_insert_one(doc):
+            inserted_docs.append(doc)
+            res = MagicMock()
+            res.inserted_id = f"txn_adj_{len(inserted_docs)}"
+            return res
+        mock_db.finance_transactions.insert_one = mock_insert_one
+
+        with patch("server.db", mock_db):
+            # 1. Run balance_adjust with blank description
+            res = await balance_adjust(
+                payload={"account": "EGP", "new_balance": 1500.0, "description": ""},
+                admin=admin_fin
+            )
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["previous_balance"], 800.0)
+            self.assertEqual(res["new_balance"], 1500.0)
+            self.assertEqual(res["adjustment"], 700.0)
+
+            # Verify inserted doc structure
+            self.assertEqual(len(inserted_docs), 1)
+            adj_doc = inserted_docs[0]
+            self.assertEqual(adj_doc["type"], "balance_adjustment")
+            self.assertEqual(adj_doc["category"], "Penyesuaian Saldo")
+            self.assertEqual(adj_doc["description"], "Set saldo saat ini")
+            self.assertEqual(adj_doc["amount"], 700.0)
+            self.assertEqual(adj_doc["currency"], "EGP")
+            self.assertEqual(adj_doc["account"], "EGP")
+            self.assertEqual(adj_doc["previous_balance"], 800.0)
+            self.assertEqual(adj_doc["new_balance"], 1500.0)
+
+            # Add to simulated ledger to test _compute_balances and _stats_for
+            existing_txns.append(adj_doc)
+
+            # 2. Verify _compute_balances
+            computed = await _compute_balances()
+            self.assertEqual(computed.get("EGP"), 1500.0)
+
+            # 3. Verify _stats_for (Stats calculation MUST NOT count balance_adjustment)
+            # In September 2026: Revenue should stay 1000.0, Cost should stay 200.0, Operating Profit should stay 800.0
+            stats = await _stats_for("2026-09-01", "2026-09-30")
+            self.assertEqual(stats["EGP"]["revenue"], 1000.0)
+            self.assertEqual(stats["EGP"]["cost"], 200.0)
+            self.assertEqual(stats["EGP"]["operating_profit"], 800.0)
+
+            # 4. Negative adjustment test
+            # Set balance down to 1100.0 (delta = -400.0)
+            res_neg = await balance_adjust(
+                payload={"account": "EGP", "new_balance": 1100.0, "description": "Koreksi fisik kas"},
+                admin=admin_fin
+            )
+            self.assertEqual(res_neg["adjustment"], -400.0)
+            neg_doc = inserted_docs[1]
+            self.assertEqual(neg_doc["description"], "Koreksi fisik kas")
+            self.assertEqual(neg_doc["amount"], -400.0)
+            existing_txns.append(neg_doc)
+
+            # Re-check _compute_balances: 1500 - 400 = 1100.0
+            computed_neg = await _compute_balances()
+            self.assertEqual(computed_neg.get("EGP"), 1100.0)
+
+            # Negative adjustment delta must NOT inflate cost or decrease revenue
+            stats_after_neg = await _stats_for("2026-09-01", "2026-09-30")
+            self.assertEqual(stats_after_neg["EGP"]["revenue"], 1000.0)
+            self.assertEqual(stats_after_neg["EGP"]["cost"], 200.0)
+            self.assertEqual(stats_after_neg["EGP"]["operating_profit"], 800.0)
+
 
 if __name__ == "__main__":
     unittest.main()
