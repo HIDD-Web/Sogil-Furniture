@@ -821,64 +821,72 @@ export default function AdminInvoiceDetail() {
             </div>
 
             {/* Copy Link Section */}
-            <div className="space-y-1.5">
-              <Label className="text-xs font-semibold text-[#2C1E16]">Link Klaim Langsung</Label>
-              <div className="flex gap-2">
-                <Input
-                  readOnly
-                  value={`${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}`}
-                  className="h-10 text-xs font-mono bg-stone-50"
-                />
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    const link = `${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}`;
-                    navigator.clipboard.writeText(link);
-                    toast.success("Link klaim berhasil disalin!");
-                  }}
-                  className="rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B] shrink-0"
-                >
-                  <Copy size={13} className="mr-1" /> Salin Link
-                </Button>
-              </div>
-            </div>
+            {(() => {
+              const customerBaseUrl = process.env.REACT_APP_CUSTOMER_URL || (window.location.hostname === "team.sogilfurniture.com" ? "https://sogilfurniture.com" : window.location.origin);
+              const claimLink = `${customerBaseUrl}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}`;
+              const waText = `Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${claimLink}\n\nTerima kasih!`;
 
-            {/* WhatsApp Message Preview */}
-            <div className="space-y-1.5">
-              <Label className="text-xs font-semibold text-[#2C1E16]">Pesan WhatsApp Siap Kirim</Label>
-              <Textarea
-                readOnly
-                rows={4}
-                value={`Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}\n\nTerima kasih!`}
-                className="text-xs font-mono bg-stone-50"
-              />
-              <div className="flex justify-end gap-2 pt-1">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    const msg = `Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}\n\nTerima kasih!`;
-                    navigator.clipboard.writeText(msg);
-                    toast.success("Pesan WhatsApp berhasil disalin!");
-                  }}
-                  className="rounded-xl text-xs"
-                >
-                  <Copy size={13} className="mr-1" /> Salin Pesan WA
-                </Button>
-                {invoice.customer?.whatsapp && (
-                  <a
-                    href={`https://wa.me/${invoice.customer.whatsapp.replace(/\+/g, "")}?text=${encodeURIComponent(`Halo Kak ${invoice.customer?.name || ""}, berikut invoice penawaran pesanan Anda dari Sogil Furniture:\n\nNomor Invoice: ${invoice.invoice_number}\nKode Klaim: ${claimCodeResult.claim_code}\n\nSilakan klik link berikut untuk mengklaim invoice dan menyelesaikan pesanan:\n${window.location.origin}/klaim-invoice?invoice=${invoice.invoice_number}&code=${claimCodeResult.claim_code}\n\nTerima kasih!`)}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    <Button size="sm" className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs text-white">
-                      <MessageCircle size={13} className="mr-1" /> Kirim via WhatsApp
-                    </Button>
-                  </a>
-                )}
-              </div>
-            </div>
+              return (
+                <>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-semibold text-[#2C1E16]">Link Klaim Langsung</Label>
+                    <div className="flex gap-2">
+                      <Input
+                        readOnly
+                        value={claimLink}
+                        className="h-10 text-xs font-mono bg-stone-50"
+                      />
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          navigator.clipboard.writeText(claimLink);
+                          toast.success("Link klaim berhasil disalin!");
+                        }}
+                        className="rounded-xl border-[#8B5A2B] text-xs text-[#8B5A2B] shrink-0"
+                      >
+                        <Copy size={13} className="mr-1" /> Salin Link
+                      </Button>
+                    </div>
+                  </div>
+
+                  {/* WhatsApp Message Preview */}
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-semibold text-[#2C1E16]">Pesan WhatsApp Siap Kirim</Label>
+                    <Textarea
+                      readOnly
+                      rows={4}
+                      value={waText}
+                      className="text-xs font-mono bg-stone-50"
+                    />
+                    <div className="flex justify-end gap-2 pt-1">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          navigator.clipboard.writeText(waText);
+                          toast.success("Pesan WhatsApp berhasil disalin!");
+                        }}
+                        className="rounded-xl text-xs"
+                      >
+                        <Copy size={13} className="mr-1" /> Salin Pesan WA
+                      </Button>
+                      {invoice.customer?.whatsapp && (
+                        <a
+                          href={`https://wa.me/${invoice.customer.whatsapp.replace(/\+/g, "")}?text=${encodeURIComponent(waText)}`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          <Button size="sm" className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-xs text-white">
+                            <MessageCircle size={13} className="mr-1" /> Kirim via WhatsApp
+                          </Button>
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
 
             <div className="flex justify-end border-t border-[#F1EBE0] pt-3">
               <Button

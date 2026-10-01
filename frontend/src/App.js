@@ -70,7 +70,8 @@ function CustomerShell({ children }) {
 
 function Layout() {
   const location = useLocation();
-  const isAdmin = location.pathname.startsWith("/admin");
+  const isTeamHost = window.location.hostname === "team.sogilfurniture.com";
+  const isAdmin = isTeamHost || location.pathname.startsWith("/admin");
 
   useEffect(() => {
     const link = document.getElementById("manifest-link");
@@ -82,7 +83,7 @@ function Layout() {
       if (link) link.setAttribute("href", "/manifest-admin.json");
       if (themeMeta) themeMeta.setAttribute("content", "#2C1E16");
       if (appleIcon) appleIcon.setAttribute("href", "/icons/apple-touch-icon-admin.png");
-      if (appleTitle) appleTitle.setAttribute("content", "Sogil Tim");
+      if (appleTitle) appleTitle.setAttribute("content", "Sogil Team");
     } else {
       if (link) link.setAttribute("href", "/manifest.json");
       if (themeMeta) themeMeta.setAttribute("content", "#8B5A2B");
@@ -94,6 +95,8 @@ function Layout() {
   if (isAdmin) {
     return (
       <Routes>
+        <Route path="/" element={<Navigate to="/admin/orders" replace />} />
+        <Route path="/login" element={<Navigate to="/admin/login" replace />} />
         <Route path="/admin/login" element={<AdminLogin />} />
         <Route path="/admin/invoices/:id/print" element={<AdminInvoicePrint />} />
         <Route path="/admin" element={<AdminLayout />}>
@@ -119,6 +122,7 @@ function Layout() {
           <Route path="admins" element={<AdminAdmins />} />
           <Route path="settings" element={<AdminSettings />} />
         </Route>
+        {isTeamHost && <Route path="*" element={<Navigate to="/admin/orders" replace />} />}
       </Routes>
     );
   }

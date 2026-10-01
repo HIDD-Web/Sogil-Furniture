@@ -9,16 +9,17 @@
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
         
-        <!-- PWA Early Resolution Script: evaluate route synchronously before manifest/apple tags are evaluated -->
+        <!-- PWA Early Resolution Script: evaluate route/host synchronously before manifest/apple tags are evaluated -->
         <script>
           (function() {
-            var isAdmin = window.location.pathname.indexOf("/admin") === 0;
+            var isTeamHost = window.location.hostname === "team.sogilfurniture.com";
+            var isAdmin = isTeamHost || window.location.pathname.indexOf("/admin") === 0;
             window.__SOGIL_PWA_EARLY_ADMIN__ = isAdmin;
             if (isAdmin) {
               document.write(
                 '<link id="manifest-link" rel="manifest" href="%PUBLIC_URL%/manifest-admin.json" />' +
                 '<link id="apple-icon-link" rel="apple-touch-icon" href="%PUBLIC_URL%/icons/apple-touch-icon-admin.png" />' +
-                '<meta id="apple-title-meta" name="apple-mobile-web-app-title" content="Sogil Tim" />'
+                '<meta id="apple-title-meta" name="apple-mobile-web-app-title" content="Sogil Team" />'
               );
             } else {
               document.write(

@@ -1,5 +1,5 @@
 {
-  "id": "/admin?pwa=admin",
+  "id": "/?pwa=admin",
   "short_name": "Sogil Team",
   "name": "Sogil Team",
   "description": "Dashboard Manajemen & Operasional Tim Sogil Furniture",
@@ -21,8 +21,8 @@
       "purpose": "any maskable"
     }
   ],
-  "start_url": "/admin?pwa=admin",
-  "scope": "/admin",
+  "start_url": "/?pwa=admin",
+  "scope": "/",
   "background_color": "#FAF5EE",
   "theme_color": "#2C1E16",
   "display": "standalone",
