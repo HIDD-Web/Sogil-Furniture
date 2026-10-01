@@ -2497,6 +2497,8 @@ async def admin_list_invoices(
 async def admin_get_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
     inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
     if not inv:
+        inv = await db.invoices.find_one({"invoice_number": invoice_id})
+    if not inv:
         raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
     return clean(inv)
 
@@ -2667,6 +2669,8 @@ async def admin_permanent_delete_invoice(
         )
 
     inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
+    if not inv:
+        inv = await db.invoices.find_one({"invoice_number": invoice_id})
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
 

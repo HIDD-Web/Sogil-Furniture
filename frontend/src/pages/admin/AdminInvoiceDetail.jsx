@@ -141,7 +141,8 @@ export default function AdminInvoiceDetail() {
   const handlePermanentDelete = async (reason) => {
     setDeleteLoading(true);
     try {
-      await api.post(`/api/admin/invoices/${id}/permanent-delete`, {
+      const targetId = invoice?.id || invoice?._id || id;
+      await api.post(`/admin/invoices/${targetId}/permanent-delete`, {
         confirmation_phrase: "HAPUS PERMANEN",
         reason: reason || undefined,
       });

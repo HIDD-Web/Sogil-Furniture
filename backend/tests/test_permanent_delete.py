@@ -416,6 +416,57 @@ class TestPermanentDeleteBackend(unittest.TestCase):
         # Normal cancel DOES void finance txn
         mock_db.finance_transactions.update_one.assert_called_once()
 
+    # --------------------------------------------------------------------------
+    # 12. INVOICE IDENTIFIER RESOLUTION (CANONICAL MONGO ID & INVOICE NUMBER)
+    # --------------------------------------------------------------------------
+    @patch("server.db")
+    def test_15_permanent_delete_invoice_lookup_by_invoice_number(self, mock_db):
+        """Permanent delete resolves invoice by invoice_number fallback if not found by _id."""
+        inv_doc = {
+            "_id": ObjectId("674500000000000000000002"),
+            "invoice_number": "INV-2026-0002",
+            "status": "SENT",
+            "customer": {"name": "Customer Test", "whatsapp": "+201500000000"}
+        }
+        # First lookup by _id returns None, second lookup by invoice_number returns inv_doc
+        mock_db.invoices.find_one = AsyncMock(side_effect=[None, inv_doc])
+        mock_db.invoices.delete_one = AsyncMock(return_value=MagicMock(deleted_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+
+        res = asyncio.run(server.admin_permanent_delete_invoice(
+            "INV-2026-0002",
+            server.PermanentDeleteInput(confirmation_phrase="HAPUS PERMANEN"),
+            admin=self.owner_user
+        ))
+        self.assertTrue(res["ok"])
+        # Verified it deletes the document by its actual Mongo _id
+        mock_db.invoices.delete_one.assert_called_once_with({"_id": ObjectId("674500000000000000000002")})
+        # Audit log recorded with canonical identifier
+        mock_db.audit_logs.insert_one.assert_called_once()
+        audit_call = mock_db.audit_logs.insert_one.call_args[0][0]
+        self.assertEqual(audit_call["entity_identifier"], "INV-2026-0002")
+
+    @patch("server.db")
+    def test_16_permanent_delete_invoice_lookup_by_object_id_string(self, mock_db):
+        """Permanent delete resolves invoice by stringified 24-char ObjectId."""
+        real_oid = ObjectId("674500000000000000000003")
+        inv_doc = {
+            "_id": real_oid,
+            "invoice_number": "INV-2026-0003",
+            "status": "DRAFT"
+        }
+        mock_db.invoices.find_one = AsyncMock(return_value=inv_doc)
+        mock_db.invoices.delete_one = AsyncMock(return_value=MagicMock(deleted_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+
+        res = asyncio.run(server.admin_permanent_delete_invoice(
+            str(real_oid),
+            server.PermanentDeleteInput(confirmation_phrase="HAPUS PERMANEN"),
+            admin=self.owner_user
+        ))
+        self.assertTrue(res["ok"])
+        mock_db.invoices.delete_one.assert_called_once_with({"_id": real_oid})
+
 
 if __name__ == "__main__":
     unittest.main()
