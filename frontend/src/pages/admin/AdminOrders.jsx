@@ -33,15 +33,6 @@ export default function AdminOrders() {
 
   const activeFilter = status ? ORDER_STATUS[status]?.label : payment ? PAYMENT_STATUS[payment]?.label : null;
 
-  const del = async (e, o) => {
-    e.stopPropagation();
-    const paid = o.payment_status === "lunas";
-    const msg = paid ? `Pesanan ${o.order_number} sudah LUNAS. Menghapus akan membalik pendapatan otomatis terkait. Lanjutkan?` : `Hapus pesanan ${o.order_number}? Tindakan ini tidak dapat dibatalkan.`;
-    if (!window.confirm(msg)) return;
-    try { await api.delete(`/admin/orders/${o.id}`); toast.success("Pesanan dihapus"); setOrders((prev) => prev.filter((x) => x.id !== o.id)); }
-    catch (err) { toast.error(err.response?.data?.detail || "Gagal menghapus"); }
-  };
-
   return (
     <div className="space-y-4 sm:space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -104,11 +95,6 @@ export default function AdminOrders() {
                     <span className="text-[11px] text-[#8B7355]">
                       {o.delivery_method === "delivery" ? (o.delivery_zone_name || "Delivery") : "Ambil"}
                     </span>
-                    {canDelete && (
-                      <button onClick={(e) => del(e, o)} data-testid={`delete-order-mobile-${o.order_number}`} className="p-0.5 text-red-500 hover:text-red-700">
-                        <Trash2 size={14} />
-                      </button>
-                    )}
                   </div>
                 </div>
               </div>
@@ -129,7 +115,6 @@ export default function AdminOrders() {
                     <th className="px-4 py-3">Total</th>
                     <th className="px-4 py-3">Bayar</th>
                     <th className="px-4 py-3">Status</th>
-                    {canDelete && <th className="px-4 py-3"></th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -143,7 +128,6 @@ export default function AdminOrders() {
                       <td className="px-4 py-3 font-medium text-[#2C1E16]">{fmtLE(o.total_le)} LE</td>
                       <td className="px-4 py-3"><Badge variant="outline" className={PAYMENT_STATUS[o.payment_status]?.color}>{PAYMENT_STATUS[o.payment_status]?.label}</Badge></td>
                       <td className="px-4 py-3"><Badge variant="outline" className={ORDER_STATUS[o.order_status]?.color}>{ORDER_STATUS[o.order_status]?.label}</Badge></td>
-                      {canDelete && <td className="px-4 py-3"><button onClick={(e) => del(e, o)} data-testid={`delete-order-${o.order_number}`} className="p-1 text-red-500 hover:text-red-700"><Trash2 size={16} /></button></td>}
                     </tr>
                   ))}
                 </tbody>

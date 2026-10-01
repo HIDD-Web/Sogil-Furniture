@@ -7,12 +7,11 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { useAuth } from "../../context/AuthContext";
-import { Plus, Search, FileText, Printer, Trash2, Eye, ExternalLink } from "lucide-react";
+import { Plus, Search, FileText, Printer, Eye, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
 export default function AdminInvoices() {
   const { user } = useAuth();
-  const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -89,25 +88,6 @@ export default function AdminInvoices() {
       next.set("status", st);
     }
     setParams(next);
-  };
-
-  const handleDelete = async (e, inv) => {
-    e.stopPropagation();
-    if (inv.status !== "DRAFT") {
-      toast.error("Hanya invoice berstatus DRAFT yang dapat dihapus.");
-      return;
-    }
-    if (!window.confirm(`Hapus invoice draft ${inv.invoice_number}? Tindakan ini tidak dapat dibatalkan.`)) {
-      return;
-    }
-    try {
-      await api.delete(`/admin/invoices/${inv.id || inv._id}`);
-      toast.success("Invoice draft berhasil dihapus");
-      setInvoices((prev) => prev.filter((x) => (x.id || x._id) !== (inv.id || inv._id)));
-      loadGlobalCounts();
-    } catch (err) {
-      toast.error(err.response?.data?.detail || "Gagal menghapus invoice");
-    }
   };
 
   return (
@@ -304,16 +284,6 @@ export default function AdminInvoices() {
                     >
                       <Eye size={13} className="mr-1" /> Detail
                     </Button>
-                    {inv.status === "DRAFT" && canDelete && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={(e) => handleDelete(e, inv)}
-                        className="h-8 rounded-lg border-red-200 text-xs text-red-600 hover:bg-red-50"
-                      >
-                        <Trash2 size={13} />
-                      </Button>
-                    )}
                   </div>
                 </div>
               );
@@ -408,17 +378,6 @@ export default function AdminInvoices() {
                             >
                               <Eye size={13} className="mr-1" /> Detail
                             </Button>
-                            {inv.status === "DRAFT" && canDelete && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={(e) => handleDelete(e, inv)}
-                                className="h-8 rounded-lg border-red-200 text-xs text-red-600 hover:bg-red-50"
-                                title="Hapus Draft"
-                              >
-                                <Trash2 size={13} />
-                              </Button>
-                            )}
                           </div>
                         </td>
                       </tr>

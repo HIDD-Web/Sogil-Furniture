@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uuid
 import secrets
+import inspect
 import json
 import re
 import urllib.parse
@@ -441,6 +442,30 @@ class ReferralInput(BaseModel):
 class PointAdjustInput(BaseModel):
     amount: float
     reason: str
+
+class PermanentDeleteInput(BaseModel):
+    confirmation_phrase: str
+    reason: Optional[str] = None
+
+async def record_audit_log(
+    action: str,
+    entity_type: str,
+    entity_id: str,
+    entity_identifier: str,
+    admin: dict,
+    metadata: Optional[dict] = None
+):
+    doc = {
+        "action": action,
+        "entity_type": entity_type,
+        "entity_id": str(entity_id),
+        "entity_identifier": str(entity_identifier or ""),
+        "performed_by_id": str(admin.get("id") or admin.get("_id") or ""),
+        "performed_by_name": admin.get("name", "Admin"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metadata": metadata or {},
+    }
+    await db.audit_logs.insert_one(doc)
 
 # --------------------------------------------------------------------------
 # Pricing engine
@@ -1063,7 +1088,7 @@ async def _create_invoice_order(request: Request, data: OrderInput):
 
     inv = await db.invoices.find_one({"_id": id_query(data.invoice_id)})
     if not inv:
-        raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
+        raise HTTPException(status_code=404, detail="Item invoice ini sudah tidak tersedia atau telah dihapus.")
 
     # Idempotency check before transaction
     if inv.get("status") == "CONVERTED" and inv.get("order_id"):
@@ -1766,15 +1791,55 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
 
     return clean(order)
 
-@api_router.delete("/admin/orders/{order_id}")
-async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("delete_data"))):
+@api_router.post("/admin/orders/{order_id}/permanent-delete")
+async def admin_permanent_delete_order(
+    order_id: str,
+    payload: PermanentDeleteInput,
+    admin: dict = Depends(require_perm("delete_data"))
+):
+    if (payload.confirmation_phrase or "").strip() != "HAPUS PERMANEN":
+        raise HTTPException(
+            status_code=400,
+            detail="Frasa konfirmasi tidak valid. Anda wajib mengetik 'HAPUS PERMANEN' secara tepat."
+        )
+
     order = await db.orders.find_one({"_id": id_query(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
-    await reverse_referral_points(order)
-    await db.orders.delete_one({"_id": id_query(order_id)})
-    # NOTE: Order deletion must NOT delete finance history (Order <-> Finance separation)
-    return {"ok": True}
+
+    # Isolated delete: ONLY remove this order document.
+    # NEVER cascade delete or reverse points, finance, invoices, customers, etc.
+    res = await db.orders.delete_one({"_id": order["_id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Pesanan sudah dihapus sebelumnya")
+
+    await record_audit_log(
+        action="PERMANENT_DELETE",
+        entity_type="order",
+        entity_id=str(order["_id"]),
+        entity_identifier=order.get("order_number", str(order["_id"])),
+        admin=admin,
+        metadata={
+            "previous_status": order.get("order_status"),
+            "payment_status": order.get("payment_status"),
+            "related_invoice_id": order.get("invoice_id"),
+            "related_invoice_number": order.get("invoice_number"),
+            "customer_id": order.get("customer_id"),
+            "reason": payload.reason,
+        }
+    )
+
+    return {
+        "ok": True,
+        "message": f"Pesanan {order.get('order_number')} berhasil dihapus secara permanen."
+    }
+
+@api_router.delete("/admin/orders/{order_id}")
+async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("delete_data"))):
+    raise HTTPException(
+        status_code=400,
+        detail="Penghapusan pesanan wajib melalui endpoint POST /api/admin/orders/{order_id}/permanent-delete dengan frasa konfirmasi 'HAPUS PERMANEN'."
+    )
 
 # --------------------------------------------------------------------------
 # Admin: products
@@ -2137,12 +2202,55 @@ async def admin_convert_custom_to_order(
     created_order = await db.orders.find_one({"_id": order_result.inserted_id})
     return clean(created_order)
 
+@api_router.post("/admin/custom-requests/{req_id}/permanent-delete")
+async def admin_permanent_delete_custom_request(
+    req_id: str,
+    payload: PermanentDeleteInput,
+    admin: dict = Depends(require_perm("delete_data"))
+):
+    if (payload.confirmation_phrase or "").strip() != "HAPUS PERMANEN":
+        raise HTTPException(
+            status_code=400,
+            detail="Frasa konfirmasi tidak valid. Anda wajib mengetik 'HAPUS PERMANEN' secara tepat."
+        )
+
+    cr = await db.custom_requests.find_one({"_id": id_query(req_id)})
+    if not cr:
+        raise HTTPException(status_code=404, detail="Request custom tidak ditemukan")
+
+    # Isolated delete: ONLY delete this custom request document.
+    # Orders, invoices, finance, and customer remain untouched.
+    res = await db.custom_requests.delete_one({"_id": cr["_id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Request custom sudah dihapus sebelumnya")
+
+    identifier = cr.get("ticket_number") or str(cr["_id"])
+    await record_audit_log(
+        action="PERMANENT_DELETE",
+        entity_type="custom_request",
+        entity_id=str(cr["_id"]),
+        entity_identifier=identifier,
+        admin=admin,
+        metadata={
+            "previous_status": cr.get("status"),
+            "related_invoice_id": cr.get("invoice_id"),
+            "converted_order_id": cr.get("converted_order_id"),
+            "customer_phone": cr.get("customer_phone"),
+            "reason": payload.reason,
+        }
+    )
+
+    return {
+        "ok": True,
+        "message": f"Request custom {identifier} berhasil dihapus secara permanen."
+    }
+
 @api_router.delete("/admin/custom-requests/{req_id}")
 async def admin_delete_custom_request(req_id: str, admin: dict = Depends(require_perm("delete_data"))):
-    res = await db.custom_requests.delete_one({"_id": id_query(req_id)})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Request custom tidak ditemukan")
-    return {"ok": True}
+    raise HTTPException(
+        status_code=400,
+        detail="Penghapusan request custom wajib melalui endpoint POST /api/admin/custom-requests/{req_id}/permanent-delete dengan frasa konfirmasi 'HAPUS PERMANEN'."
+    )
 
 @api_router.post("/admin/custom-collection/publish")
 async def admin_publish_to_custom_collection(data: PublishCustomCollectionInput, admin: dict = Depends(require_perm("modify_products"))):
@@ -2267,6 +2375,31 @@ async def get_next_invoice_number():
                 current_max = int(last_inv["invoice_number"].split("-")[-1])
             except (ValueError, IndexError):
                 current_max = 0
+
+        # Also inspect audit_logs for any permanently deleted invoices of this year
+        find_audit = getattr(db, "audit_logs", None)
+        if find_audit is not None and hasattr(find_audit, "find_one"):
+            try:
+                res_audit = find_audit.find_one(
+                    {"entity_type": "invoice", "entity_identifier": {"$regex": f"^{prefix}"}},
+                    sort=[("entity_identifier", -1)]
+                )
+                if inspect.isawaitable(res_audit):
+                    last_audit = await res_audit
+                elif isinstance(res_audit, dict):
+                    last_audit = res_audit
+                else:
+                    last_audit = None
+
+                if last_audit and isinstance(last_audit, dict) and "entity_identifier" in last_audit:
+                    try:
+                        audit_max = int(last_audit["entity_identifier"].split("-")[-1])
+                        current_max = max(current_max, audit_max)
+                    except (ValueError, IndexError):
+                        pass
+            except Exception:
+                pass
+
         await db.counters.update_one(
             {"_id": counter_id},
             {"$set": {"seq": current_max}},
@@ -2521,17 +2654,67 @@ async def admin_update_invoice(invoice_id: str, data: InvoiceUpdateInput, admin:
     updated = await db.invoices.find_one({"_id": inv["_id"]})
     return clean(updated)
 
-@api_router.delete("/admin/invoices/{invoice_id}")
-async def admin_delete_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+@api_router.post("/admin/invoices/{invoice_id}/permanent-delete")
+async def admin_permanent_delete_invoice(
+    invoice_id: str,
+    payload: PermanentDeleteInput,
+    admin: dict = Depends(require_perm("delete_data"))
+):
+    if (payload.confirmation_phrase or "").strip() != "HAPUS PERMANEN":
+        raise HTTPException(
+            status_code=400,
+            detail="Frasa konfirmasi tidak valid. Anda wajib mengetik 'HAPUS PERMANEN' secara tepat."
+        )
+
     inv = await db.invoices.find_one({"_id": id_query(invoice_id)})
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
 
-    if inv.get("status") != "DRAFT":
-        raise HTTPException(status_code=400, detail="Hanya invoice berstatus DRAFT yang dapat dihapus. Invoice yang pernah dikirim/dikonversi tidak boleh dihapus.")
+    # Isolated delete: ONLY remove this invoice document.
+    # NEVER cascade delete or decrement counters, orders, finance, customer, etc.
+    res = await db.invoices.delete_one({"_id": inv["_id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Invoice sudah dihapus sebelumnya.")
 
-    await db.invoices.delete_one({"_id": inv["_id"]})
-    return {"ok": True, "message": "Invoice draft berhasil dihapus."}
+    await record_audit_log(
+        action="PERMANENT_DELETE",
+        entity_type="invoice",
+        entity_id=str(inv["_id"]),
+        entity_identifier=inv.get("invoice_number", str(inv["_id"])),
+        admin=admin,
+        metadata={
+            "previous_status": inv.get("status"),
+            "related_order_id": inv.get("order_id"),
+            "related_order_number": inv.get("order_number"),
+            "custom_request_id": (inv.get("source") or {}).get("custom_request_id"),
+            "customer_phone": (inv.get("customer") or {}).get("whatsapp"),
+            "reason": payload.reason,
+        }
+    )
+
+    return {
+        "ok": True,
+        "message": f"Invoice {inv.get('invoice_number')} berhasil dihapus secara permanen."
+    }
+
+@api_router.delete("/admin/invoices/{invoice_id}")
+async def admin_delete_invoice(invoice_id: str, admin: dict = Depends(require_perm("delete_data"))):
+    raise HTTPException(
+        status_code=400,
+        detail="Penghapusan invoice wajib melalui endpoint POST /api/admin/invoices/{invoice_id}/permanent-delete dengan frasa konfirmasi 'HAPUS PERMANEN'."
+    )
+
+@api_router.get("/admin/audit-logs")
+async def admin_list_audit_logs(
+    entity_type: Optional[str] = None,
+    limit: int = 50,
+    admin: dict = Depends(require_perm("delete_data"))
+):
+    query = {}
+    if entity_type:
+        query["entity_type"] = entity_type
+    logs = await db.audit_logs.find(query).sort("timestamp", -1).to_list(min(limit, 200))
+    return [clean(l) for l in logs]
 
 @api_router.post("/admin/invoices/{invoice_id}/send")
 async def admin_send_invoice(invoice_id: str, admin: dict = Depends(require_perm("manage_orders"))):
@@ -3925,6 +4108,10 @@ async def seed():
     await db.claim_attempts.create_index("created_at", expireAfterSeconds=900)
     await db.claim_attempts.create_index([("ip", 1), ("created_at", -1)])
     await db.claim_attempts.create_index([("customer_id", 1), ("created_at", -1)])
+    # Audit logs indexes
+    await db.audit_logs.create_index([("entity_type", 1), ("entity_id", 1)])
+    await db.audit_logs.create_index("entity_identifier")
+    await db.audit_logs.create_index([("timestamp", -1)])
 
     defaults = {
         "store_name": "Sogil Furniture",

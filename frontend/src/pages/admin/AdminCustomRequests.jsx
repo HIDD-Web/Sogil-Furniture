@@ -9,9 +9,10 @@ import { Badge } from "../../components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
 import { fmtLE } from "../../lib/format";
 import { useAuth } from "../../context/AuthContext";
-import { Search, MessageCircle, ExternalLink, ShoppingBag, Eye, Trash2, X, ChevronRight, CheckCircle, Sparkles, FileText } from "lucide-react";
+import { Search, MessageCircle, ExternalLink, ShoppingBag, Eye, Trash2, X, ChevronRight, CheckCircle, Sparkles, FileText, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
+import PermanentDeleteModal from "../../components/admin/PermanentDeleteModal";
 
 const STATUS_BADGES = {
   baru: { label: "Baru", bg: "bg-blue-100 text-blue-800 border-blue-200" },
@@ -36,6 +37,9 @@ export default function AdminCustomRequests() {
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [convertModalOpen, setConvertModalOpen] = useState(false);
   const [publishModalOpen, setPublishModalOpen] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const [editStatus, setEditStatus] = useState("baru");
   const [adminNotes, setAdminNotes] = useState("");
@@ -143,17 +147,30 @@ export default function AdminCustomRequests() {
     }
   };
 
-  const handleDelete = async (req) => {
-    if (!window.confirm(`Yakin ingin menghapus request tiket ${req.ticket_number}? Tindakan ini tidak dapat dibatalkan.`)) {
-      return;
-    }
+  const openDeleteModal = (req) => {
+    setDeleteTarget(req);
+    setDeleteModalOpen(true);
+  };
+
+  const handlePermanentDelete = async (reason) => {
+    if (!deleteTarget) return;
+    setDeleteLoading(true);
     try {
-      const reqId = req.id || req._id;
-      await api.delete(`/admin/custom-requests/${reqId}`);
-      toast.success("Request custom berhasil dihapus");
+      const reqId = deleteTarget.id || deleteTarget._id;
+      await api.post(`/admin/custom-requests/${reqId}/permanent-delete`, {
+        confirmation_phrase: "HAPUS PERMANEN",
+        reason: reason || undefined,
+      });
+      toast.success("Request custom berhasil dihapus secara permanen");
       setRequests((prev) => prev.filter((r) => (r.id || r._id) !== reqId));
+      setDeleteModalOpen(false);
+      if (detailModalOpen && (selectedReq?.id || selectedReq?._id) === reqId) {
+        setDetailModalOpen(false);
+      }
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Gagal menghapus request");
+      toast.error(err.response?.data?.detail || "Gagal menghapus request custom");
+    } finally {
+      setDeleteLoading(false);
     }
   };
 
@@ -467,9 +484,9 @@ export default function AdminCustomRequests() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() => handleDelete(req)}
+                              onClick={() => openDeleteModal(req)}
                               className="h-8 w-8 p-0 text-red-500 hover:bg-red-50"
-                              title="Hapus Request"
+                              title="Hapus Request Permanen"
                             >
                               <Trash2 size={14} />
                             </Button>
@@ -839,6 +856,30 @@ export default function AdminCustomRequests() {
           onSuccess={() => {
             loadRequests();
           }}
+        />
+      )}
+
+      {/* Permanent Delete Modal */}
+      {deleteTarget && (
+        <PermanentDeleteModal
+          open={deleteModalOpen}
+          onClose={() => {
+            setDeleteModalOpen(false);
+            setDeleteTarget(null);
+          }}
+          onConfirm={handlePermanentDelete}
+          title="Hapus Request Custom Permanen"
+          entityType="Request Custom"
+          entityIdentifier={deleteTarget.ticket_number || deleteTarget.furniture_type || "Request Custom"}
+          warningMessages={[
+            deleteTarget.status === "dipesan"
+              ? "Request custom ini telah dipesan/dikonversi. Menghapus request TIDAK akan menghapus invoice atau pesanan terkait."
+              : null,
+            deleteTarget.converted_order_id || deleteTarget.invoice_id
+              ? "Pesanan atau Invoice yang dibuat dari request ini tetap aman dan tidak akan terpengaruh."
+              : null,
+          ].filter(Boolean)}
+          loading={deleteLoading}
         />
       )}
     </div>

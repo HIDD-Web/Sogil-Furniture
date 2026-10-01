@@ -9,10 +9,11 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
+import PermanentDeleteModal from "../../components/admin/PermanentDeleteModal";
 
 export default function AdminOrderDetail() {
   const { id } = useParams();
@@ -23,8 +24,11 @@ export default function AdminOrderDetail() {
   const canModifyProducts = user?.role === "owner" || user?.permissions?.modify_products;
   const [order, setOrder] = useState(null);
   const [note, setNote] = useState("");
+  const [loadError, setLoadError] = useState(null);
   const [priceModalOpen, setPriceModalOpen] = useState(false);
   const [publishModalOpen, setPublishModalOpen] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
   const [priceForm, setPriceForm] = useState({
     subtotal_le: 0,
     delivery_fee_le: 0,
@@ -32,7 +36,15 @@ export default function AdminOrderDetail() {
     reason: "",
   });
 
-  const load = () => api.get(`/admin/orders/${id}`).then((r) => { setOrder(r.data); setNote(r.data.admin_note || ""); });
+  const load = () => {
+    api.get(`/admin/orders/${id}`)
+      .then((r) => { setOrder(r.data); setNote(r.data.admin_note || ""); setLoadError(null); })
+      .catch((err) => {
+        const msg = err.response?.data?.detail || "Pesanan tidak ditemukan atau telah dihapus";
+        setLoadError(msg);
+        toast.error(msg);
+      });
+  };
   useEffect(() => { load(); }, [id]);
 
   const update = async (patch) => {
@@ -81,19 +93,49 @@ export default function AdminOrderDetail() {
       toast.error(err.response?.data?.detail || "Gagal menyesuaikan harga");
     }
   };
-  if (!order) return <div className="text-[#8B7355]">Memuat...</div>;
+  if (loadError) {
+    return (
+      <div className="max-w-4xl py-12 text-center" data-testid="order-load-error">
+        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 text-amber-800">
+          <AlertTriangle size={28} />
+        </div>
+        <h2 className="font-heading text-xl font-bold text-[#2C1E16]">
+          Pesanan Tidak Ditemukan
+        </h2>
+        <p className="mt-1 text-sm text-[#8B7355]">
+          {loadError}
+        </p>
+        <Button
+          onClick={() => navigate("/admin/orders")}
+          className="mt-6 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-white text-xs font-semibold"
+        >
+          <ChevronLeft size={16} className="mr-1" /> Kembali ke Daftar Pesanan
+        </Button>
+      </div>
+    );
+  }
+  if (!order) return <div className="text-[#8B7355] py-8">Memuat...</div>;
   const items = order.items || [order.item];
   const phoneNum = (order.customer_phone || "").replace(/[^0-9]/g, "");
   const copySummary = async () => {
     await copyToClipboard(order.whatsapp_message || "");
     toast.success("Ringkasan disalin");
   };
-  const doDelete = async () => {
-    const paid = order.payment_status === "lunas";
-    const msg = paid ? "Pesanan ini sudah LUNAS. Menghapus akan menghapus/membalik pendapatan otomatis terkait dan tidak dapat dibatalkan. Lanjutkan?" : "Apakah Anda yakin ingin menghapus pesanan ini? Tindakan ini tidak dapat dibatalkan.";
-    if (!window.confirm(msg)) return;
-    try { await api.delete(`/admin/orders/${id}`); toast.success("Pesanan dihapus"); navigate("/admin/orders"); }
-    catch (e) { toast.error(e.response?.data?.detail || "Gagal menghapus"); }
+  const handlePermanentDelete = async (reason) => {
+    setDeleteLoading(true);
+    try {
+      await api.post(`/admin/orders/${id}/permanent-delete`, {
+        confirmation_phrase: "HAPUS PERMANEN",
+        reason: reason || undefined,
+      });
+      toast.success("Pesanan berhasil dihapus secara permanen");
+      setDeleteModalOpen(false);
+      navigate("/admin/orders");
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Gagal menghapus pesanan");
+    } finally {
+      setDeleteLoading(false);
+    }
   };
 
   return (
@@ -144,7 +186,6 @@ export default function AdminOrderDetail() {
                   : "Publikasikan ke Koleksi Custom"}
               </Button>
             )}
-            {canDelete && <Button variant="outline" onClick={doDelete} data-testid="delete-order" className="rounded-xl border-red-300 text-red-600 hover:bg-red-50"><Trash2 size={16} className="mr-1" /> Hapus Pesanan</Button>}
           </div>
         </div>
 
@@ -163,7 +204,14 @@ export default function AdminOrderDetail() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => navigate(`/admin/invoices/${order.invoice_id}`)}
+                onClick={async () => {
+                  try {
+                    await api.get(`/admin/invoices/${order.invoice_id}`);
+                    navigate(`/admin/invoices/${order.invoice_id}`);
+                  } catch {
+                    toast.error(`Invoice ${order.invoice_number} telah dihapus secara permanen`);
+                  }
+                }}
                 className="h-8 rounded-xl border-[#8B5A2B]/40 text-[#8B5A2B] text-xs font-semibold hover:bg-[#8B5A2B] hover:text-white"
               >
                 Lihat Invoice &rarr;
@@ -368,9 +416,46 @@ export default function AdminOrderDetail() {
           photo_urls: [],
           order_id: order.id || order._id,
         }}
-        onSuccess={() => {
-          load();
-        }}
+      />
+
+      {/* Zona Berbahaya (Permanent Delete) */}
+      {canDelete && (
+        <div className="mt-8 rounded-2xl border border-red-200 bg-red-50/40 p-5 shadow-xs" data-testid="danger-zone-order">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <h3 className="text-sm font-bold text-red-950 flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
+                Zona Berbahaya
+              </h3>
+              <p className="text-xs text-red-700 mt-1">
+                Hapus pesanan ini secara permanen dari database. Transaksi finance dan invoice terkait TIDAK akan ikut dihapus.
+              </p>
+            </div>
+            <Button
+              variant="destructive"
+              onClick={() => setDeleteModalOpen(true)}
+              data-testid="permanent-delete-order-btn"
+              className="rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold text-xs shrink-0"
+            >
+              <Trash2 size={14} className="mr-1.5" /> Hapus Permanen
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Permanent Delete Modal */}
+      <PermanentDeleteModal
+        open={deleteModalOpen}
+        onClose={() => setDeleteModalOpen(false)}
+        onConfirm={handlePermanentDelete}
+        title="Hapus Pesanan Permanen"
+        entityType="Pesanan"
+        entityIdentifier={order.order_number || id}
+        warningMessages={[
+          order.payment_status === "lunas" ? "Pesanan ini sudah LUNAS. Catatan transaksi di finance TIDAK akan dihapus." : null,
+          order.invoice_id ? `Pesanan ini berasal dari Invoice ${order.invoice_number}. Invoice terkait TIDAK akan dihapus.` : null,
+        ].filter(Boolean)}
+        loading={deleteLoading}
       />
     </div>
   );

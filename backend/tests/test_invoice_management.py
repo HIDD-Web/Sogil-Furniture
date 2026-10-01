@@ -330,17 +330,11 @@ class TestInvoiceManagementBackend(unittest.TestCase):
 
     @patch("server.db")
     def test_12_delete_guard_draft_only(self, mock_db):
-        """Only DRAFT invoices can be deleted."""
-        mock_db.invoices.find_one = AsyncMock(return_value={"_id": "inv_draft", "status": "DRAFT"})
-        mock_db.invoices.delete_one = AsyncMock(return_value=None)
-        res = asyncio.run(server.admin_delete_invoice("inv_draft", admin=self.admin_user))
-        self.assertTrue(res["ok"])
-
-        # Sent: blocked
-        mock_db.invoices.find_one = AsyncMock(return_value={"_id": "inv_sent", "status": "SENT"})
+        """Legacy unconfirmed delete is deprecated and blocked with HTTP 400."""
         with self.assertRaises(HTTPException) as err:
-            asyncio.run(server.admin_delete_invoice("inv_sent", admin=self.admin_user))
+            asyncio.run(server.admin_delete_invoice("inv_draft", admin=self.admin_user))
         self.assertEqual(err.exception.status_code, 400)
+        self.assertIn("HAPUS PERMANEN", err.exception.detail)
 
     # -------------------------------------------------------------
     # E. CONVERSION TO ORDER & IDEMPOTENCY

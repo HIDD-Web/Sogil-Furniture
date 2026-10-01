@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
+import PermanentDeleteModal from "../../components/admin/PermanentDeleteModal";
 
 export default function AdminInvoiceDetail() {
   const { id } = useParams();
@@ -41,6 +42,8 @@ export default function AdminInvoiceDetail() {
   const [invoice, setInvoice] = useState(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Conversion Modal State
   const [convertModalOpen, setConvertModalOpen] = useState(false);
@@ -135,22 +138,20 @@ export default function AdminInvoiceDetail() {
     }
   };
 
-  const handleDelete = async () => {
-    if (invoice.status !== "DRAFT") {
-      toast.error("Hanya invoice DRAFT yang dapat dihapus.");
-      return;
-    }
-    if (!window.confirm(`Hapus invoice ${invoice.invoice_number}? Tindakan ini permanen.`)) {
-      return;
-    }
-    setActionLoading(true);
+  const handlePermanentDelete = async (reason) => {
+    setDeleteLoading(true);
     try {
-      await api.delete(`/admin/invoices/${id}`);
-      toast.success("Invoice draft berhasil dihapus");
+      await api.post(`/api/admin/invoices/${id}/permanent-delete`, {
+        confirmation_phrase: "HAPUS PERMANEN",
+        reason: reason || undefined,
+      });
+      toast.success("Invoice berhasil dihapus secara permanen");
+      setDeleteModalOpen(false);
       navigate("/admin/invoices");
     } catch (err) {
       toast.error(formatApiError(err.response?.data?.detail) || "Gagal menghapus invoice");
-      setActionLoading(false);
+    } finally {
+      setDeleteLoading(false);
     }
   };
 
@@ -258,18 +259,6 @@ export default function AdminInvoiceDetail() {
               >
                 <Send size={14} className="mr-1.5" /> Tandai Menunggu Konfirmasi
               </Button>
-              {canDelete && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={actionLoading}
-                  onClick={handleDelete}
-                  className="rounded-xl border-red-200 text-xs text-red-600 hover:bg-red-50"
-                  title="Hapus Draft"
-                >
-                  <Trash2 size={14} />
-                </Button>
-              )}
             </>
           )}
 
@@ -349,7 +338,14 @@ export default function AdminInvoiceDetail() {
           {isConverted && invoice.order_id && (
             <Button
               size="sm"
-              onClick={() => navigate(`/admin/orders/${invoice.order_id}`)}
+              onClick={async () => {
+                try {
+                  await api.get(`/admin/orders/${invoice.order_id}`);
+                  navigate(`/admin/orders/${invoice.order_id}`);
+                } catch {
+                  toast.error(`Pesanan ${invoice.order_number || ""} telah dihapus secara permanen`);
+                }
+              }}
               className="rounded-xl bg-purple-700 hover:bg-purple-800 text-xs font-semibold text-white shadow-xs"
             >
               <ShoppingBag size={14} className="mr-1.5" /> Lihat Pesanan ({invoice.order_number})
@@ -376,7 +372,14 @@ export default function AdminInvoiceDetail() {
           {invoice.order_id && (
             <Button
               size="sm"
-              onClick={() => navigate(`/admin/orders/${invoice.order_id}`)}
+              onClick={async () => {
+                try {
+                  await api.get(`/admin/orders/${invoice.order_id}`);
+                  navigate(`/admin/orders/${invoice.order_id}`);
+                } catch {
+                  toast.error(`Pesanan ${invoice.order_number || ""} telah dihapus secara permanen`);
+                }
+              }}
               className="rounded-xl bg-emerald-700 hover:bg-emerald-800 text-xs text-white shrink-0"
             >
               Buka Pesanan <ExternalLink size={12} className="ml-1" />
@@ -888,6 +891,50 @@ export default function AdminInvoiceDetail() {
           </div>
         </div>
       )}
+
+      {/* Zona Berbahaya (Permanent Delete) */}
+      {canDelete && (
+        <div className="rounded-2xl border border-red-200 bg-red-50/40 p-5 shadow-xs" data-testid="danger-zone-invoice">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <h3 className="text-sm font-bold text-red-950 flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
+                Zona Berbahaya
+              </h3>
+              <p className="text-xs text-red-700 mt-1">
+                Hapus invoice ini secara permanen dari database. Pesanan atau transaksi keuangan terkait TIDAK akan ikut dihapus.
+              </p>
+            </div>
+            <Button
+              variant="destructive"
+              onClick={() => setDeleteModalOpen(true)}
+              data-testid="permanent-delete-invoice-btn"
+              className="rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold text-xs shrink-0"
+            >
+              <Trash2 size={14} className="mr-1.5" /> Hapus Permanen
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Permanent Delete Modal */}
+      <PermanentDeleteModal
+        open={deleteModalOpen}
+        onClose={() => setDeleteModalOpen(false)}
+        onConfirm={handlePermanentDelete}
+        title="Hapus Invoice Permanen"
+        entityType="Invoice"
+        entityIdentifier={invoice.invoice_number}
+        warningMessages={[
+          invoice.status === "CONVERTED"
+            ? `Invoice ini telah dikonversi menjadi Pesanan (${invoice.order_number || ""}). Menghapus invoice TIDAK akan menghapus pesanan terkait. Pesanan tetap ada dan dapat diproses normal.`
+            : null,
+          invoice.status === "CLAIMED"
+            ? "Invoice ini telah diklaim oleh pelanggan. Menghapus invoice akan menghapus ketersediaannya untuk checkout."
+            : null,
+        ].filter(Boolean)}
+        loading={deleteLoading}
+      />
     </div>
   );
 }

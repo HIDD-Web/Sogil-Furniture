@@ -1,18 +1,37 @@
-import React from "react";
+import React, { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { fmtLE } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
 import { useCart } from "../context/CartContext";
 import { useLang } from "../context/LanguageContext";
-import { imgUrl } from "../lib/api";
+import api, { imgUrl } from "../lib/api";
 import { ProductImage } from "../components/ProductImage";
 import { Button } from "../components/ui/button";
-import { Minus, Plus, Trash2, ShoppingCart, Lock, Info } from "lucide-react";
+import { Minus, Plus, Trash2, ShoppingCart, Lock, Info, AlertTriangle } from "lucide-react";
 
 export default function Cart() {
   const { items, removeItem, updateQty, productSubtotal, isInvoiceCart, activeInvoice, clear } = useCart();
   const { t } = useLang();
   const navigate = useNavigate();
+  const [staleInvoiceError, setStaleInvoiceError] = useState(null);
+
+  useEffect(() => {
+    if (isInvoiceCart && activeInvoice?.invoice_id) {
+      api.get(`/customer/invoices/${activeInvoice.invoice_id}`)
+        .then((res) => {
+          if (res.data?.status === "CANCELLED") {
+            setStaleInvoiceError("Invoice ini telah dibatalkan oleh admin.");
+          } else if (res.data?.status === "CONVERTED") {
+            setStaleInvoiceError("Invoice ini sudah dikonversi menjadi pesanan resmi.");
+          }
+        })
+        .catch((err) => {
+          if (err.response?.status === 404) {
+            setStaleInvoiceError("Item invoice ini sudah tidak tersedia atau telah dihapus.");
+          }
+        });
+    }
+  }, [isInvoiceCart, activeInvoice?.invoice_id]);
 
   if (!items.length) {
     return (
@@ -44,8 +63,28 @@ export default function Cart() {
         )}
       </div>
 
+      {/* Stale Invoice Warning */}
+      {staleInvoiceError && (
+        <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-900 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="text-red-600 h-5 w-5 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-red-950">Invoice Tidak Tersedia</div>
+              <p className="text-xs text-red-800 mt-0.5">{staleInvoiceError}</p>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            onClick={() => { clear(); setStaleInvoiceError(null); }}
+            className="rounded-xl bg-red-600 hover:bg-red-700 text-xs text-white shrink-0 font-semibold"
+          >
+            Keluarkan Paket Invoice
+          </Button>
+        </div>
+      )}
+
       {/* Invoice Bundle Notice */}
-      {isInvoiceCart && (
+      {isInvoiceCart && !staleInvoiceError && (
         <div className="mt-4 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-start gap-2.5">
             <Lock className="text-amber-700 h-5 w-5 shrink-0 mt-0.5" />
@@ -152,9 +191,18 @@ export default function Cart() {
               {t("cart.tambah_lagi")}
             </Button>
           )}
-          <Button onClick={() => navigate("/checkout")} data-testid="cart-checkout" className="h-12 flex-1 rounded-full bg-[#8B5A2B] hover:bg-[#6B4423]">
-            {t("cart.lanjut_checkout")}
-          </Button>
+          {staleInvoiceError ? (
+            <Button
+              onClick={() => { clear(); setStaleInvoiceError(null); }}
+              className="h-12 flex-1 rounded-full bg-red-600 hover:bg-red-700 text-white font-semibold"
+            >
+              Keluarkan Paket Invoice
+            </Button>
+          ) : (
+            <Button onClick={() => navigate("/checkout")} data-testid="cart-checkout" className="h-12 flex-1 rounded-full bg-[#8B5A2B] hover:bg-[#6B4423]">
+              {t("cart.lanjut_checkout")}
+            </Button>
+          )}
         </div>
       </div>
     </div>

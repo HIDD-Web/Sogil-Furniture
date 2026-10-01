@@ -137,6 +137,16 @@ export default function Checkout() {
     api.get("/delivery-zones").then((r) => setZones(r.data));
     api.get("/store-info").then((r) => setStore(r.data));
 
+    if (isInvoiceCart && activeInvoice?.invoice_id) {
+      api.get(`/customer/invoices/${activeInvoice.invoice_id}`).catch((err) => {
+        if (err.response?.status === 404) {
+          toast.error("Item invoice ini sudah tidak tersedia atau telah dihapus.");
+          clear();
+          navigate("/keranjang");
+        }
+      });
+    }
+
     // Restore draft from sessionStorage if returning from /akun
     try {
       const raw = sessionStorage.getItem("sogil_checkout_draft");
