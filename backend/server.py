@@ -181,6 +181,15 @@ def require_perm(perm: str):
         raise HTTPException(status_code=403, detail="Anda tidak memiliki akses untuk tindakan ini")
     return dep
 
+def require_material_perm():
+    async def dep(admin: dict = Depends(get_current_admin)) -> dict:
+        role = admin.get("role")
+        perms = admin.get("permissions", {})
+        if role == "owner" or perms.get("modify_products") or perms.get("access_finance"):
+            return admin
+        raise HTTPException(status_code=403, detail="Anda tidak memiliki akses untuk mengelola data bahan")
+    return dep
+
 def require_owner():
     async def dep(admin: dict = Depends(get_current_admin)) -> dict:
         if admin.get("role") != "owner":
@@ -395,6 +404,23 @@ class PublishCustomCollectionInput(BaseModel):
     photo_urls: List[str] = []
     order_id: Optional[str] = None
     request_id: Optional[str] = None
+
+class MaterialInput(BaseModel):
+    name: str
+    category: str  # "Material" | "Parts"
+    specs: str
+    sku: Optional[str] = None
+    unit: str  # "pcs" | "batang" | "lembar" | "meter" | "kg" | "box"
+    notes: Optional[str] = ""
+
+class MaterialUpdateInput(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    specs: Optional[str] = None
+    sku: Optional[str] = None
+    unit: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None  # "active" | "archived"
 
 class FinanceTxnInput(BaseModel):
     date: Optional[str] = None
@@ -4246,6 +4272,16 @@ async def seed():
         {"$set": {"name": "Koleksi Custom"}}
     )
 
+    # Ensure indexes for materials
+    try:
+        await db.materials.create_index(
+            [("name_normalized", 1), ("specs_normalized", 1)],
+            unique=True,
+            name="uniq_material_name_specs"
+        )
+    except Exception:
+        pass
+
 @app.on_event("startup")
 async def startup():
     await seed()
@@ -4528,6 +4564,196 @@ async def export_product_prices(admin: dict = Depends(require_perm("modify_produ
     for p in await db.products.find({}).to_list(500):
         cur_rows.append([p.get("name", ""), p.get("category", ""), _num(p.get("starting_price_le")), json.dumps(p.get("pricing") or {}, ensure_ascii=False)[:32000]])
     return xlsx_response(build_xlsx([("Riwayat Perubahan Harga", headers, rows), ("Harga Saat Ini", cur_headers, cur_rows)]), "harga_produk.xlsx")
+
+# --------------------------------------------------------------------------
+# Master Data Bahan (Materials)
+# --------------------------------------------------------------------------
+ALLOWED_MATERIAL_CATEGORIES = ["Material", "Parts"]
+ALLOWED_MATERIAL_UNITS = ["pcs", "batang", "lembar", "meter", "kg", "box"]
+
+def normalize_text_key(s: str) -> str:
+    return " ".join(s.strip().lower().split())
+
+@api_router.get("/admin/materials")
+async def get_materials(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    admin: dict = Depends(require_material_perm())
+):
+    query: Dict[str, Any] = {}
+    if category and category != "all":
+        query["category"] = category
+    if status and status != "all":
+        query["status"] = status
+    if q and q.strip():
+        search_term = re.escape(q.strip())
+        query["$or"] = [
+            {"name": {"$regex": search_term, "$options": "i"}},
+            {"specs": {"$regex": search_term, "$options": "i"}},
+            {"sku": {"$regex": search_term, "$options": "i"}},
+        ]
+    docs = await db.materials.find(query).sort("created_at", -1).to_list(1000)
+    return [clean(d) for d in docs]
+
+@api_router.post("/admin/materials")
+async def create_material(
+    data: MaterialInput,
+    admin: dict = Depends(require_material_perm())
+):
+    name = (data.name or "").strip()
+    category = (data.category or "").strip()
+    specs = (data.specs or "").strip()
+    unit = (data.unit or "").strip()
+    sku = (data.sku or "").strip() if data.sku else None
+    notes = (data.notes or "").strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Nama bahan wajib diisi")
+    if category not in ALLOWED_MATERIAL_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"Kategori tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_CATEGORIES)}")
+    if not specs:
+        raise HTTPException(status_code=400, detail="Spesifikasi/Ukuran wajib diisi")
+    if unit not in ALLOWED_MATERIAL_UNITS:
+        raise HTTPException(status_code=400, detail=f"Satuan tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_UNITS)}")
+
+    name_norm = normalize_text_key(name)
+    specs_norm = normalize_text_key(specs)
+
+    # Check duplicate
+    existing = await db.materials.find_one({
+        "name_normalized": name_norm,
+        "specs_normalized": specs_norm
+    })
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{name}' dan spesifikasi '{specs}' sudah terdaftar")
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "name": name,
+        "category": category,
+        "specs": specs,
+        "sku": sku,
+        "unit": unit,
+        "notes": notes,
+        "status": "active",
+        "name_normalized": name_norm,
+        "specs_normalized": specs_norm,
+        "created_at": now,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+        **audit_fields(admin)
+    }
+
+    try:
+        res = await db.materials.insert_one(doc)
+        doc["_id"] = res.inserted_id
+        return clean(doc)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{name}' dan spesifikasi '{specs}' sudah terdaftar")
+
+@api_router.get("/admin/materials/{mat_id}")
+async def get_material_detail(
+    mat_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+    return clean(doc)
+
+@api_router.put("/admin/materials/{mat_id}")
+async def update_material(
+    mat_id: str,
+    data: MaterialUpdateInput,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    upd: Dict[str, Any] = {}
+    new_name = data.name.strip() if data.name is not None else doc.get("name", "")
+    new_specs = data.specs.strip() if data.specs is not None else doc.get("specs", "")
+
+    if data.name is not None:
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Nama bahan tidak boleh kosong")
+        upd["name"] = new_name
+        upd["name_normalized"] = normalize_text_key(new_name)
+
+    if data.category is not None:
+        cat = data.category.strip()
+        if cat not in ALLOWED_MATERIAL_CATEGORIES:
+            raise HTTPException(status_code=400, detail=f"Kategori tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_CATEGORIES)}")
+        upd["category"] = cat
+
+    if data.specs is not None:
+        if not new_specs:
+            raise HTTPException(status_code=400, detail="Spesifikasi/Ukuran tidak boleh kosong")
+        upd["specs"] = new_specs
+        upd["specs_normalized"] = normalize_text_key(new_specs)
+
+    if data.unit is not None:
+        u = data.unit.strip()
+        if u not in ALLOWED_MATERIAL_UNITS:
+            raise HTTPException(status_code=400, detail=f"Satuan tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_UNITS)}")
+        upd["unit"] = u
+
+    if data.sku is not None:
+        upd["sku"] = data.sku.strip() if data.sku else None
+
+    if data.notes is not None:
+        upd["notes"] = data.notes.strip()
+
+    if data.status is not None:
+        st = data.status.strip()
+        if st not in ["active", "archived"]:
+            raise HTTPException(status_code=400, detail="Status harus 'active' atau 'archived'")
+        upd["status"] = st
+
+    if not upd:
+        return clean(doc)
+
+    name_norm = upd.get("name_normalized", doc.get("name_normalized"))
+    specs_norm = upd.get("specs_normalized", doc.get("specs_normalized"))
+
+    # Check duplicate against other documents
+    existing = await db.materials.find_one({
+        "_id": {"$ne": doc["_id"]},
+        "name_normalized": name_norm,
+        "specs_normalized": specs_norm
+    })
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{new_name}' dan spesifikasi '{new_specs}' sudah terdaftar")
+
+    upd.update(audit_fields(admin))
+    try:
+        updated = await db.materials.find_one_and_update(
+            {"_id": doc["_id"]},
+            {"$set": upd},
+            return_document=ReturnDocument.AFTER
+        )
+        return clean(updated)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{new_name}' dan spesifikasi '{new_specs}' sudah terdaftar")
+
+@api_router.delete("/admin/materials/{mat_id}")
+async def archive_material(
+    mat_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    upd = {"status": "archived", **audit_fields(admin)}
+    updated = await db.materials.find_one_and_update(
+        {"_id": doc["_id"]},
+        {"$set": upd},
+        return_document=ReturnDocument.AFTER
+    )
+    return {"ok": True, "message": "Bahan berhasil diarsipkan", "material": clean(updated)}
 
 app.include_router(api_router)
 

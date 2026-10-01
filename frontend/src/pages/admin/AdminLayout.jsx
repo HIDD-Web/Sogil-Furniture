@@ -31,6 +31,7 @@ export default function AdminLayout() {
     { to: "/admin/custom-requests", label: "Request Custom", icon: Sparkles, show: perms.manage_orders || isOwner },
     { to: "/admin/analytics", label: "Analitik", icon: BarChart3, show: perms.manage_orders || isOwner },
     { to: "/admin/products", label: "Produk", icon: Package, show: perms.modify_products || isOwner },
+    { to: "/admin/materials", label: "Bahan", icon: Layers, show: perms.modify_products || perms.access_finance || isOwner },
     { to: "/admin/finance", label: "Keuangan", icon: Wallet, show: perms.access_finance || isOwner },
     { to: "/admin/export", label: "Export Data", icon: Wallet, show: perms.access_finance || perms.manage_orders || isOwner },
     { to: "/admin/discounts", label: "Diskon", icon: Ticket, show: perms.manage_settings || isOwner },

@@ -45,6 +45,7 @@ import AdminAdmins from "./pages/admin/AdminAdmins";
 import AdminDiscounts from "./pages/admin/AdminDiscounts";
 import AdminReferrals from "./pages/admin/AdminReferrals";
 import AdminCustomers from "./pages/admin/AdminCustomers";
+import AdminMaterials from "./pages/admin/AdminMaterials";
 import CustomOrderPage from "./pages/CustomOrderPage";
 
 function QueryRedirect({ to }) {
@@ -115,6 +116,7 @@ function Layout() {
           <Route path="invoices/:id/edit" element={<AdminInvoiceForm />} />
           <Route path="products" element={<AdminProducts />} />
           <Route path="products/:id" element={<AdminProductEdit />} />
+          <Route path="materials" element={<AdminMaterials />} />
           <Route path="categories" element={<Navigate to="/admin/products" replace />} />
           <Route path="custom-requests" element={<AdminCustomRequests />} />
           <Route path="analytics" element={<AdminAnalytics />} />
