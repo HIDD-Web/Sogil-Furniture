@@ -240,6 +240,8 @@ class TestMaterialStockPhase3(unittest.TestCase):
         mock_db.materials.find_one_and_update = AsyncMock(return_value={**self.sample_material, "current_stock": 10.0})
         mock_db.material_stocks.find_one = AsyncMock(return_value=None)
         mock_db.material_stocks.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.find_one = AsyncMock(return_value=None)
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
 
         inp = MaterialPurchaseInput(
             material_id=str(self.sample_mat_id),
@@ -306,6 +308,8 @@ class TestMaterialStockPhase3(unittest.TestCase):
         mock_db.counters.find_one = AsyncMock(return_value={"_id": "stock_20261001", "seq": 5})
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 5})
         mock_db.material_stocks.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.find_one = AsyncMock(return_value=None)
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
         mock_db.material_purchases.find_one_and_update = AsyncMock(return_value={**active_pb, "is_void": True, "void_reason": "Salah nota"})
         mock_db.materials.update_one = AsyncMock(return_value=None)
 

@@ -604,6 +604,7 @@ export default function AdminFinance() {
                   <span className="text-[11px] text-[#8B7355] block">
                     {(t.date || "").slice(0, 10)}
                     {t.type === "balance_adjustment" ? " · Set saldo saat ini" : ` · ${getTxnTypeLabel(t.type)}`}
+                    {t.reference_number && ` · Ref: ${t.reference_number}`}
                   </span>
                 </div>
                 <div className="text-right shrink-0">
@@ -646,7 +647,14 @@ export default function AdminFinance() {
                     {getTxnTypeBadge(t.type)}
                   </td>
                   <td className="py-2.5 px-2 text-[#5C4A3D] font-medium">
-                    <div>{t.category}</div>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span>{t.category}</span>
+                      {t.reference_number && (
+                        <span className="text-[10px] font-mono text-[#8B5A2B] bg-[#FAF8F5] px-1.5 py-0.5 rounded border border-[#E5DCC5]">
+                          {t.reference_number}
+                        </span>
+                      )}
+                    </div>
                     {t.type === "balance_adjustment" && (
                       <span className="text-[11px] font-normal text-[#8B7355]">Set saldo saat ini</span>
                     )}

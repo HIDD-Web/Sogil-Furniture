@@ -44,6 +44,7 @@ const INITIAL_PURCHASE_FORM = {
   unit_price: "",
   quantity: "",
   currency: "EGP",
+  exchange_rate: "",
   supplier_name: "",
   notes: "",
 };
@@ -227,13 +228,23 @@ export default function AdminMaterials() {
   };
 
   // Purchase Handlers
-  const openRecordPurchaseModal = (presetMaterial = null) => {
+  const openRecordPurchaseModal = async (presetMaterial = null) => {
+    let defaultRate = "357";
+    try {
+      const res = await api.get("/admin/settings");
+      if (res.data?.exchange_rate_idr_per_le) {
+        defaultRate = String(res.data.exchange_rate_idr_per_le);
+      }
+    } catch {
+      // Keep default 357
+    }
     setPurchaseForm({
       material_id: presetMaterial ? presetMaterial.id : "",
       purchase_date: new Date().toISOString().slice(0, 10),
       unit_price: "",
       quantity: "",
       currency: "EGP",
+      exchange_rate: defaultRate,
       supplier_name: "",
       notes: "",
     });
@@ -255,11 +266,12 @@ export default function AdminMaterials() {
         quantity: Number(purchaseForm.quantity),
         unit_price: Number(purchaseForm.unit_price),
         currency: purchaseForm.currency || "EGP",
+        exchange_rate: purchaseForm.exchange_rate ? Number(purchaseForm.exchange_rate) : undefined,
         supplier_name: purchaseForm.supplier_name.trim(),
         notes: purchaseForm.notes.trim(),
       };
       await api.post("/admin/materials/purchases", payload);
-      toast.success("Pembelian bahan berhasil dicatat dan stok bertambah");
+      toast.success("Pembelian bahan berhasil dicatat (Stok bertambah & Pengeluaran tercatat di Keuangan)");
       setPurchaseModalOpen(false);
       loadMaterials();
       loadPurchases();
@@ -1176,6 +1188,25 @@ export default function AdminMaterials() {
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              <div>
+                <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                  Kurs Nilai Tukar (1 EGP ke IDR)
+                </Label>
+                <Input
+                  type="number"
+                  step="any"
+                  min="1"
+                  placeholder="357"
+                  value={purchaseForm.exchange_rate}
+                  onChange={(e) => setPurchaseForm({ ...purchaseForm, exchange_rate: e.target.value })}
+                  data-testid="purchase-form-rate"
+                  className="bg-white"
+                />
+                <span className="mt-1 block text-[10px] text-[#8B7355]">
+                  Default dari Pengaturan Toko. Dapat disesuaikan jika transaksi menggunakan kurs berbeda.
+                </span>
               </div>
 
               <div className="grid grid-cols-2 gap-3">

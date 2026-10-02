@@ -428,6 +428,7 @@ class MaterialPurchaseInput(BaseModel):
     unit_price: float
     quantity: float
     currency: Optional[str] = "EGP"
+    exchange_rate: Optional[float] = None
     supplier_name: Optional[str] = ""
     notes: Optional[str] = ""
 
@@ -4339,6 +4340,23 @@ async def seed():
     except Exception:
         pass
 
+    # Ensure indexes for finance_transactions material purchase references (Phase 4)
+    try:
+        await db.finance_transactions.create_index(
+            [("reference_id", 1), ("reference_type", 1), ("type", 1)],
+            unique=True,
+            partialFilterExpression={"reference_type": "material_purchase", "type": "expense"},
+            name="uniq_purchase_finance_expense"
+        )
+        await db.finance_transactions.create_index(
+            [("reference_id", 1), ("is_reversal", 1)],
+            unique=True,
+            partialFilterExpression={"reference_type": "material_purchase", "is_reversal": True},
+            name="uniq_purchase_finance_reversal"
+        )
+    except Exception:
+        pass
+
 @app.on_event("startup")
 async def startup():
     await seed()
@@ -4965,16 +4983,21 @@ async def create_material_purchase(
     total_amount = round(qty * unit_price, 2)
     currency = (data.currency or "EGP").strip().upper()
     if currency not in ["EGP", "IDR"]:
-        currency = "EGP"
+        raise HTTPException(status_code=400, detail=f"Mata uang '{currency}' tidak didukung (harus EGP atau IDR)")
 
-    # Get exchange rate from store-info or settings
-    exchange_rate = 344.0
+    # Get default exchange rate from settings
+    settings_rate = 357.0
     try:
-        rate_val = await get_setting("exchange_rate_idr_per_le")
+        rate_val = await get_setting("exchange_rate_idr_per_le", 357)
         if rate_val:
-            exchange_rate = float(rate_val)
+            settings_rate = float(rate_val)
     except Exception:
         pass
+
+    if data.exchange_rate is not None and _num(data.exchange_rate) > 0:
+        exchange_rate = round(float(data.exchange_rate), 4)
+    else:
+        exchange_rate = settings_rate
 
     now = datetime.now(timezone.utc).isoformat()
     material_canonical_id = str(mat["_id"])
@@ -5023,6 +5046,10 @@ async def create_material_purchase(
 
         # 3. Create purchase_in stock movement & update current_stock inside transaction
         await apply_purchase_stock_in(doc, admin, session=session)
+
+        # 4. Create Finance expense transaction inside transaction (Phase 4)
+        await apply_purchase_finance_expense(doc, admin, session=session)
+
         return doc
 
     try:
@@ -5097,7 +5124,10 @@ async def void_material_purchase(
         # 1. Reverse stock movement with strict non-negative policy inside transaction
         await apply_purchase_stock_reversal(doc, void_reason, admin, session=session)
 
-        # 2. Mark purchase as voided inside transaction
+        # 2. Reverse finance expense inside transaction (Phase 4)
+        await apply_purchase_finance_reversal(doc, void_reason, admin, session=session)
+
+        # 3. Mark purchase as voided inside transaction
         updated_doc = await db.material_purchases.find_one_and_update(
             {"_id": doc["_id"], "is_void": False},
             {"$set": upd},
@@ -5107,7 +5137,7 @@ async def void_material_purchase(
         if not updated_doc:
             raise HTTPException(status_code=400, detail="Pembelian bahan ini sudah dibatalkan sebelumnya.")
 
-        # 3. Recalculate material latest price snapshot inside transaction
+        # 4. Recalculate material latest price snapshot inside transaction
         await recalculate_material_latest_price(doc["material_id"], session=session)
         return updated_doc
 
@@ -5359,6 +5389,155 @@ async def apply_purchase_stock_reversal(purchase_doc: dict, void_reason: str, ad
         allow_negative=False,
         session=session
     )
+
+async def apply_purchase_finance_expense(purchase_doc: dict, admin: dict, session=None):
+    kw = {"session": session} if session else {}
+    pb_id = str(purchase_doc["_id"])
+    pb_num = purchase_doc.get("purchase_number")
+    currency = (purchase_doc.get("currency") or "EGP").strip().upper()
+    if currency not in ("EGP", "IDR"):
+        raise HTTPException(status_code=400, detail=f"Mata uang '{currency}' tidak didukung untuk transaksi keuangan.")
+
+    # Idempotent check
+    existing = await db.finance_transactions.find_one({
+        "reference_type": "material_purchase",
+        "reference_id": pb_id,
+        "type": "expense"
+    }, **kw)
+    if existing:
+        return clean(existing)
+
+    total_amt = round(float(purchase_doc.get("total_amount") or 0.0), 2)
+    rate = float(purchase_doc.get("exchange_rate") or 357.0)
+    conv = compute_currency_conversion(currency, total_amt, rate)
+
+    p_date = purchase_doc.get("purchase_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Format date with time component so ISO queries with $gte/$lte period ranges work reliably
+    # Calendar date component strictly matches p_date
+    time_part = now_iso[10:] if len(now_iso) > 10 else "T12:00:00+00:00"
+    txn_date = f"{p_date[:10]}{time_part}"
+
+    mat_name = purchase_doc.get("material_name_snapshot") or "Bahan"
+    mat_specs = purchase_doc.get("material_specs_snapshot") or ""
+    specs_str = f" ({mat_specs})" if mat_specs else ""
+    desc = f"Pembelian bahan: {mat_name}{specs_str}"
+
+    finance_doc = {
+        "date": txn_date,
+        "type": "expense",
+        "category": "Material",
+        "classification": "cost",
+        "amount": conv["primary_amount"],
+        "currency": currency,
+        "account": currency,  # EGP -> Cash (EGP), IDR -> Bank (IDR)
+        "exchange_rate": rate,
+        "counterpart_amount": conv["counterpart_amount"],
+        "counterpart_currency": conv["counterpart_currency"],
+        "description": desc,
+        "reference_type": "material_purchase",
+        "reference_id": pb_id,
+        "reference_number": pb_num,
+        "supplier_name": purchase_doc.get("supplier_name", ""),
+        "notes": purchase_doc.get("notes", ""),
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+        "updated_by_name": admin.get("name", "Admin"),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "is_void": False,
+        "status": "active"
+    }
+
+    try:
+        res = await db.finance_transactions.insert_one(finance_doc, **kw)
+        finance_doc["_id"] = res.inserted_id
+        return clean(finance_doc)
+    except pymongo.errors.DuplicateKeyError:
+        existing = await db.finance_transactions.find_one({
+            "reference_type": "material_purchase",
+            "reference_id": pb_id,
+            "type": "expense"
+        }, **kw)
+        if existing:
+            return clean(existing)
+        raise HTTPException(status_code=409, detail="Transaksi keuangan untuk pembelian ini sudah pernah dicatat.")
+
+async def apply_purchase_finance_reversal(purchase_doc: dict, void_reason: str, admin: dict, session=None):
+    kw = {"session": session} if session else {}
+    pb_id = str(purchase_doc["_id"])
+    pb_num = purchase_doc.get("purchase_number")
+
+    # Find the original finance expense
+    orig_txn = await db.finance_transactions.find_one({
+        "reference_type": "material_purchase",
+        "reference_id": pb_id,
+        "type": "expense"
+    }, **kw)
+    if not orig_txn:
+        # Pre-Phase 4 purchase or no finance transaction: do nothing
+        return None
+
+    # Check if reversal already exists
+    existing_reversal = await db.finance_transactions.find_one({
+        "reference_type": "material_purchase",
+        "reference_id": pb_id,
+        "is_reversal": True
+    }, **kw)
+    if existing_reversal:
+        return clean(existing_reversal)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    now_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    time_part = now_iso[10:] if len(now_iso) > 10 else "T12:00:00+00:00"
+    txn_date = f"{now_date}{time_part}"
+
+    currency = orig_txn.get("currency", "EGP")
+    amount = float(orig_txn.get("amount") or 0.0)
+    rate = float(orig_txn.get("exchange_rate") or 357.0)
+    conv = compute_currency_conversion(currency, amount, rate)
+
+    reversal_doc = {
+        "date": txn_date,
+        "type": "income",
+        "category": "Material",
+        "classification": "cost_reversal",
+        "amount": conv["primary_amount"],
+        "currency": currency,
+        "account": orig_txn.get("account", currency),
+        "exchange_rate": rate,
+        "counterpart_amount": conv["counterpart_amount"],
+        "counterpart_currency": conv["counterpart_currency"],
+        "description": f"Reversal pembelian {pb_num} (Void: {void_reason})",
+        "reference_type": "material_purchase",
+        "reference_id": pb_id,
+        "reference_number": pb_num,
+        "related_transaction_id": str(orig_txn["_id"]),
+        "is_reversal": True,
+        "reversal_of_id": str(orig_txn["_id"]),
+        "reversal_reason": void_reason,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+        "updated_by_name": admin.get("name", "Admin"),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "is_void": False,
+        "status": "active"
+    }
+
+    try:
+        res = await db.finance_transactions.insert_one(reversal_doc, **kw)
+        reversal_doc["_id"] = res.inserted_id
+        return clean(reversal_doc)
+    except pymongo.errors.DuplicateKeyError:
+        existing_reversal = await db.finance_transactions.find_one({
+            "reference_type": "material_purchase",
+            "reference_id": pb_id,
+            "is_reversal": True
+        }, **kw)
+        if existing_reversal:
+            return clean(existing_reversal)
+        raise HTTPException(status_code=409, detail="Reversal transaksi keuangan untuk pembelian ini sudah pernah dicatat.")
 
 @api_router.get("/admin/materials/stock")
 async def get_materials_stock_summary(

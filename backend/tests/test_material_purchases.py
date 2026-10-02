@@ -98,6 +98,8 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
         mock_db.material_stocks.find_one = AsyncMock(return_value=None)
         mock_db.material_stocks.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
         mock_db.material_stocks.update_one = AsyncMock(return_value=None)
+        mock_db.finance_transactions.find_one = AsyncMock(return_value=None)
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
         mock_db.counters.find_one = AsyncMock(return_value={"seq": 1})
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 2})
         mock_db.counters.update_one = AsyncMock(return_value=None)
@@ -375,7 +377,7 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
         self.assertEqual(set_args["latest_purchase_date"], "2026-09-25")
 
     # -------------------------------------------------------------
-    # 17 & 18. Scope Safety: Purchase -> Stock = YES, Purchase -> Finance = NO
+    # 17 & 18. Scope Safety: Purchase -> Stock = YES, Purchase -> Finance = YES
     # -------------------------------------------------------------
     @patch("server.db")
     def test_17_18_no_stock_or_finance_mutations(self, mock_db):
@@ -401,8 +403,8 @@ class TestMaterialPurchasesPhase2(unittest.TestCase):
         self.assertTrue(mock_db.material_stocks.insert_one.called)
         # 3. Current stock updated (+quantity) -> YES
         self.assertTrue(mock_db.materials.update_one.called)
-        # 4. Finance transaction created -> NO (strictly isolated)
-        self.assertFalse(hasattr(mock_db.finance_transactions, "insert_one") and mock_db.finance_transactions.insert_one.called)
+        # 4. Finance transaction created -> YES (Phase 4 integrated)
+        self.assertTrue(mock_db.finance_transactions.insert_one.called)
 
     # -------------------------------------------------------------
     # 19. RBAC Protection
