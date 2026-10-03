@@ -104,9 +104,24 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         }
 
     def _setup_mock_db(self, mock_db):
-        mock_db.materials.find_one = AsyncMock(return_value={**self.sample_material})
-        mock_db.materials.find_one_and_update = AsyncMock(return_value={**self.sample_material, "current_stock": 30.0})
-        mock_db.materials.update_one = AsyncMock(return_value=None)
+        stored_mat = {**self.sample_material}
+        def mat_find_one(query, **kwargs):
+            return {**stored_mat}
+
+        def mat_find_one_and_update(query, update, **kwargs):
+            if "$set" in update:
+                stored_mat.update(update["$set"])
+            return {**stored_mat}
+
+        def mat_update_one(query, update, **kwargs):
+            if "$set" in update:
+                stored_mat.update(update["$set"])
+            return None
+
+        mock_db.materials.find_one = AsyncMock(side_effect=mat_find_one)
+        mock_db.materials.find_one_and_update = AsyncMock(side_effect=mat_find_one_and_update)
+        mock_db.materials.update_one = AsyncMock(side_effect=mat_update_one)
+        self.stored_mat = stored_mat
 
         mock_db.counters.find_one = AsyncMock(return_value={"seq": 1})
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
@@ -158,6 +173,7 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
                 doc = {"_id": ObjectId(), "current_quantity": 0.0}
             return doc
 
+        self.stored_forms = stored_forms
         mock_db.stock_forms.insert_one = AsyncMock(side_effect=sf_insert_one)
         mock_db.stock_forms.find_one = AsyncMock(side_effect=sf_find_one)
         mock_db.stock_forms.find_one_and_update = AsyncMock(side_effect=sf_find_one_and_update)
@@ -870,6 +886,254 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
             asyncio.run(void_material_purchase(str(pb_id), VoidPurchaseInput(void_reason="Batal"), admin=self.owner_user))
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("lebih kecil dari jumlah pembelian", ctx.exception.detail)
+
+    # =========================================================================
+    # 33 - 37: INVENTORY INVARIANT REGRESSION TESTS (MINIMAL CORRECTIVE FIX)
+    # =========================================================================
+    @patch("server.db")
+    def test_33_transformation_does_not_inflate_material_current_stock(self, mock_db):
+        """33. Transformation (1 lembar -> 20 pcs) decrements 1 lembar and outputs 20 pcs without adding pcs to materials.current_stock."""
+        self._setup_mock_db(mock_db)
+        self.stored_mat["current_stock"] = 10.0
+        self.stored_mat["unit"] = "lembar"
+
+        source_sf_id = ObjectId()
+        # Source is raw form with 10 lembar
+        self.stored_forms[str(source_sf_id)] = {
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 10.0,
+            "is_active": True
+        }
+
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=1.0,
+            transformation_date="2026-10-02",
+            reason="Potong ambalan rak",
+            outputs=[
+                StockFormOutputItemInput(
+                    form_type="standard",
+                    width=80,
+                    length=30,
+                    quantity=20.0,
+                    stock_unit="pcs",
+                    label="Ambalan 80x30"
+                )
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+
+        # Invariant verification:
+        # materials.current_stock must be 9.0 (10 - 1), NOT 29.0
+        self.assertEqual(self.stored_mat["current_stock"], 9.0)
+
+        # Source form decremented to 9.0
+        src_sf = asyncio.run(mock_db.stock_forms.find_one({"_id": source_sf_id}))
+        self.assertEqual(src_sf["current_quantity"], 9.0)
+
+        # Output form has 20.0 pcs
+        out_sf_id = res["transformation"]["output_stock_forms"][0]["stock_form_id"]
+        out_sf = asyncio.run(mock_db.stock_forms.find_one({"_id": ObjectId(out_sf_id)}))
+        self.assertEqual(out_sf["current_quantity"], 20.0)
+        self.assertEqual(out_sf["stock_unit"], "pcs")
+
+    @patch("server.db")
+    def test_34_purchase_precut_keeps_only_remaining_raw_stock_in_current_stock(self, mock_db):
+        """34. Purchase 10 lembar with 4 lembar pre-cut -> 80 pcs leaves current_stock = 6.0 (NOT 86.0)."""
+        self._setup_mock_db(mock_db)
+        self.stored_mat["current_stock"] = 0.0
+        self.stored_mat["unit"] = "lembar"
+
+        inp = MaterialPurchaseInput(
+            material_id=str(self.sample_mat_id),
+            purchase_date="2026-10-02",
+            quantity=10.0,
+            unit_price=500.0,
+            currency="EGP",
+            unit="lembar",
+            stock_processing=StockProcessingInput(
+                mode="pre_cut",
+                processed_quantity=4.0,
+                outputs=[
+                    StockFormOutputItemInput(
+                        form_type="standard",
+                        width=80,
+                        length=30,
+                        quantity=80.0,
+                        stock_unit="pcs",
+                        label="Rak 80x30"
+                    )
+                ]
+            )
+        )
+        res = asyncio.run(create_material_purchase(inp, admin=self.owner_user))
+        self.assertEqual(res["stock_processing"]["remaining_raw_quantity"], 6.0)
+
+        # Invariant check:
+        # materials.current_stock must equal 6.0 (0 + 10 - 4), NEVER 86.0!
+        self.assertEqual(self.stored_mat["current_stock"], 6.0)
+
+        # Finance has exactly one expense transaction
+        mock_db.finance_transactions.insert_one.assert_called_once()
+        fin_doc = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(fin_doc["amount"], 5000.0)
+
+    @patch("server.db")
+    def test_35_100_percent_precut_results_in_zero_canonical_stock(self, mock_db):
+        """35. Purchase 10 lembar with 100% pre-cut (10 lembar -> 200 pcs) leaves current_stock = 0.0."""
+        self._setup_mock_db(mock_db)
+        self.stored_mat["current_stock"] = 0.0
+        self.stored_mat["unit"] = "lembar"
+
+        inp = MaterialPurchaseInput(
+            material_id=str(self.sample_mat_id),
+            purchase_date="2026-10-02",
+            quantity=10.0,
+            unit_price=500.0,
+            currency="EGP",
+            unit="lembar",
+            stock_processing=StockProcessingInput(
+                mode="pre_cut",
+                processed_quantity=10.0,
+                outputs=[
+                    StockFormOutputItemInput(
+                        form_type="standard",
+                        width=80,
+                        length=30,
+                        quantity=200.0,
+                        stock_unit="pcs",
+                        label="Komponen 80x30"
+                    )
+                ]
+            )
+        )
+        res = asyncio.run(create_material_purchase(inp, admin=self.owner_user))
+        self.assertEqual(res["stock_processing"]["remaining_raw_quantity"], 0.0)
+
+        # Invariant check:
+        # materials.current_stock must be 0.0 (0 + 10 - 10), output form = 200.0 pcs
+        self.assertEqual(self.stored_mat["current_stock"], 0.0)
+
+    @patch("server.db")
+    def test_36_void_precut_purchase_restores_canonical_stock_safely(self, mock_db):
+        """36. Voiding pre-cut purchase safely reverses outputs, raw restoration, and purchase_in."""
+        self._setup_mock_db(mock_db)
+        self.stored_mat["current_stock"] = 10.0
+        self.stored_mat["unit"] = "lembar"
+
+        # 1. Perform purchase 10 lembar with 4 lembar pre-cut -> 80 pcs
+        inp = MaterialPurchaseInput(
+            material_id=str(self.sample_mat_id),
+            purchase_date="2026-10-02",
+            quantity=10.0,
+            unit_price=500.0,
+            currency="EGP",
+            unit="lembar",
+            stock_processing=StockProcessingInput(
+                mode="pre_cut",
+                processed_quantity=4.0,
+                outputs=[
+                    StockFormOutputItemInput(
+                        form_type="standard",
+                        width=80,
+                        length=30,
+                        quantity=80.0,
+                        stock_unit="pcs",
+                        label="Rak 80x30"
+                    )
+                ]
+            )
+        )
+        p_res = asyncio.run(create_material_purchase(inp, admin=self.owner_user))
+        pb_id = p_res["id"]
+        # Initial 10 + 10 purchase - 4 pre-cut = 16.0
+        self.assertEqual(self.stored_mat["current_stock"], 16.0)
+
+        # Setup mock db query responses for void lookup
+        stored_purchase = {**p_res, "_id": ObjectId(pb_id), "is_void": False}
+        def pb_find_one(query, **kwargs):
+            return {**stored_purchase}
+        def pb_find_one_and_update(query, update, **kwargs):
+            if "$set" in update:
+                stored_purchase.update(update["$set"])
+            return {**stored_purchase}
+
+        mock_db.material_purchases.find_one = AsyncMock(side_effect=pb_find_one)
+        mock_db.material_purchases.find_one_and_update = AsyncMock(side_effect=pb_find_one_and_update)
+
+        # Find the transformation document recorded for this purchase
+        tr_call = mock_db.stock_transformations.insert_one.call_args[0][0]
+        mock_db.stock_transformations.find_one = AsyncMock(return_value=tr_call)
+
+        # Mock material_stocks to return the orig purchase_in movement
+        orig_mov = {
+            "_id": ObjectId(),
+            "related_purchase_id": pb_id,
+            "movement_type": "purchase_in",
+            "quantity_delta": 10.0
+        }
+        mock_db.material_stocks.find_one = AsyncMock(side_effect=[orig_mov, None])
+
+        # Find the orig finance transaction recorded during purchase
+        fin_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        orig_fin = {**fin_call, "_id": ObjectId()}
+        mock_db.finance_transactions.find_one = AsyncMock(side_effect=[orig_fin, None])
+
+        # 2. Void the purchase
+        void_res = asyncio.run(void_material_purchase(str(pb_id), VoidPurchaseInput(void_reason="Batal proyek"), admin=self.owner_user))
+        self.assertTrue(void_res["ok"])
+        self.assertTrue(void_res["purchase"]["is_void"])
+
+        # Canonical stock returned to initial 10.0
+        self.assertEqual(self.stored_mat["current_stock"], 10.0)
+
+        # Output form reversed to 0.0
+        out_sf_id = tr_call["output_stock_forms"][0]["stock_form_id"]
+        out_sf = asyncio.run(mock_db.stock_forms.find_one({"_id": ObjectId(out_sf_id)}))
+        self.assertEqual(out_sf["current_quantity"], 0.0)
+
+        # Exactly 1 finance reversal recorded
+        reversal_calls = [c[0][0] for c in mock_db.finance_transactions.insert_one.call_args_list if c[0][0].get("is_reversal")]
+        self.assertEqual(len(reversal_calls), 1)
+
+    @patch("server.db")
+    def test_37_adjustment_on_transformed_form_does_not_change_material_aggregate(self, mock_db):
+        """37. Manual adjustment on a non-raw stock form changes only that form's quantity and leaves materials.current_stock intact."""
+        self._setup_mock_db(mock_db)
+        self.stored_mat["current_stock"] = 5.0
+        self.stored_mat["unit"] = "lembar"
+
+        sf_id = ObjectId()
+        self.stored_forms[str(sf_id)] = {
+            "_id": sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "stock_unit": "pcs",
+            "label": "Rak 12x60",
+            "current_quantity": 20.0,
+            "is_active": True
+        }
+
+        inp = MaterialStockAdjustmentInput(
+            adjustment_type="adjustment_out",
+            quantity=2.0,
+            reason="Rusak saat perakitan",
+            stock_form_id=str(sf_id)
+        )
+        res = asyncio.run(create_material_stock_adjustment(str(self.sample_mat_id), inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+
+        # Form quantity decremented to 18.0
+        sf = asyncio.run(mock_db.stock_forms.find_one({"_id": sf_id}))
+        self.assertEqual(sf["current_quantity"], 18.0)
+
+        # Canonical aggregate stock strictly preserved at 5.0 lembar!
+        self.assertEqual(self.stored_mat["current_stock"], 5.0)
 
 
 if __name__ == "__main__":

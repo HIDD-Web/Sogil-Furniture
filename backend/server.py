@@ -5472,7 +5472,8 @@ async def apply_stock_movement_atomic(
     session=None,
     stock_form_id: Optional[str] = None,
     transformation_id: Optional[str] = None,
-    transformation_number: Optional[str] = None
+    transformation_number: Optional[str] = None,
+    update_material_aggregate: bool = True
 ) -> dict:
     kw = {"session": session} if session else {}
     mat = await db.materials.find_one({"_id": id_query(material_id)}, **kw)
@@ -5522,56 +5523,68 @@ async def apply_stock_movement_atomic(
         if not stock_form_doc:
             raise HTTPException(status_code=409, detail="Konflik konkurensi saat mengubah kuantitas bentuk stok.")
 
-    # 2. Concurrency-safe atomic update loop with optimistic concurrency for materials.current_stock
+    # 2. Concurrency-safe atomic update loop with optimistic concurrency for materials.current_stock (when update_material_aggregate=True)
     max_retries = 10
     updated_mat = None
-    prev_stock = 0.0
-    target_new_stock = 0.0
+    prev_stock = round(float(mat.get("current_stock") or 0.0), 4)
+    target_new_stock = prev_stock
 
-    for attempt in range(max_retries):
-        current_doc = await db.materials.find_one({"_id": mat["_id"]}, **kw)
-        if not current_doc:
-            raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+    if update_material_aggregate:
+        for attempt in range(max_retries):
+            current_doc = await db.materials.find_one({"_id": mat["_id"]}, **kw)
+            if not current_doc:
+                raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
 
-        prev_stock = round(float(current_doc.get("current_stock") or 0.0), 4)
-        target_new_stock = round(prev_stock + delta, 4)
+            prev_stock = round(float(current_doc.get("current_stock") or 0.0), 4)
+            target_new_stock = round(prev_stock + delta, 4)
 
-        if not allow_negative and target_new_stock < 0:
-            # Rollback stock_form if we modified it
-            if stock_form_id and stock_form_doc:
-                await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Stok bahan tidak mencukupi (stok saat ini: {prev_stock} {mat.get('unit', '')}, pengurangan: {abs(delta)})"
+            if not allow_negative and target_new_stock < 0:
+                # Rollback stock_form if we modified it
+                if stock_form_id and stock_form_doc:
+                    await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Stok bahan tidak mencukupi (stok saat ini: {prev_stock} {mat.get('unit', '')}, pengurangan: {abs(delta)})"
+                )
+
+            # Atomic compare-and-swap
+            cond = {"_id": mat["_id"]}
+            if "current_stock" in current_doc and current_doc["current_stock"] is not None:
+                cond["current_stock"] = current_doc["current_stock"]
+            else:
+                cond["$or"] = [{"current_stock": {"$exists": False}}, {"current_stock": None}, {"current_stock": 0.0}]
+
+            updated_mat = await db.materials.find_one_and_update(
+                cond,
+                {"$set": {"current_stock": target_new_stock}},
+                return_document=ReturnDocument.AFTER,
+                **kw
             )
-
-        # Atomic compare-and-swap
-        cond = {"_id": mat["_id"]}
-        if "current_stock" in current_doc and current_doc["current_stock"] is not None:
-            cond["current_stock"] = current_doc["current_stock"]
-        else:
-            cond["$or"] = [{"current_stock": {"$exists": False}}, {"current_stock": None}, {"current_stock": 0.0}]
-
-        updated_mat = await db.materials.find_one_and_update(
-            cond,
-            {"$set": {"current_stock": target_new_stock}},
-            return_document=ReturnDocument.AFTER,
-            **kw
-        )
-        if updated_mat:
-            break
-        if attempt == max_retries - 1:
-            if stock_form_id and stock_form_doc:
-                await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
-            raise HTTPException(status_code=409, detail="Konflik konkurensi saat mengubah stok. Silakan coba kembali.")
+            if updated_mat:
+                break
+            if attempt == max_retries - 1:
+                if stock_form_id and stock_form_doc:
+                    await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
+                raise HTTPException(status_code=409, detail="Konflik konkurensi saat mengubah stok. Silakan coba kembali.")
+    else:
+        # Read latest current_stock for movement_doc snapshot without mutating it
+        current_doc = await db.materials.find_one({"_id": mat["_id"]}, **kw)
+        if current_doc:
+            prev_stock = round(float(current_doc.get("current_stock") or 0.0), 4)
+            target_new_stock = prev_stock
 
     # 3. Record movement document
     now = datetime.now(timezone.utc).isoformat()
+    # If this movement is strictly on a stock form and does not update canonical material aggregate, record form's stock_unit
+    mov_unit = mat.get("unit", "pcs")
+    if not update_material_aggregate and stock_form_doc:
+        mov_unit = stock_form_doc.get("stock_unit") or mov_unit
+
     movement_doc = {
         "material_id": canonical_mat_id,
         "material_name_snapshot": mat.get("name", ""),
         "material_specs_snapshot": mat.get("specs", ""),
-        "unit": mat.get("unit", "pcs"),
+        "unit": mov_unit,
         "movement_type": movement_type,
         "quantity_delta": delta,
         "previous_stock": prev_stock,
@@ -5601,13 +5614,15 @@ async def apply_stock_movement_atomic(
             # Check if this duplicate is on related_purchase_id idempotency index
             if "uniq_purchase_stock_movement" in str(dke):
                 # Rollback current_stock and stock_form
-                await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                if update_material_aggregate:
+                    await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
                 if stock_form_id and stock_form_doc:
                     await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(status_code=409, detail="Stok untuk pembelian ini sudah pernah dicatat.")
             if attempt == 4:
                 # Rollback on fatal failure
-                await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                if update_material_aggregate:
+                    await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
                 if stock_form_id and stock_form_doc:
                     await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pergerakan stok unik.")
@@ -5725,7 +5740,8 @@ async def apply_purchase_stock_in(purchase_doc: dict, admin: dict, session=None)
                     allow_negative=False,
                     session=session,
                     stock_form_id=str(out_sf["_id"]),
-                    transformation_number=tr_num
+                    transformation_number=tr_num,
+                    update_material_aggregate=False
                 )
                 output_refs.append({
                     "stock_form_id": str(out_sf["_id"]),
@@ -5869,7 +5885,8 @@ async def apply_purchase_stock_reversal(purchase_doc: dict, void_reason: str, ad
                 notes=f"Reversal void pembelian {pb_num}",
                 allow_negative=False,
                 session=session,
-                stock_form_id=sf_id
+                stock_form_id=sf_id,
+                update_material_aggregate=False
             )
 
         # Reverse source raw deduction: adjustment_in back to source raw stock form
@@ -6187,6 +6204,13 @@ async def create_material_stock_adjustment(
     qty_val = round(_num(data.quantity), 4)
     delta = qty_val if adj_type == "adjustment_in" else -qty_val
 
+    # Check if stock form is non-raw to prevent non-canonical stock opname from mutating materials.current_stock
+    upd_mat_agg = True
+    if data.stock_form_id:
+        sf_check = await db.stock_forms.find_one({"_id": id_query(data.stock_form_id)})
+        if sf_check and sf_check.get("form_type") != "raw":
+            upd_mat_agg = False
+
     movement = await apply_stock_movement_atomic(
         material_id=material_id,
         movement_type=adj_type,
@@ -6196,7 +6220,8 @@ async def create_material_stock_adjustment(
         admin=admin,
         notes=(data.notes or "").strip(),
         allow_negative=False,
-        stock_form_id=data.stock_form_id
+        stock_form_id=data.stock_form_id,
+        update_material_aggregate=upd_mat_agg
     )
 
     return {"ok": True, "message": "Penyesuaian stok berhasil disimpan", "movement": movement}
@@ -6355,6 +6380,8 @@ async def create_stock_transformation(
         now = datetime.now(timezone.utc).isoformat()
 
         # 2. transformation_out from source stock form
+        # Only mutate materials.current_stock if source form was raw/canonical
+        is_source_raw = (source_sf.get("form_type") == "raw")
         await apply_stock_movement_atomic(
             material_id=canonical_mat_id,
             movement_type="transformation_out",
@@ -6366,10 +6393,11 @@ async def create_stock_transformation(
             allow_negative=False,
             session=session,
             stock_form_id=str(source_sf["_id"]),
-            transformation_number=tr_num
+            transformation_number=tr_num,
+            update_material_aggregate=is_source_raw
         )
 
-        # 3. transformation_in for each output form
+        # 3. transformation_in for each output form (never inflates canonical materials.current_stock)
         output_refs = []
         for out_it in valid_outputs:
             out_sf = await get_or_create_stock_form(
@@ -6396,7 +6424,8 @@ async def create_stock_transformation(
                 allow_negative=False,
                 session=session,
                 stock_form_id=str(out_sf["_id"]),
-                transformation_number=tr_num
+                transformation_number=tr_num,
+                update_material_aggregate=False
             )
             output_refs.append({
                 "stock_form_id": str(out_sf["_id"]),
