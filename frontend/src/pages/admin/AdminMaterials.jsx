@@ -23,6 +23,12 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   SlidersHorizontal,
+  Scissors,
+  Boxes,
+  Trash2,
+  Split,
+  Shapes,
+  FileText,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -38,6 +44,18 @@ const INITIAL_FORM = {
   notes: "",
 };
 
+const INITIAL_TRANSFORMATION_OUTPUT = {
+  form_type: "standard",
+  label: "",
+  width: "",
+  length: "",
+  thickness: "",
+  dimension_unit: "cm",
+  quantity: "",
+  stock_unit: "",
+  notes: "",
+};
+
 const INITIAL_PURCHASE_FORM = {
   material_id: "",
   purchase_date: new Date().toISOString().slice(0, 10),
@@ -47,14 +65,38 @@ const INITIAL_PURCHASE_FORM = {
   exchange_rate: "",
   supplier_name: "",
   notes: "",
+  enable_precut: false,
+  processed_quantity: "",
+  precut_outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT }],
 };
 
 const INITIAL_ADJUSTMENT_FORM = {
   material_id: "",
+  stock_form_id: "",
   adjustment_type: "adjustment_in",
   quantity: "",
   movement_date: new Date().toISOString().slice(0, 10),
   reason: "",
+  notes: "",
+};
+
+const INITIAL_STOCK_FORM = {
+  form_type: "standard",
+  width: "",
+  length: "",
+  thickness: "",
+  dimension_unit: "cm",
+  stock_unit: "",
+  label: "",
+  notes: "",
+};
+
+const INITIAL_TRANSFORMATION_FORM = {
+  material_id: "",
+  transformation_date: new Date().toISOString().slice(0, 10),
+  source_stock_form_id: "",
+  source_quantity: "",
+  outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT }],
   notes: "",
 };
 
@@ -107,6 +149,38 @@ export default function AdminMaterials() {
   const [movementsData, setMovementsData] = useState(null);
   const [loadingMovements, setLoadingMovements] = useState(false);
 
+  // Phase 5: Transformations list & filters
+  const [transformations, setTransformations] = useState([]);
+  const [transformationSearch, setTransformationSearch] = useState("");
+  const [transformationMaterialFilter, setTransformationMaterialFilter] = useState("all");
+  const [transformationStartDate, setTransformationStartDate] = useState("");
+  const [transformationEndDate, setTransformationEndDate] = useState("");
+
+  // Phase 5: Stock Forms Modal states
+  const [stockFormsModalOpen, setStockFormsModalOpen] = useState(false);
+  const [selectedStockFormMaterial, setSelectedStockFormMaterial] = useState(null);
+  const [stockFormsList, setStockFormsList] = useState([]);
+  const [loadingStockForms, setLoadingStockForms] = useState(false);
+  const [newStockFormOpen, setNewStockFormOpen] = useState(false);
+  const [newStockForm, setNewStockForm] = useState(INITIAL_STOCK_FORM);
+  const [submittingStockForm, setSubmittingStockForm] = useState(false);
+
+  // Phase 5: Stock Transformation Modal states
+  const [transformationModalOpen, setTransformationModalOpen] = useState(false);
+  const [transformationForm, setTransformationForm] = useState(INITIAL_TRANSFORMATION_FORM);
+  const [submittingTransformation, setSubmittingTransformation] = useState(false);
+  const [availableSourceForms, setAvailableSourceForms] = useState([]);
+  const [loadingSourceForms, setLoadingSourceForms] = useState(false);
+
+  // Phase 5: Transformation Detail Modal state
+  const [transformationDetailModalOpen, setTransformationDetailModalOpen] = useState(false);
+  const [selectedTransformationDetail, setSelectedTransformationDetail] = useState(null);
+  const [loadingTransformationDetail, setLoadingTransformationDetail] = useState(false);
+
+  // Phase 5: Stock Forms for Adjustment Modal
+  const [adjustmentStockForms, setAdjustmentStockForms] = useState([]);
+  const [loadingAdjustmentStockForms, setLoadingAdjustmentStockForms] = useState(false);
+
   const loadMaterials = async () => {
     try {
       setLoading(true);
@@ -137,10 +211,20 @@ export default function AdminMaterials() {
     }
   };
 
+  const loadTransformations = async () => {
+    try {
+      const res = await api.get("/admin/materials/stock-transformations");
+      setTransformations(res.data || []);
+    } catch {
+      toast.error("Gagal memuat riwayat transformasi stok");
+    }
+  };
+
   useEffect(() => {
     loadMaterials();
     loadPurchases();
     loadStockSummary();
+    loadTransformations();
   }, []);
 
   const openAddModal = () => {
@@ -247,6 +331,9 @@ export default function AdminMaterials() {
       exchange_rate: defaultRate,
       supplier_name: "",
       notes: "",
+      enable_precut: false,
+      processed_quantity: "",
+      precut_outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: presetMaterial?.unit || "pcs" }],
     });
     setPurchaseModalOpen(true);
   };
@@ -257,6 +344,20 @@ export default function AdminMaterials() {
     if (!purchaseForm.purchase_date) return toast.error("Tanggal pembelian wajib diisi");
     if (!purchaseForm.quantity || Number(purchaseForm.quantity) <= 0) return toast.error("Jumlah (quantity) harus lebih besar dari 0");
     if (purchaseForm.unit_price === "" || Number(purchaseForm.unit_price) < 0) return toast.error("Harga satuan tidak valid");
+
+    if (purchaseForm.enable_precut) {
+      const procQ = Number(purchaseForm.processed_quantity || 0);
+      if (procQ <= 0) {
+        return toast.error("Jumlah bahan yang dipotong langsung (pre-cut) harus lebih besar dari 0");
+      }
+      if (procQ > Number(purchaseForm.quantity)) {
+        return toast.error("Jumlah dipotong langsung tidak boleh melebihi jumlah pembelian");
+      }
+      const validOuts = (purchaseForm.precut_outputs || []).filter(o => Number(o.quantity) > 0);
+      if (validOuts.length === 0) {
+        return toast.error("Tambahkan minimal 1 bentuk hasil potong dengan jumlah > 0");
+      }
+    }
 
     try {
       setSubmittingPurchase(true);
@@ -270,12 +371,32 @@ export default function AdminMaterials() {
         supplier_name: purchaseForm.supplier_name.trim(),
         notes: purchaseForm.notes.trim(),
       };
+
+      if (purchaseForm.enable_precut && Number(purchaseForm.processed_quantity) > 0) {
+        payload.stock_processing = {
+          mode: "pre_cut",
+          processed_quantity: Number(purchaseForm.processed_quantity),
+          outputs: purchaseForm.precut_outputs.filter(o => Number(o.quantity) > 0).map(o => ({
+            form_type: o.form_type || "standard",
+            label: (o.label || "").trim(),
+            width: o.width ? Number(o.width) : undefined,
+            length: o.length ? Number(o.length) : undefined,
+            thickness: o.thickness ? Number(o.thickness) : undefined,
+            dimension_unit: o.dimension_unit || "cm",
+            quantity: Number(o.quantity),
+            stock_unit: o.stock_unit || selectedPurchaseMaterial?.unit || "pcs",
+            notes: (o.notes || "").trim(),
+          })),
+        };
+      }
+
       await api.post("/admin/materials/purchases", payload);
       toast.success("Pembelian bahan berhasil dicatat (Stok bertambah & Pengeluaran tercatat di Keuangan)");
       setPurchaseModalOpen(false);
       loadMaterials();
       loadPurchases();
       loadStockSummary();
+      loadTransformations();
     } catch (err) {
       toast.error(formatApiError(err.response?.data?.detail) || "Gagal mencatat pembelian");
     } finally {
@@ -295,15 +416,18 @@ export default function AdminMaterials() {
       loadPurchases();
       loadMaterials();
       loadStockSummary();
+      loadTransformations();
     } catch (err) {
       toast.error(formatApiError(err.response?.data?.detail) || "Gagal membatalkan pembelian");
     }
   };
 
   // Stock Adjustment Handlers
-  const openAdjustmentModal = (presetMaterial = null) => {
+  const openAdjustmentModal = async (presetMaterial = null) => {
+    const matId = presetMaterial ? presetMaterial.id : "";
     setAdjustmentForm({
-      material_id: presetMaterial ? presetMaterial.id : "",
+      material_id: matId,
+      stock_form_id: "",
       adjustment_type: "adjustment_in",
       quantity: "",
       movement_date: new Date().toISOString().slice(0, 10),
@@ -311,6 +435,23 @@ export default function AdminMaterials() {
       notes: "",
     });
     setAdjustmentModalOpen(true);
+    if (matId) {
+      loadAdjustmentForms(matId);
+    } else {
+      setAdjustmentStockForms([]);
+    }
+  };
+
+  const loadAdjustmentForms = async (matId) => {
+    try {
+      setLoadingAdjustmentStockForms(true);
+      const res = await api.get(`/admin/materials/${matId}/stock-forms`);
+      setAdjustmentStockForms(res.data || []);
+    } catch {
+      setAdjustmentStockForms([]);
+    } finally {
+      setLoadingAdjustmentStockForms(false);
+    }
   };
 
   const handleAdjustmentSubmit = async (e) => {
@@ -327,6 +468,7 @@ export default function AdminMaterials() {
         movement_date: adjustmentForm.movement_date,
         reason: adjustmentForm.reason.trim(),
         notes: adjustmentForm.notes.trim(),
+        stock_form_id: adjustmentForm.stock_form_id || undefined,
       };
       await api.post(`/admin/materials/${adjustmentForm.material_id}/stock-adjustment`, payload);
       toast.success("Penyesuaian stok berhasil disimpan");
@@ -337,6 +479,150 @@ export default function AdminMaterials() {
       toast.error(formatApiError(err.response?.data?.detail) || "Gagal menyesuaikan stok");
     } finally {
       setSubmittingAdjustment(false);
+    }
+  };
+
+  // Phase 5: Stock Forms Handlers
+  const openStockFormsModal = async (material) => {
+    setSelectedStockFormMaterial(material);
+    setNewStockFormOpen(false);
+    setNewStockForm({
+      ...INITIAL_STOCK_FORM,
+      stock_unit: material.unit || "pcs",
+    });
+    setStockFormsModalOpen(true);
+    await loadStockForms(material.id);
+  };
+
+  const loadStockForms = async (matId) => {
+    try {
+      setLoadingStockForms(true);
+      const res = await api.get(`/admin/materials/${matId}/stock-forms`);
+      setStockFormsList(res.data || []);
+    } catch {
+      toast.error("Gagal memuat data bentuk stok bahan");
+    } finally {
+      setLoadingStockForms(false);
+    }
+  };
+
+  const handleCreateStockForm = async (e) => {
+    e.preventDefault();
+    if (!selectedStockFormMaterial) return;
+    try {
+      setSubmittingStockForm(true);
+      const payload = {
+        form_type: newStockForm.form_type || "standard",
+        width: newStockForm.width ? Number(newStockForm.width) : undefined,
+        length: newStockForm.length ? Number(newStockForm.length) : undefined,
+        thickness: newStockForm.thickness ? Number(newStockForm.thickness) : undefined,
+        dimension_unit: newStockForm.dimension_unit || "cm",
+        stock_unit: newStockForm.stock_unit || selectedStockFormMaterial.unit || "pcs",
+        label: newStockForm.label.trim(),
+        notes: newStockForm.notes.trim(),
+      };
+      await api.post(`/admin/materials/${selectedStockFormMaterial.id}/stock-forms`, payload);
+      toast.success("Bentuk stok berhasil ditambahkan");
+      setNewStockForm({
+        ...INITIAL_STOCK_FORM,
+        stock_unit: selectedStockFormMaterial.unit || "pcs",
+      });
+      setNewStockFormOpen(false);
+      loadStockForms(selectedStockFormMaterial.id);
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail) || "Gagal menambahkan bentuk stok");
+    } finally {
+      setSubmittingStockForm(false);
+    }
+  };
+
+  // Phase 5: Stock Transformations Handlers
+  const openTransformationModal = async (presetMaterial = null) => {
+    const matId = presetMaterial ? presetMaterial.id : "";
+    setTransformationForm({
+      material_id: matId,
+      transformation_date: new Date().toISOString().slice(0, 10),
+      source_stock_form_id: "",
+      source_quantity: "",
+      outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: presetMaterial?.unit || "pcs" }],
+      notes: "",
+    });
+    setTransformationModalOpen(true);
+    if (matId) {
+      await loadSourceForms(matId);
+    } else {
+      setAvailableSourceForms([]);
+    }
+  };
+
+  const loadSourceForms = async (matId) => {
+    try {
+      setLoadingSourceForms(true);
+      const res = await api.get(`/admin/materials/${matId}/stock-forms`);
+      setAvailableSourceForms(res.data || []);
+    } catch {
+      setAvailableSourceForms([]);
+    } finally {
+      setLoadingSourceForms(false);
+    }
+  };
+
+  const handleTransformationSubmit = async (e) => {
+    e.preventDefault();
+    if (!transformationForm.material_id) return toast.error("Pilih bahan yang dipotong/ditransformasi");
+    if (!transformationForm.source_stock_form_id) return toast.error("Pilih bentuk stok asal");
+    if (!transformationForm.source_quantity || Number(transformationForm.source_quantity) <= 0) {
+      return toast.error("Jumlah asal yang dipotong harus lebih besar dari 0");
+    }
+    const validOutputs = (transformationForm.outputs || []).filter(o => Number(o.quantity) > 0);
+    if (validOutputs.length === 0) {
+      return toast.error("Tambahkan minimal 1 bentuk hasil potong dengan jumlah > 0");
+    }
+
+    try {
+      setSubmittingTransformation(true);
+      const payload = {
+        material_id: transformationForm.material_id,
+        transformation_date: transformationForm.transformation_date,
+        source_stock_form_id: transformationForm.source_stock_form_id,
+        source_quantity: Number(transformationForm.source_quantity),
+        outputs: validOutputs.map(o => ({
+          form_type: o.form_type || "standard",
+          label: (o.label || "").trim(),
+          width: o.width ? Number(o.width) : undefined,
+          length: o.length ? Number(o.length) : undefined,
+          thickness: o.thickness ? Number(o.thickness) : undefined,
+          dimension_unit: o.dimension_unit || "cm",
+          quantity: Number(o.quantity),
+          stock_unit: o.stock_unit || "pcs",
+          notes: (o.notes || "").trim(),
+        })),
+        notes: (transformationForm.notes || "").trim(),
+      };
+      const res = await api.post("/admin/materials/stock-transformations", payload);
+      toast.success(`Transformasi berhasil dicatat (${res.data?.transformation?.transformation_number || "Sukses"})`);
+      setTransformationModalOpen(false);
+      loadMaterials();
+      loadStockSummary();
+      loadTransformations();
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail) || "Gagal mencatat transformasi");
+    } finally {
+      setSubmittingTransformation(false);
+    }
+  };
+
+  const openTransformationDetail = async (tr) => {
+    try {
+      setLoadingTransformationDetail(true);
+      setTransformationDetailModalOpen(true);
+      const res = await api.get(`/admin/materials/stock-transformations/${tr.id || tr.transformation_number}`);
+      setSelectedTransformationDetail(res.data);
+    } catch {
+      toast.error("Gagal memuat detail transformasi");
+      setSelectedTransformationDetail(tr);
+    } finally {
+      setLoadingTransformationDetail(false);
     }
   };
 
@@ -416,6 +702,31 @@ export default function AdminMaterials() {
     });
   }, [stockSummary, stockCategoryFilter, stockSearch]);
 
+  const filteredTransformations = useMemo(() => {
+    return transformations.filter((t) => {
+      if (transformationMaterialFilter !== "all" && t.material_id !== transformationMaterialFilter) {
+        return false;
+      }
+      if (transformationStartDate && t.transformation_date < transformationStartDate) {
+        return false;
+      }
+      if (transformationEndDate && t.transformation_date > transformationEndDate) {
+        return false;
+      }
+      if (transformationSearch.trim()) {
+        const q = transformationSearch.toLowerCase();
+        const num = (t.transformation_number || "").toLowerCase();
+        const mat = (t.material_name_snapshot || "").toLowerCase();
+        const reason = (t.reason || "").toLowerCase();
+        const pb = (t.related_purchase_number || "").toLowerCase();
+        if (!num.includes(q) && !mat.includes(q) && !reason.includes(q) && !pb.includes(q)) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [transformations, transformationMaterialFilter, transformationStartDate, transformationEndDate, transformationSearch]);
+
   const selectedPurchaseMaterial = useMemo(() => {
     return materials.find((m) => m.id === purchaseForm.material_id);
   }, [materials, purchaseForm.material_id]);
@@ -423,6 +734,14 @@ export default function AdminMaterials() {
   const selectedAdjustmentMaterial = useMemo(() => {
     return materials.find((m) => m.id === adjustmentForm.material_id);
   }, [materials, adjustmentForm.material_id]);
+
+  const selectedTransformationMaterial = useMemo(() => {
+    return materials.find((m) => m.id === transformationForm.material_id);
+  }, [materials, transformationForm.material_id]);
+
+  const selectedSourceStockForm = useMemo(() => {
+    return availableSourceForms.find((sf) => sf.id === transformationForm.source_stock_form_id);
+  }, [availableSourceForms, transformationForm.source_stock_form_id]);
 
   const purchaseEstimatedTotal = useMemo(() => {
     const q = Number(purchaseForm.quantity) || 0;
@@ -458,6 +777,14 @@ export default function AdminMaterials() {
             className="rounded-xl border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#EFE6D5] flex items-center gap-1.5"
           >
             <SlidersHorizontal size={17} /> Penyesuaian Stok
+          </Button>
+          <Button
+            onClick={() => openTransformationModal()}
+            data-testid="stock-transformation-btn"
+            variant="outline"
+            className="rounded-xl border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#EFE6D5] flex items-center gap-1.5"
+          >
+            <Scissors size={17} /> Transformasi Stok
           </Button>
           <Button
             onClick={openAddModal}
@@ -510,6 +837,19 @@ export default function AdminMaterials() {
         >
           <ShoppingCart size={17} />
           Riwayat Pembelian ({purchases.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("transformations")}
+          className={`flex items-center gap-2 px-5 py-3 text-sm font-semibold border-b-2 transition whitespace-nowrap ${
+            activeTab === "transformations"
+              ? "border-[#8B5A2B] text-[#8B5A2B] bg-white rounded-t-xl"
+              : "border-transparent text-[#8B7355] hover:text-[#2C1E16]"
+          }`}
+          data-testid="tab-transformations"
+        >
+          <Scissors size={17} />
+          Transformasi Stok ({transformations.length})
         </button>
       </div>
 
@@ -694,15 +1034,35 @@ export default function AdminMaterials() {
                           <td className="px-4 py-3 text-right">
                             <div className="flex items-center justify-end gap-1.5">
                               {!isArchived && (
-                                <button
-                                  type="button"
-                                  onClick={() => openRecordPurchaseModal(m)}
-                                  className="rounded-lg p-1.5 text-[#8B5A2B] hover:bg-[#EFE6D5] transition"
-                                  title="Catat Pembelian Bahan Ini"
-                                  data-testid={`buy-material-${m.id}`}
-                                >
-                                  <ShoppingCart size={15} />
-                                </button>
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => openRecordPurchaseModal(m)}
+                                    className="rounded-lg p-1.5 text-[#8B5A2B] hover:bg-[#EFE6D5] transition"
+                                    title="Catat Pembelian Bahan Ini"
+                                    data-testid={`buy-material-${m.id}`}
+                                  >
+                                    <ShoppingCart size={15} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openStockFormsModal(m)}
+                                    className="rounded-lg p-1.5 text-purple-700 hover:bg-purple-50 transition"
+                                    title="Kelola Bentuk Stok (Stock Forms)"
+                                    data-testid={`stock-forms-material-${m.id}`}
+                                  >
+                                    <Boxes size={15} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openTransformationModal(m)}
+                                    className="rounded-lg p-1.5 text-amber-700 hover:bg-amber-50 transition"
+                                    title="Transformasi / Potong Bahan Ini"
+                                    data-testid={`transform-material-${m.id}`}
+                                  >
+                                    <Scissors size={15} />
+                                  </button>
+                                </>
                               )}
                               <button
                                 type="button"
@@ -895,15 +1255,35 @@ export default function AdminMaterials() {
                           <td className="px-4 py-3 text-right">
                             <div className="flex items-center justify-end gap-1.5">
                               {!isArchived && (
-                                <button
-                                  type="button"
-                                  onClick={() => openAdjustmentModal(m)}
-                                  className="rounded-lg p-1.5 text-[#8B5A2B] hover:bg-[#EFE6D5] transition"
-                                  title="Penyesuaian Stok"
-                                  data-testid={`adjust-stock-${m.id}`}
-                                >
-                                  <SlidersHorizontal size={15} />
-                                </button>
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => openStockFormsModal(m)}
+                                    className="rounded-lg p-1.5 text-purple-700 hover:bg-purple-50 transition"
+                                    title="Kelola Bentuk Stok"
+                                    data-testid={`stock-forms-tab-stock-${m.id}`}
+                                  >
+                                    <Boxes size={15} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openTransformationModal(m)}
+                                    className="rounded-lg p-1.5 text-amber-700 hover:bg-amber-50 transition"
+                                    title="Transformasi / Potong Bahan"
+                                    data-testid={`transform-tab-stock-${m.id}`}
+                                  >
+                                    <Scissors size={15} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => openAdjustmentModal(m)}
+                                    className="rounded-lg p-1.5 text-[#8B5A2B] hover:bg-[#EFE6D5] transition"
+                                    title="Penyesuaian Stok"
+                                    data-testid={`adjust-stock-${m.id}`}
+                                  >
+                                    <SlidersHorizontal size={15} />
+                                  </button>
+                                </>
                               )}
                               <button
                                 type="button"
@@ -1100,10 +1480,202 @@ export default function AdminMaterials() {
         </>
       )}
 
+      {/* TAB 4: TRANSFORMASI STOK (Phase 5) */}
+      {activeTab === "transformations" && (
+        <>
+          {/* Transformation Filters */}
+          <div className="rounded-2xl border border-[#E5DCC5] bg-white p-4 shadow-sm space-y-3">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="relative flex-1">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#8B7355]" size={16} />
+                <Input
+                  type="text"
+                  placeholder="Cari nomor transformasi (TR-...), nama bahan, alasan, atau nomor pembelian..."
+                  value={transformationSearch}
+                  onChange={(e) => setTransformationSearch(e.target.value)}
+                  className="pl-9 bg-[#F9F6F0] border-[#E5DCC5] text-sm"
+                  data-testid="search-transformation-input"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Select
+                  value={transformationMaterialFilter}
+                  onValueChange={setTransformationMaterialFilter}
+                >
+                  <SelectTrigger className="w-[180px] bg-[#F9F6F0] border-[#E5DCC5] text-xs">
+                    <SelectValue placeholder="Filter Bahan" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Semua Bahan</SelectItem>
+                    {materials.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        {m.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                <div className="flex items-center gap-1.5">
+                  <Input
+                    type="date"
+                    value={transformationStartDate}
+                    onChange={(e) => setTransformationStartDate(e.target.value)}
+                    className="w-[130px] bg-[#F9F6F0] border-[#E5DCC5] text-xs"
+                    title="Tanggal Mulai"
+                  />
+                  <span className="text-xs text-[#8B7355]">s/d</span>
+                  <Input
+                    type="date"
+                    value={transformationEndDate}
+                    onChange={(e) => setTransformationEndDate(e.target.value)}
+                    className="w-[130px] bg-[#F9F6F0] border-[#E5DCC5] text-xs"
+                    title="Tanggal Akhir"
+                  />
+                </div>
+
+                {(transformationSearch || transformationMaterialFilter !== "all" || transformationStartDate || transformationEndDate) && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setTransformationSearch("");
+                      setTransformationMaterialFilter("all");
+                      setTransformationStartDate("");
+                      setTransformationEndDate("");
+                    }}
+                    className="text-xs text-[#8B5A2B] hover:bg-[#FAF7F2]"
+                  >
+                    Reset
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Transformation Table */}
+          <div className="rounded-2xl border border-[#E5DCC5] bg-white overflow-hidden shadow-sm">
+            <div className="px-5 py-4 border-b border-[#E5DCC5] flex items-center justify-between">
+              <div>
+                <h3 className="font-heading font-bold text-[#2C1E16]">
+                  Riwayat Transformasi & Pemotongan Bahan
+                </h3>
+                <p className="text-xs text-[#8B7355] mt-0.5">
+                  Daftar seluruh perubahan bentuk fisik bahan (pemotongan, pembuatan komponen, sisa potongan).
+                </p>
+              </div>
+              <Button
+                type="button"
+                onClick={() => openTransformationModal()}
+                data-testid="create-transformation-btn"
+                className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-white text-xs h-9 px-3 flex items-center gap-1.5"
+              >
+                <Scissors size={14} /> Catat Transformasi
+              </Button>
+            </div>
+
+            {filteredTransformations.length === 0 ? (
+              <div className="p-8 text-center text-[#8B7355] space-y-2">
+                <Scissors className="mx-auto text-[#C8B89E]" size={36} />
+                <p className="font-medium text-sm">Belum ada riwayat transformasi stok</p>
+                <p className="text-xs max-w-sm mx-auto">
+                  Transformasi stok terjadi saat pemotongan lembaran/batang menjadi ukuran komponen tertentu atau saat pre-cut pembelian.
+                </p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm" data-testid="transformations-table">
+                  <thead className="bg-[#F9F6F0] text-xs font-semibold text-[#8B7355] uppercase border-b border-[#E5DCC5]">
+                    <tr>
+                      <th className="px-4 py-3">No. Transformasi</th>
+                      <th className="px-4 py-3">Tanggal</th>
+                      <th className="px-4 py-3">Bahan</th>
+                      <th className="px-4 py-3">Bentuk Asal (Dipotong)</th>
+                      <th className="px-4 py-3">Hasil Bentuk Output</th>
+                      <th className="px-4 py-3">Alasan / Referensi</th>
+                      <th className="px-4 py-3">Operator</th>
+                      <th className="px-4 py-3 text-right">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E5DCC5]">
+                    {filteredTransformations.map((tr) => (
+                      <tr key={tr.id} className="hover:bg-[#FAF8F5] transition" data-testid={`transformation-row-${tr.id}`}>
+                        <td className="px-4 py-3 font-mono font-semibold text-xs text-[#8B5A2B]">
+                          {tr.transformation_number}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-[#5C4A3D]">
+                          {tr.transformation_date}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="font-medium text-[#2C1E16] text-xs">{tr.material_name_snapshot}</div>
+                          <div className="text-[10px] text-[#8B7355] font-mono">{tr.material_specs_snapshot}</div>
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          <span className="font-bold text-red-700">
+                            -{tr.source_quantity} {tr.source_stock_unit || ""}
+                          </span>
+                          <span className="block text-[10px] text-[#8B7355]">
+                            {tr.source_stock_form_id ? "Dari stok form" : "Bentuk asal"}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          <div className="flex flex-wrap gap-1 max-w-xs">
+                            {(tr.output_stock_forms || []).map((out, idx) => (
+                              <Badge
+                                key={idx}
+                                variant="outline"
+                                className={`text-[10px] ${
+                                  out.form_type === "custom"
+                                    ? "bg-purple-50 text-purple-800 border-purple-200"
+                                    : "bg-emerald-50 text-emerald-800 border-emerald-200"
+                                }`}
+                              >
+                                +{out.quantity} {out.stock_unit || "pcs"} ({out.label || `${out.dimensions?.length || ""}x${out.dimensions?.width || ""}`})
+                              </Badge>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-[#5C4A3D]">
+                          {tr.related_purchase_number ? (
+                            <div>
+                              <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 text-[10px]">
+                                Pre-cut {tr.related_purchase_number}
+                              </Badge>
+                              <span className="block text-[10px] text-[#8B7355] mt-0.5">{tr.reason}</span>
+                            </div>
+                          ) : (
+                            <span>{tr.reason || "-"}</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-[#8B7355]">
+                          {tr.created_by_name || "Admin"}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            type="button"
+                            onClick={() => openTransformationDetail(tr)}
+                            className="rounded-lg p-1.5 text-blue-700 hover:bg-blue-50 transition"
+                            title="Lihat Detail Transformasi"
+                            data-testid={`view-transformation-${tr.id}`}
+                          >
+                            <FileText size={15} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
       {/* MODAL: RECORD PURCHASE */}
       {purchaseModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-lg rounded-2xl border border-[#E5DCC5] bg-white p-6 shadow-xl">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl border border-[#E5DCC5] bg-white p-6 shadow-xl">
             <div className="mb-4 flex items-center justify-between border-b border-[#E5DCC5] pb-3">
               <h2 className="font-heading text-lg font-bold text-[#2C1E16] flex items-center gap-2">
                 <ShoppingCart className="text-[#8B5A2B]" size={20} />
@@ -1252,6 +1824,209 @@ export default function AdminMaterials() {
                 </span>
               </div>
 
+              {/* PRE-CUT / STOCK PROCESSING (Phase 5) */}
+              <div className="rounded-xl border border-[#E5DCC5] bg-[#FAF8F5] p-3 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="enable-precut"
+                      checked={purchaseForm.enable_precut || false}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setPurchaseForm({
+                          ...purchaseForm,
+                          enable_precut: checked,
+                          processed_quantity: checked ? (purchaseForm.processed_quantity || purchaseForm.quantity || "") : "",
+                        });
+                      }}
+                      className="rounded border-[#C8B89E] text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
+                      data-testid="purchase-enable-precut"
+                    />
+                    <label htmlFor="enable-precut" className="text-xs font-bold text-[#2C1E16] cursor-pointer flex items-center gap-1.5">
+                      <Scissors size={14} className="text-[#8B5A2B]" />
+                      Potong Langsung / Pre-cut Saat Pembelian
+                    </label>
+                  </div>
+                  {purchaseForm.enable_precut && (
+                    <Badge variant="outline" className="bg-amber-100 text-amber-800 text-[10px]">
+                      Pre-cut Aktif
+                    </Badge>
+                  )}
+                </div>
+
+                {purchaseForm.enable_precut && (
+                  <div className="space-y-3 pt-2 border-t border-[#E5DCC5]">
+                    <div>
+                      <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                        Jumlah Bahan yang Dipotong Langsung <span className="text-red-500">*</span>
+                      </Label>
+                      <Input
+                        type="number"
+                        step="any"
+                        min="0.0001"
+                        max={purchaseForm.quantity || undefined}
+                        placeholder={selectedPurchaseMaterial ? `Maksimal ${purchaseForm.quantity || 0} ${selectedPurchaseMaterial.unit}` : "0"}
+                        value={purchaseForm.processed_quantity || ""}
+                        onChange={(e) => setPurchaseForm({ ...purchaseForm, processed_quantity: e.target.value })}
+                        data-testid="purchase-processed-qty"
+                        className="bg-white"
+                        required={purchaseForm.enable_precut}
+                      />
+                      <span className="mt-1 block text-[10px] text-[#8B7355]">
+                        Sisa raw: <strong className="text-emerald-700">{Math.max(0, Number(purchaseForm.quantity || 0) - Number(purchaseForm.processed_quantity || 0))} {selectedPurchaseMaterial?.unit || ""}</strong> tetap disimpan sebagai lembaran/batang utuh.
+                      </span>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold text-[#5C4A3D]">Hasil Potongan (Output Forms):</span>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setPurchaseForm({
+                              ...purchaseForm,
+                              precut_outputs: [
+                                ...(purchaseForm.precut_outputs || []),
+                                { ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: selectedPurchaseMaterial?.unit || "pcs" }
+                              ]
+                            });
+                          }}
+                          className="h-7 text-xs px-2 text-[#8B5A2B] border-[#8B5A2B]"
+                        >
+                          <Plus size={12} className="mr-1" /> Tambah Ukuran Hasil
+                        </Button>
+                      </div>
+
+                      {(purchaseForm.precut_outputs || []).map((out, idx) => (
+                        <div key={idx} className="rounded-lg border border-[#E5DCC5] bg-white p-2.5 space-y-2 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-[#2C1E16]">Bentuk #{idx + 1}</span>
+                            <div className="flex items-center gap-2">
+                              <select
+                                value={out.form_type || "standard"}
+                                onChange={(e) => {
+                                  const updated = [...purchaseForm.precut_outputs];
+                                  updated[idx].form_type = e.target.value;
+                                  setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                                }}
+                                className="text-[11px] rounded border border-[#E5DCC5] bg-white px-2 py-0.5"
+                              >
+                                <option value="standard">Standard (Komponen)</option>
+                                <option value="custom">Custom (Sisa Potong / Remnant)</option>
+                              </select>
+                              {purchaseForm.precut_outputs.length > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const updated = purchaseForm.precut_outputs.filter((_, i) => i !== idx);
+                                    setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                                  }}
+                                  className="text-red-500 hover:text-red-700"
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            <Input
+                              placeholder="Label (contoh: Rak 80x30)"
+                              value={out.label || ""}
+                              onChange={(e) => {
+                                const updated = [...purchaseForm.precut_outputs];
+                                updated[idx].label = e.target.value;
+                                setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                              }}
+                              className="h-8 text-xs bg-white"
+                            />
+                            <div className="flex items-center gap-1">
+                              <Input
+                                type="number"
+                                step="any"
+                                min="0.0001"
+                                placeholder="Qty"
+                                value={out.quantity || ""}
+                                onChange={(e) => {
+                                  const updated = [...purchaseForm.precut_outputs];
+                                  updated[idx].quantity = e.target.value;
+                                  setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                                }}
+                                className="h-8 text-xs bg-white w-20"
+                                required={purchaseForm.enable_precut}
+                              />
+                              <Input
+                                placeholder="Satuan"
+                                value={out.stock_unit || selectedPurchaseMaterial?.unit || "pcs"}
+                                onChange={(e) => {
+                                  const updated = [...purchaseForm.precut_outputs];
+                                  updated[idx].stock_unit = e.target.value;
+                                  setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                                }}
+                                className="h-8 text-xs bg-white"
+                              />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-4 gap-1">
+                            <Input
+                              type="number"
+                              step="any"
+                              placeholder="P (Panjang)"
+                              value={out.length || ""}
+                              onChange={(e) => {
+                                const updated = [...purchaseForm.precut_outputs];
+                                updated[idx].length = e.target.value;
+                                setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                              }}
+                              className="h-7 text-[11px] bg-white"
+                            />
+                            <Input
+                              type="number"
+                              step="any"
+                              placeholder="L (Lebar)"
+                              value={out.width || ""}
+                              onChange={(e) => {
+                                const updated = [...purchaseForm.precut_outputs];
+                                updated[idx].width = e.target.value;
+                                setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                              }}
+                              className="h-7 text-[11px] bg-white"
+                            />
+                            <Input
+                              type="number"
+                              step="any"
+                              placeholder="T (Tebal)"
+                              value={out.thickness || ""}
+                              onChange={(e) => {
+                                const updated = [...purchaseForm.precut_outputs];
+                                updated[idx].thickness = e.target.value;
+                                setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                              }}
+                              className="h-7 text-[11px] bg-white"
+                            />
+                            <select
+                              value={out.dimension_unit || "cm"}
+                              onChange={(e) => {
+                                const updated = [...purchaseForm.precut_outputs];
+                                updated[idx].dimension_unit = e.target.value;
+                                setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
+                              }}
+                              className="h-7 text-[11px] rounded border border-[#E5DCC5] bg-white px-1"
+                            >
+                              <option value="cm">cm</option>
+                              <option value="mm">mm</option>
+                              <option value="m">m</option>
+                            </select>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div>
                 <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
                   Nama Toko / Supplier (Opsional)
@@ -1330,7 +2105,10 @@ export default function AdminMaterials() {
                 </Label>
                 <Select
                   value={adjustmentForm.material_id}
-                  onValueChange={(val) => setAdjustmentForm({ ...adjustmentForm, material_id: val })}
+                  onValueChange={(val) => {
+                    setAdjustmentForm({ ...adjustmentForm, material_id: val, stock_form_id: "" });
+                    if (val) loadAdjustmentForms(val);
+                  }}
                   required
                 >
                   <SelectTrigger className="bg-white" data-testid="adjustment-form-material">
@@ -1352,6 +2130,33 @@ export default function AdminMaterials() {
                   </div>
                 )}
               </div>
+
+              {selectedAdjustmentMaterial && (
+                <div>
+                  <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                    Pilih Bentuk Stok Fisik (Opsional)
+                  </Label>
+                  <Select
+                    value={adjustmentForm.stock_form_id || "all"}
+                    onValueChange={(val) => setAdjustmentForm({ ...adjustmentForm, stock_form_id: val === "all" ? "" : val })}
+                  >
+                    <SelectTrigger className="bg-white" data-testid="adjustment-form-stock-form">
+                      <SelectValue placeholder="-- Semua / Stok Agregat Bahan --" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">-- Semua / Stok Agregat Bahan --</SelectItem>
+                      {adjustmentStockForms.map((sf) => (
+                        <SelectItem key={sf.id} value={sf.id}>
+                          [{sf.form_type === "raw" ? "Raw" : sf.form_type === "custom" ? "Custom/Sisa" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} — Tersisa: {sf.current_quantity || 0} {sf.stock_unit || selectedAdjustmentMaterial.unit}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <span className="mt-1 block text-[10px] text-[#8B7355]">
+                    Pilih bentuk stok tertentu jika penyesuaian opname dilakukan pada bentuk fisik spesifik.
+                  </span>
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
@@ -1803,6 +2608,688 @@ export default function AdminMaterials() {
                 </Button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+      {/* MODAL: STOCK FORMS (Phase 5) */}
+      {stockFormsModalOpen && selectedStockFormMaterial && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl border border-[#E5DCC5] bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between border-b border-[#E5DCC5] pb-3">
+              <div>
+                <h2 className="font-heading text-lg font-bold text-[#2C1E16] flex items-center gap-2">
+                  <Boxes className="text-purple-700" size={20} />
+                  Bentuk Stok Fisik: {selectedStockFormMaterial.name}
+                </h2>
+                <div className="mt-1 flex items-center gap-2 text-xs text-[#8B7355]">
+                  <span className="font-mono">{selectedStockFormMaterial.specs}</span>
+                  <span>·</span>
+                  <span>Total Agregat: <strong className="text-emerald-700">{selectedStockFormMaterial.current_stock || 0} {selectedStockFormMaterial.unit}</strong></span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStockFormsModalOpen(false)}
+                className="text-[#8B7355] hover:text-[#2C1E16]"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setNewStockFormOpen(!newStockFormOpen)}
+                  className="text-xs text-[#8B5A2B] border-[#8B5A2B]"
+                  data-testid="toggle-add-stock-form-btn"
+                >
+                  <Plus size={14} className="mr-1" />
+                  {newStockFormOpen ? "Batal Tambah Bentuk" : "Tambah Bentuk Stok Baru"}
+                </Button>
+
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => {
+                    setStockFormsModalOpen(false);
+                    openTransformationModal(selectedStockFormMaterial);
+                  }}
+                  className="text-xs bg-[#8B5A2B] hover:bg-[#6B4423] text-white flex items-center gap-1.5"
+                  data-testid="transform-from-stock-forms-btn"
+                >
+                  <Scissors size={13} />
+                  Transformasi Bahan Ini
+                </Button>
+              </div>
+
+              {/* Inline Form to Add Stock Form */}
+              {newStockFormOpen && (
+                <form onSubmit={handleCreateStockForm} className="rounded-xl border border-[#E5DCC5] bg-[#FAF8F5] p-4 space-y-3">
+                  <h4 className="font-semibold text-xs text-[#2C1E16]">Tambah Ukuran / Bentuk Stok Baru</h4>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <Label className="mb-1 block text-[11px] font-semibold text-[#5C4A3D]">Tipe Bentuk</Label>
+                      <select
+                        value={newStockForm.form_type}
+                        onChange={(e) => setNewStockForm({ ...newStockForm, form_type: e.target.value })}
+                        className="w-full text-xs rounded border border-[#E5DCC5] bg-white px-2 py-1.5"
+                      >
+                        <option value="standard">Standard (Ukuran Standar Komponen)</option>
+                        <option value="custom">Custom (Sisa Potong / Remnant)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <Label className="mb-1 block text-[11px] font-semibold text-[#5C4A3D]">Label / Nama Ukuran</Label>
+                      <Input
+                        placeholder="Contoh: Rak 80x30, Sisa 42x244"
+                        value={newStockForm.label}
+                        onChange={(e) => setNewStockForm({ ...newStockForm, label: e.target.value })}
+                        className="h-8 text-xs bg-white"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-2">
+                    <div>
+                      <Label className="mb-1 block text-[11px] font-semibold text-[#5C4A3D]">Panjang</Label>
+                      <Input
+                        type="number"
+                        step="any"
+                        placeholder="P"
+                        value={newStockForm.length}
+                        onChange={(e) => setNewStockForm({ ...newStockForm, length: e.target.value })}
+                        className="h-8 text-xs bg-white"
+                      />
+                    </div>
+                    <div>
+                      <Label className="mb-1 block text-[11px] font-semibold text-[#5C4A3D]">Lebar</Label>
+                      <Input
+                        type="number"
+                        step="any"
+                        placeholder="L"
+                        value={newStockForm.width}
+                        onChange={(e) => setNewStockForm({ ...newStockForm, width: e.target.value })}
+                        className="h-8 text-xs bg-white"
+                      />
+                    </div>
+                    <div>
+                      <Label className="mb-1 block text-[11px] font-semibold text-[#5C4A3D]">Tebal</Label>
+                      <Input
+                        type="number"
+                        step="any"
+                        placeholder="T"
+                        value={newStockForm.thickness}
+                        onChange={(e) => setNewStockForm({ ...newStockForm, thickness: e.target.value })}
+                        className="h-8 text-xs bg-white"
+                      />
+                    </div>
+                    <div>
+                      <Label className="mb-1 block text-[11px] font-semibold text-[#5C4A3D]">Satuan Ukuran</Label>
+                      <select
+                        value={newStockForm.dimension_unit}
+                        onChange={(e) => setNewStockForm({ ...newStockForm, dimension_unit: e.target.value })}
+                        className="w-full h-8 text-xs rounded border border-[#E5DCC5] bg-white px-2"
+                      >
+                        <option value="cm">cm</option>
+                        <option value="mm">mm</option>
+                        <option value="m">m</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setNewStockFormOpen(false)}
+                      className="text-xs"
+                    >
+                      Batal
+                    </Button>
+                    <Button
+                      type="submit"
+                      disabled={submittingStockForm}
+                      size="sm"
+                      className="text-xs bg-[#8B5A2B] hover:bg-[#6B4423] text-white"
+                    >
+                      {submittingStockForm ? "Menyimpan..." : "Simpan Bentuk Stok"}
+                    </Button>
+                  </div>
+                </form>
+              )}
+
+              {/* Stock Forms Table */}
+              {loadingStockForms ? (
+                <div className="py-6 text-center text-xs text-[#8B7355]">Memuat bentuk stok...</div>
+              ) : stockFormsList.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-[#E5DCC5] p-6 text-center text-xs text-[#8B7355]">
+                  Belum ada catatan bentuk fisik untuk bahan ini. Bentuk stok akan otomatis tercatat saat pembelian atau transformasi.
+                </div>
+              ) : (
+                <div className="rounded-xl border border-[#E5DCC5] overflow-hidden">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-[#F9F6F0] font-semibold text-[#8B7355] border-b border-[#E5DCC5]">
+                      <tr>
+                        <th className="px-3 py-2">Tipe</th>
+                        <th className="px-3 py-2">Label</th>
+                        <th className="px-3 py-2">Dimensi (P × L × T)</th>
+                        <th className="px-3 py-2 text-right">Stok Fisik Tersedia</th>
+                        <th className="px-3 py-2">Catatan</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#E5DCC5]">
+                      {stockFormsList.map((sf) => (
+                        <tr key={sf.id} className="hover:bg-[#FAF8F5]">
+                          <td className="px-3 py-2.5">
+                            <Badge
+                              variant="outline"
+                              className={`text-[10px] ${
+                                sf.form_type === "raw"
+                                  ? "bg-blue-50 text-blue-800 border-blue-200"
+                                  : sf.form_type === "custom"
+                                  ? "bg-purple-50 text-purple-800 border-purple-200"
+                                  : "bg-emerald-50 text-emerald-800 border-emerald-200"
+                              }`}
+                            >
+                              {sf.form_type === "raw" ? "Raw / Utuh" : sf.form_type === "custom" ? "Custom (Sisa)" : "Standard"}
+                            </Badge>
+                          </td>
+                          <td className="px-3 py-2.5 font-medium text-[#2C1E16]">
+                            {sf.label || "-"}
+                          </td>
+                          <td className="px-3 py-2.5 font-mono text-[#5C4A3D]">
+                            {sf.length || sf.width ? (
+                              <span>
+                                {sf.length || "-"} × {sf.width || "-"}
+                                {sf.thickness ? ` × ${sf.thickness}` : ""} {sf.dimension_unit || "cm"}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400 italic">Bentuk standar asal</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2.5 text-right font-bold text-emerald-800">
+                            {sf.current_quantity || 0} {sf.stock_unit || selectedStockFormMaterial.unit}
+                          </td>
+                          <td className="px-3 py-2.5 text-[#8B7355]">
+                            {sf.notes || "-"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-5 flex justify-end border-t border-[#E5DCC5] pt-3">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setStockFormsModalOpen(false)}
+                className="rounded-xl border-[#E5DCC5]"
+              >
+                Tutup
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CREATE TRANSFORMATION (Phase 5) */}
+      {transformationModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl border border-[#E5DCC5] bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between border-b border-[#E5DCC5] pb-3">
+              <div>
+                <h2 className="font-heading text-lg font-bold text-[#2C1E16] flex items-center gap-2">
+                  <Scissors className="text-[#8B5A2B]" size={20} />
+                  Catat Transformasi / Pemotongan Stok
+                </h2>
+                <p className="text-xs text-[#8B7355] mt-0.5">
+                  Potong stok bentuk asal (lembaran/batang) menjadi ukuran komponen baru atau sisa potongan.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTransformationModalOpen(false)}
+                disabled={submittingTransformation}
+                className="text-[#8B7355] hover:text-[#2C1E16]"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <form onSubmit={handleTransformationSubmit} className="space-y-4">
+              {/* Material Selection */}
+              <div>
+                <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                  Pilih Bahan <span className="text-red-500">*</span>
+                </Label>
+                <Select
+                  value={transformationForm.material_id}
+                  onValueChange={(val) => {
+                    setTransformationForm({
+                      ...transformationForm,
+                      material_id: val,
+                      source_stock_form_id: "",
+                      outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: materials.find(m => m.id === val)?.unit || "pcs" }]
+                    });
+                    if (val) loadSourceForms(val);
+                  }}
+                  required
+                >
+                  <SelectTrigger className="bg-white" data-testid="transformation-form-material">
+                    <SelectValue placeholder="-- Pilih Bahan --" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {materials
+                      .filter((m) => m.status !== "archived")
+                      .map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          {m.name} — {m.specs} ({m.unit})
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+                {selectedTransformationMaterial && (
+                  <div className="mt-1 text-xs text-[#8B7355]">
+                    Total Stok Bahan: <strong className="text-emerald-700">{selectedTransformationMaterial.current_stock || 0} {selectedTransformationMaterial.unit}</strong>
+                  </div>
+                )}
+              </div>
+
+              {/* Source Stock Form & Quantity */}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                    Bentuk Stok Asal yang Dipotong <span className="text-red-500">*</span>
+                  </Label>
+                  {loadingSourceForms ? (
+                    <div className="text-xs text-[#8B7355] py-2">Memuat bentuk stok...</div>
+                  ) : (
+                    <Select
+                      value={transformationForm.source_stock_form_id}
+                      onValueChange={(val) => setTransformationForm({ ...transformationForm, source_stock_form_id: val })}
+                      required
+                    >
+                      <SelectTrigger className="bg-white" data-testid="transformation-source-sf">
+                        <SelectValue placeholder="-- Pilih Bentuk Asal --" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {availableSourceForms.map((sf) => (
+                          <SelectItem key={sf.id} value={sf.id}>
+                            [{sf.form_type === "raw" ? "Raw/Utuh" : sf.form_type === "custom" ? "Custom" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} (Stok: {sf.current_quantity || 0} {sf.stock_unit})
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                  {selectedSourceStockForm && (
+                    <span className="mt-1 block text-[10px] text-[#8B7355]">
+                      Stok bentuk ini: <strong className="text-emerald-700">{selectedSourceStockForm.current_quantity || 0} {selectedSourceStockForm.stock_unit}</strong>
+                    </span>
+                  )}
+                </div>
+
+                <div>
+                  <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                    Jumlah Asal yang Dipotong <span className="text-red-500">*</span>
+                  </Label>
+                  <Input
+                    type="number"
+                    step="any"
+                    min="0.0001"
+                    placeholder="Contoh: 1, 2, 5"
+                    value={transformationForm.source_quantity}
+                    onChange={(e) => setTransformationForm({ ...transformationForm, source_quantity: e.target.value })}
+                    required
+                    data-testid="transformation-source-qty"
+                    className="bg-white"
+                  />
+                  {selectedSourceStockForm && transformationForm.source_quantity && (
+                    <span className="mt-1 block text-[10px] text-[#8B7355]">
+                      Sisa setelah potong: <strong>{Math.max(0, Number(selectedSourceStockForm.current_quantity || 0) - Number(transformationForm.source_quantity || 0))} {selectedSourceStockForm.stock_unit}</strong>
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Transformation Date */}
+              <div>
+                <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                  Tanggal Transformasi / Pemotongan <span className="text-red-500">*</span>
+                </Label>
+                <Input
+                  type="date"
+                  value={transformationForm.transformation_date}
+                  onChange={(e) => setTransformationForm({ ...transformationForm, transformation_date: e.target.value })}
+                  required
+                  data-testid="transformation-date"
+                  className="bg-white"
+                />
+              </div>
+
+              {/* Output Stock Forms Builder */}
+              <div className="rounded-xl border border-[#E5DCC5] bg-[#FAF8F5] p-3 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="font-semibold text-xs text-[#2C1E16]">Bentuk Hasil Potongan (Outputs)</h4>
+                    <span className="text-[10px] text-[#8B7355]">Tentukan satu atau lebih ukuran hasil potong (termasuk sisa jika ada).</span>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setTransformationForm({
+                        ...transformationForm,
+                        outputs: [
+                          ...(transformationForm.outputs || []),
+                          { ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: selectedTransformationMaterial?.unit || "pcs" }
+                        ]
+                      });
+                    }}
+                    className="h-7 text-xs px-2 text-[#8B5A2B] border-[#8B5A2B]"
+                  >
+                    <Plus size={12} className="mr-1" /> Tambah Ukuran Hasil
+                  </Button>
+                </div>
+
+                <div className="space-y-2">
+                  {(transformationForm.outputs || []).map((out, idx) => (
+                    <div key={idx} className="rounded-lg border border-[#E5DCC5] bg-white p-2.5 space-y-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-[#2C1E16]">Bentuk Hasil #{idx + 1}</span>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={out.form_type || "standard"}
+                            onChange={(e) => {
+                              const updated = [...transformationForm.outputs];
+                              updated[idx].form_type = e.target.value;
+                              setTransformationForm({ ...transformationForm, outputs: updated });
+                            }}
+                            className="text-[11px] rounded border border-[#E5DCC5] bg-white px-2 py-0.5"
+                          >
+                            <option value="standard">Standard (Komponen)</option>
+                            <option value="custom">Custom (Sisa Potong / Remnant)</option>
+                          </select>
+                          {transformationForm.outputs.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const updated = transformationForm.outputs.filter((_, i) => i !== idx);
+                                setTransformationForm({ ...transformationForm, outputs: updated });
+                              }}
+                              className="text-red-500 hover:text-red-700"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <Input
+                          placeholder="Label (contoh: Rak 80x30, Sisa 42x244)"
+                          value={out.label || ""}
+                          onChange={(e) => {
+                            const updated = [...transformationForm.outputs];
+                            updated[idx].label = e.target.value;
+                            setTransformationForm({ ...transformationForm, outputs: updated });
+                          }}
+                          className="h-8 text-xs bg-white"
+                        />
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            step="any"
+                            min="0.0001"
+                            placeholder="Qty"
+                            value={out.quantity || ""}
+                            onChange={(e) => {
+                              const updated = [...transformationForm.outputs];
+                              updated[idx].quantity = e.target.value;
+                              setTransformationForm({ ...transformationForm, outputs: updated });
+                            }}
+                            className="h-8 text-xs bg-white w-20"
+                            required
+                          />
+                          <Input
+                            placeholder="Satuan"
+                            value={out.stock_unit || selectedTransformationMaterial?.unit || "pcs"}
+                            onChange={(e) => {
+                              const updated = [...transformationForm.outputs];
+                              updated[idx].stock_unit = e.target.value;
+                              setTransformationForm({ ...transformationForm, outputs: updated });
+                            }}
+                            className="h-8 text-xs bg-white"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-4 gap-1">
+                        <Input
+                          type="number"
+                          step="any"
+                          placeholder="P (Panjang)"
+                          value={out.length || ""}
+                          onChange={(e) => {
+                            const updated = [...transformationForm.outputs];
+                            updated[idx].length = e.target.value;
+                            setTransformationForm({ ...transformationForm, outputs: updated });
+                          }}
+                          className="h-7 text-[11px] bg-white"
+                        />
+                        <Input
+                          type="number"
+                          step="any"
+                          placeholder="L (Lebar)"
+                          value={out.width || ""}
+                          onChange={(e) => {
+                            const updated = [...transformationForm.outputs];
+                            updated[idx].width = e.target.value;
+                            setTransformationForm({ ...transformationForm, outputs: updated });
+                          }}
+                          className="h-7 text-[11px] bg-white"
+                        />
+                        <Input
+                          type="number"
+                          step="any"
+                          placeholder="T (Tebal)"
+                          value={out.thickness || ""}
+                          onChange={(e) => {
+                            const updated = [...transformationForm.outputs];
+                            updated[idx].thickness = e.target.value;
+                            setTransformationForm({ ...transformationForm, outputs: updated });
+                          }}
+                          className="h-7 text-[11px] bg-white"
+                        />
+                        <select
+                          value={out.dimension_unit || "cm"}
+                          onChange={(e) => {
+                            const updated = [...transformationForm.outputs];
+                            updated[idx].dimension_unit = e.target.value;
+                            setTransformationForm({ ...transformationForm, outputs: updated });
+                          }}
+                          className="h-7 text-[11px] rounded border border-[#E5DCC5] bg-white px-1"
+                        >
+                          <option value="cm">cm</option>
+                          <option value="mm">mm</option>
+                          <option value="m">m</option>
+                        </select>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Notes */}
+              <div>
+                <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                  Alasan / Catatan Pemotongan
+                </Label>
+                <Textarea
+                  placeholder="Contoh: Pemotongan untuk pesanan lemari #ORD-..., persiapan komponen rak..."
+                  value={transformationForm.notes}
+                  onChange={(e) => setTransformationForm({ ...transformationForm, notes: e.target.value })}
+                  rows={2}
+                  className="bg-white text-xs"
+                />
+              </div>
+
+              <div className="mt-6 flex items-center justify-end gap-2 border-t border-[#E5DCC5] pt-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setTransformationModalOpen(false)}
+                  disabled={submittingTransformation}
+                  className="rounded-xl border-[#E5DCC5]"
+                >
+                  Batal
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={submittingTransformation}
+                  data-testid="submit-transformation-btn"
+                  className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-white"
+                >
+                  {submittingTransformation ? "Menyimpan..." : "Simpan Transformasi Stok"}
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: TRANSFORMATION DETAIL (Phase 5) */}
+      {transformationDetailModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-lg rounded-2xl border border-[#E5DCC5] bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between border-b border-[#E5DCC5] pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="bg-amber-100 text-amber-800 font-mono text-xs">
+                    {selectedTransformationDetail?.transformation_number}
+                  </Badge>
+                  <span className="text-xs text-[#8B7355]">
+                    {selectedTransformationDetail?.transformation_date}
+                  </span>
+                </div>
+                <h3 className="font-heading text-base font-bold text-[#2C1E16] mt-1">
+                  Detail Transformasi / Pemotongan Bahan
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTransformationDetailModalOpen(false)}
+                className="text-[#8B7355] hover:text-[#2C1E16]"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {loadingTransformationDetail ? (
+              <div className="py-6 text-center text-xs text-[#8B7355]">Memuat detail transformasi...</div>
+            ) : selectedTransformationDetail ? (
+              <div className="space-y-4 text-xs">
+                {/* Material Info */}
+                <div className="rounded-xl border border-[#E5DCC5] bg-[#FAF8F5] p-3 space-y-1.5">
+                  <div className="text-[11px] text-[#8B7355] uppercase font-semibold">Bahan yang Ditransformasi</div>
+                  <div className="font-bold text-sm text-[#2C1E16]">
+                    {selectedTransformationDetail.material_name_snapshot}
+                  </div>
+                  <div className="font-mono text-[11px] text-[#5C4A3D]">
+                    {selectedTransformationDetail.material_specs_snapshot}
+                  </div>
+                  {selectedTransformationDetail.related_purchase_number && (
+                    <div className="pt-1">
+                      <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 text-[10px]">
+                        Pre-cut Pembelian: {selectedTransformationDetail.related_purchase_number}
+                      </Badge>
+                    </div>
+                  )}
+                </div>
+
+                {/* Source Form Deduction */}
+                <div className="rounded-xl border border-red-200 bg-red-50/50 p-3 flex items-center justify-between">
+                  <div>
+                    <span className="block text-[11px] font-semibold text-red-800">Bahan Asal yang Terpotong / Keluar</span>
+                    <span className="text-[11px] text-red-600">Dikurangkan dari bentuk stok asal</span>
+                  </div>
+                  <span className="font-bold text-base text-red-700 font-mono">
+                    -{selectedTransformationDetail.source_quantity} {selectedTransformationDetail.source_stock_unit || ""}
+                  </span>
+                </div>
+
+                {/* Output Forms */}
+                <div>
+                  <span className="block text-xs font-semibold text-[#5C4A3D] mb-1.5">
+                    Hasil Bentuk Output yang Dihasilkan:
+                  </span>
+                  <div className="space-y-1.5">
+                    {(selectedTransformationDetail.output_stock_forms || []).map((out, idx) => (
+                      <div key={idx} className="rounded-lg border border-[#E5DCC5] p-2.5 flex items-center justify-between bg-white">
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <Badge
+                              variant="outline"
+                              className={`text-[9px] ${
+                                out.form_type === "custom"
+                                  ? "bg-purple-50 text-purple-800 border-purple-200"
+                                  : "bg-emerald-50 text-emerald-800 border-emerald-200"
+                              }`}
+                            >
+                              {out.form_type === "custom" ? "Custom (Sisa)" : "Standard"}
+                            </Badge>
+                            <span className="font-semibold text-xs text-[#2C1E16]">
+                              {out.label || "Komponen"}
+                            </span>
+                          </div>
+                          {out.dimensions && (out.dimensions.width || out.dimensions.length) && (
+                            <span className="text-[10px] text-[#8B7355] font-mono mt-0.5 block">
+                              Dimensi: {out.dimensions.length || "-"} × {out.dimensions.width || "-"}
+                              {out.dimensions.thickness ? ` × ${out.dimensions.thickness}` : ""} {out.dimensions.unit || "cm"}
+                            </span>
+                          )}
+                        </div>
+                        <span className="font-bold text-sm text-emerald-700 font-mono">
+                          +{out.quantity} {out.stock_unit || "pcs"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Reason & Operator */}
+                <div className="rounded-xl border border-[#E5DCC5] bg-white p-3 space-y-1">
+                  <div className="text-[11px] text-[#8B7355]">Alasan / Catatan:</div>
+                  <div className="font-medium text-[#2C1E16]">{selectedTransformationDetail.reason || "-"}</div>
+                  {selectedTransformationDetail.notes && (
+                    <div className="text-[11px] text-[#8B7355] italic pt-1">{selectedTransformationDetail.notes}</div>
+                  )}
+                  <div className="text-[10px] text-[#8B7355] pt-1 border-t border-[#E5DCC5] mt-2">
+                    Dibuat oleh: {selectedTransformationDetail.created_by_name || "Admin"} · {selectedTransformationDetail.created_at?.slice(0, 19).replace("T", " ")}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="mt-5 flex justify-end border-t border-[#E5DCC5] pt-3">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setTransformationDetailModalOpen(false)}
+                className="rounded-xl border-[#E5DCC5]"
+              >
+                Tutup
+              </Button>
+            </div>
           </div>
         </div>
       )}
