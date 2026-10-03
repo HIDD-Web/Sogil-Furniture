@@ -832,6 +832,71 @@ class TestInvoiceV2HardenedBackend(unittest.TestCase):
         mock_db.finance_transactions.insert_one.assert_not_called()
         mock_db.finance_transactions.update_one.assert_not_called()
 
+    # -------------------------------------------------------------
+    # 12. LIVE CLAIMED INVOICE UPDATES VISIBLE TO CUSTOMER
+    # -------------------------------------------------------------
+    @patch("server.db")
+    def test_23_claimed_invoice_edit_visible_to_customer(self, mock_db):
+        """Customer viewing claimed invoice sees updated items and total after admin edit."""
+        inv_id = str(ObjectId())
+        claimed_inv = {
+            "_id": ObjectId(inv_id),
+            "invoice_number": "INV-2026-0088",
+            "status": "CLAIMED",
+            "claim": {
+                "claimed_by_customer_id": str(self.customer_oid),
+                "claimed_at": "2026-09-30T10:00:00Z"
+            },
+            "customer": {
+                "name": "Ahmad Customer",
+                "whatsapp": "+201234567890"
+            },
+            "items": [
+                {
+                    "item_id": "it_1",
+                    "item_type": "custom",
+                    "name": "Meja Belajar",
+                    "quantity": 1,
+                    "unit_price": 1000.0,
+                    "line_total": 1000.0,
+                    "finishing": "Natural"
+                }
+            ],
+            "subtotal": 1000.0,
+            "total": 1000.0
+        }
+
+        # Customer fetches before edit
+        mock_db.invoices.find_one = AsyncMock(return_value=claimed_inv)
+        res1 = asyncio.run(server.customer_get_invoice(inv_id, c=self.customer_user))
+        self.assertEqual(res1["total"], 1000.0)
+        self.assertEqual(res1["items"][0]["finishing"], "Natural")
+
+        # After admin edits the invoice to add finishing and adjust total
+        edited_inv = {
+            **claimed_inv,
+            "items": [
+                {
+                    "item_id": "it_1",
+                    "item_type": "custom",
+                    "name": "Meja Belajar",
+                    "quantity": 1,
+                    "unit_price": 1350.0,
+                    "line_total": 1350.0,
+                    "finishing": "Duco Putih Glossy"
+                }
+            ],
+            "subtotal": 1350.0,
+            "total": 1350.0
+        }
+        mock_db.invoices.find_one = AsyncMock(return_value=edited_inv)
+
+        # Customer fetches again with same claim
+        res2 = asyncio.run(server.customer_get_invoice(inv_id, c=self.customer_user))
+        self.assertEqual(res2["total"], 1350.0)
+        self.assertEqual(res2["items"][0]["finishing"], "Duco Putih Glossy")
+        self.assertEqual(res2["claim"]["claimed_by_customer_id"], str(self.customer_oid))
+
 
 if __name__ == "__main__":
     unittest.main()

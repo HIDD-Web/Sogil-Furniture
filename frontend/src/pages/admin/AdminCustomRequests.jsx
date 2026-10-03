@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import api from "../../lib/api";
+import api, { imgUrl } from "../../lib/api";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
@@ -597,17 +597,20 @@ export default function AdminCustomRequests() {
                     Foto Referensi Customer ({selectedReq.reference_photos.length}):
                   </span>
                   <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-4">
-                    {selectedReq.reference_photos.map((p, idx) => (
-                      <a key={idx} href={p} target="_blank" rel="noreferrer" className="block group">
-                        <div className="relative aspect-square overflow-hidden rounded-xl border border-[#E5DCC5] bg-[#FBF9F4]">
-                          <img
-                            src={p}
-                            alt="Referensi"
-                            className="h-full w-full object-cover group-hover:scale-105 transition-transform"
-                          />
-                        </div>
-                      </a>
-                    ))}
+                    {selectedReq.reference_photos.map((p, idx) => {
+                      const fullUrl = imgUrl(p);
+                      return (
+                        <a key={idx} href={fullUrl} target="_blank" rel="noreferrer" className="block group">
+                          <div className="relative aspect-square overflow-hidden rounded-xl border border-[#E5DCC5] bg-[#FBF9F4]">
+                            <img
+                              src={fullUrl}
+                              alt="Referensi"
+                              className="h-full w-full object-cover group-hover:scale-105 transition-transform"
+                            />
+                          </div>
+                        </a>
+                      );
+                    })}
                   </div>
                 </div>
               )}

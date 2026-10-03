@@ -185,9 +185,11 @@ export default function AdminMaterials() {
     try {
       setLoading(true);
       const res = await api.get("/admin/materials");
-      setMaterials(res.data || []);
-    } catch {
-      toast.error("Gagal memuat data bahan");
+      setMaterials(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") return;
+      console.error("Error loading materials:", err);
+      toast.error(formatApiError(err?.response?.data?.detail) || "Gagal memuat data bahan");
     } finally {
       setLoading(false);
     }
@@ -196,27 +198,33 @@ export default function AdminMaterials() {
   const loadPurchases = async () => {
     try {
       const res = await api.get("/admin/materials/purchases");
-      setPurchases(res.data || []);
-    } catch {
-      toast.error("Gagal memuat riwayat pembelian");
+      setPurchases(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") return;
+      console.error("Error loading purchases:", err);
+      toast.error(formatApiError(err?.response?.data?.detail) || "Gagal memuat riwayat pembelian");
     }
   };
 
   const loadStockSummary = async () => {
     try {
       const res = await api.get("/admin/materials/stock");
-      setStockSummary(res.data || []);
-    } catch {
-      toast.error("Gagal memuat ringkasan stok");
+      setStockSummary(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") return;
+      console.error("Error loading stock summary:", err);
+      toast.error(formatApiError(err?.response?.data?.detail) || "Gagal memuat ringkasan stok");
     }
   };
 
   const loadTransformations = async () => {
     try {
       const res = await api.get("/admin/materials/stock-transformations");
-      setTransformations(res.data || []);
-    } catch {
-      toast.error("Gagal memuat riwayat transformasi stok");
+      setTransformations(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") return;
+      console.error("Error loading stock transformations:", err);
+      toast.error(formatApiError(err?.response?.data?.detail) || "Gagal memuat riwayat transformasi stok");
     }
   };
 

@@ -2688,13 +2688,10 @@ async def admin_update_invoice(invoice_id: str, data: InvoiceUpdateInput, admin:
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice tidak ditemukan.")
 
-    if inv.get("status") == "CONVERTED":
+    if inv.get("status") == "CONVERTED" or inv.get("order_id"):
         raise HTTPException(status_code=400, detail="Invoice yang sudah dikonversi menjadi pesanan tidak dapat diubah.")
     if inv.get("status") == "CANCELLED":
         raise HTTPException(status_code=400, detail="Invoice yang sudah dibatalkan tidak dapat diubah.")
-    if inv.get("status") == "CLAIMED":
-        if data.items is not None or data.discount_amount is not None or data.delivery_fee is not None or data.additional_fee is not None or data.customer is not None:
-            raise HTTPException(status_code=400, detail="Invoice yang sudah diklaim oleh pelanggan tidak dapat diubah rincian produk, harga, atau pemiliknya.")
 
     now = datetime.now(timezone.utc).isoformat()
     upd = {

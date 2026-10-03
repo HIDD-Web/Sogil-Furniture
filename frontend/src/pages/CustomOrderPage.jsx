@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChevronLeft, Upload, X, MessageCircle, Sparkles, CheckCircle2, Image as ImageIcon } from "lucide-react";
-import api from "../lib/api";
+import api, { imgUrl } from "../lib/api";
 import { normalizeEgyptPhone, validEgyptPhone } from "../lib/photoMatch";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -286,7 +286,7 @@ export default function CustomOrderPage() {
                       className="group relative h-24 w-24 overflow-hidden rounded-xl border border-[#E5DCC5] bg-[#FBF9F4]"
                     >
                       <img
-                        src={url}
+                        src={imgUrl(url)}
                         alt="Referensi"
                         className="h-full w-full object-cover"
                       />

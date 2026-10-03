@@ -309,6 +309,14 @@ export default function AdminInvoiceDetail() {
               <Button
                 variant="outline"
                 size="sm"
+                onClick={() => navigate(`/admin/invoices/${id}/edit`)}
+                className="rounded-xl border-[#E5DCC5] text-xs font-semibold text-[#5C4A3D]"
+              >
+                <Pencil size={14} className="mr-1.5" /> Edit
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
                 disabled={claimCodeLoading}
                 onClick={handleGenerateClaimCode}
                 className="rounded-xl border-[#8B5A2B] text-xs font-semibold text-[#8B5A2B] hover:bg-[#FAF5EE]"

@@ -24,6 +24,7 @@ import server
 from fastapi import HTTPException
 from pymongo import ReturnDocument
 import pymongo
+from bson import ObjectId
 
 
 class TestInvoiceManagementBackend(unittest.TestCase):
@@ -498,6 +499,107 @@ class TestInvoiceManagementBackend(unittest.TestCase):
             res = asyncio.run(server.admin_get_invoice_print_data("inv_print_1", admin=self.admin_user))
             self.assertEqual(res["invoice"]["customer_note"], "Customer note for PDF")
             self.assertNotIn("internal_note", res["invoice"])
+
+    # -------------------------------------------------------------
+    # H. CLAIMED INVOICE EDITABILITY & CONVERSION LOCK
+    # -------------------------------------------------------------
+    @patch("server.db")
+    def test_17_claimed_invoice_remains_editable(self, mock_db):
+        """A claimed but not converted invoice remains editable by admin."""
+        inv_id = str(ObjectId())
+        claimed_inv = {
+            "_id": ObjectId(inv_id),
+            "invoice_number": "INV-2026-0099",
+            "status": "CLAIMED",
+            "order_id": None,
+            "claim": {
+                "claimed_by_customer_id": "cust_123",
+                "claimed_at": "2026-10-01T10:00:00Z"
+            },
+            "customer": {
+                "name": "Customer Claimed",
+                "whatsapp": "+201551685018",
+                "customer_id": "cust_123"
+            },
+            "items": [
+                {
+                    "item_id": "it_1",
+                    "item_type": "custom",
+                    "name": "Rak Buku",
+                    "quantity": 1,
+                    "unit_price": 1875.0,
+                    "line_total": 1875.0,
+                    "finishing": "-"
+                }
+            ],
+            "subtotal": 1875.0,
+            "discount_amount": 0.0,
+            "delivery_fee": 0.0,
+            "additional_fee": 0.0,
+            "total": 1875.0
+        }
+
+        updated_inv = {
+            **claimed_inv,
+            "items": [
+                {
+                    "item_id": "it_1",
+                    "item_type": "custom",
+                    "name": "Rak Buku",
+                    "quantity": 1,
+                    "unit_price": 2200.0,
+                    "line_total": 2200.0,
+                    "finishing": "Duco Putih"
+                }
+            ],
+            "subtotal": 2200.0,
+            "total": 2200.0
+        }
+
+        mock_db.invoices.find_one = AsyncMock(side_effect=[claimed_inv, updated_inv])
+        mock_db.invoices.update_one = AsyncMock(return_value=None)
+
+        update_payload = server.InvoiceUpdateInput(
+            items=[
+                server.InvoiceItemInput(
+                    name="Rak Buku",
+                    quantity=1,
+                    unit_price=2200.0,
+                    finishing="Duco Putih"
+                )
+            ]
+        )
+
+        res = asyncio.run(server.admin_update_invoice(inv_id, update_payload, admin=self.admin_user))
+        self.assertEqual(res["status"], "CLAIMED")
+        self.assertEqual(res["total"], 2200.0)
+        self.assertEqual(res["items"][0]["finishing"], "Duco Putih")
+        # Ensure customer claim data is preserved intact
+        self.assertEqual(res["claim"]["claimed_by_customer_id"], "cust_123")
+        mock_db.invoices.update_one.assert_called_once()
+
+    @patch("server.db")
+    def test_18_converted_invoice_locked_from_editing(self, mock_db):
+        """Invoice converted into an Order is strictly locked from editing."""
+        inv_id = str(ObjectId())
+        converted_inv = {
+            "_id": ObjectId(inv_id),
+            "invoice_number": "INV-2026-0100",
+            "status": "CONVERTED",
+            "order_id": "ord_999",
+            "items": [{"name": "Rak", "quantity": 1, "unit_price": 500, "line_total": 500}],
+            "total": 500
+        }
+        mock_db.invoices.find_one = AsyncMock(return_value=converted_inv)
+
+        update_payload = server.InvoiceUpdateInput(
+            items=[server.InvoiceItemInput(name="Rak Baru", quantity=1, unit_price=600)]
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(server.admin_update_invoice(inv_id, update_payload, admin=self.admin_user))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("sudah dikonversi", ctx.exception.detail)
 
 
 if __name__ == "__main__":

@@ -91,8 +91,8 @@ export default function AdminInvoiceForm() {
     api.get(`/admin/invoices/${id}`)
       .then((r) => {
         const inv = r.data;
-        if (inv.status === "CONVERTED" || inv.status === "CANCELLED" || inv.status === "CLAIMED") {
-          toast.error(inv.status === "CLAIMED" ? "Invoice sudah diklaim pelanggan dan terkunci dari perubahan." : "Invoice dengan status ini tidak dapat diubah.");
+        if (inv.status === "CONVERTED" || inv.status === "CANCELLED") {
+          toast.error("Invoice dengan status ini tidak dapat diubah.");
           navigate(`/admin/invoices/${id}`);
           return;
         }

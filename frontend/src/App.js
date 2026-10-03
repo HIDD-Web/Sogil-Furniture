@@ -76,24 +76,29 @@ function CustomerShell({ children }) {
 
 function Layout() {
   const location = useLocation();
+  const searchParams = new URLSearchParams(location.search);
   const isTeamHost = window.location.hostname === "team.sogilfurniture.com";
-  const isAdmin = isTeamHost || location.pathname.startsWith("/admin");
+  const isPwaAdmin = searchParams.get("pwa") === "admin" || window.location.search.indexOf("pwa=admin") !== -1;
+  const isAdmin = isTeamHost || isPwaAdmin || location.pathname.startsWith("/admin");
 
   useEffect(() => {
     const link = document.getElementById("manifest-link");
     const themeMeta = document.getElementById("theme-color-meta") || document.querySelector('meta[name="theme-color"]');
     const appleIcon = document.getElementById("apple-icon-link") || document.querySelector('link[rel="apple-touch-icon"]');
+    const favicon = document.getElementById("favicon-link") || document.querySelector('link[rel="icon"]');
     const appleTitle = document.getElementById("apple-title-meta") || document.querySelector('meta[name="apple-mobile-web-app-title"]');
 
     if (isAdmin) {
       if (link) link.setAttribute("href", "/manifest-admin.json");
       if (themeMeta) themeMeta.setAttribute("content", "#2C1E16");
       if (appleIcon) appleIcon.setAttribute("href", "/icons/apple-touch-icon-admin.png");
+      if (favicon) favicon.setAttribute("href", "/icons/icon-admin-192.png");
       if (appleTitle) appleTitle.setAttribute("content", "Sogil Team");
     } else {
       if (link) link.setAttribute("href", "/manifest.json");
       if (themeMeta) themeMeta.setAttribute("content", "#8B5A2B");
       if (appleIcon) appleIcon.setAttribute("href", "/icons/apple-touch-icon.png");
+      if (favicon) favicon.setAttribute("href", "/icons/icon-192.png");
       if (appleTitle) appleTitle.setAttribute("content", "Sogil Furniture");
     }
   }, [isAdmin]);
