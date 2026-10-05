@@ -441,6 +441,7 @@ class StockFormCreateInput(BaseModel):
     notes: Optional[str] = ""
 
 class StockFormOutputItemInput(BaseModel):
+    stock_form_id: Optional[str] = None
     form_type: str = "standard"  # raw | standard | custom
     width: Optional[float] = None
     length: Optional[float] = None
@@ -6396,6 +6397,7 @@ async def create_stock_transformation(
         if out_q <= 0:
             raise HTTPException(status_code=400, detail="Jumlah hasil bentuk stok harus lebih besar dari 0")
         valid_outputs.append({
+            "stock_form_id": (out_item.stock_form_id or "").strip() or None,
             "form_type": (out_item.form_type or "standard").strip().lower(),
             "width": round(float(out_item.width), 2) if out_item.width is not None and out_item.width != "" else None,
             "length": round(float(out_item.length), 2) if out_item.length is not None and out_item.length != "" else None,
@@ -6408,22 +6410,35 @@ async def create_stock_transformation(
         })
 
     # Pre-resolve / pre-create all output stock_forms OUTSIDE the transaction.
+    # If stock_form_id is explicitly provided, resolve directly from DB without fuzzy spec matching.
+    # Otherwise, resolve or create via get_or_create_stock_form.
     # This prevents any implicit collection initialization, index build, or DuplicateKeyError
     # inside MongoDB Atlas multi-document transactions when multiple output forms are created.
     resolved_outputs = []
     for out_it in valid_outputs:
-        out_sf = await get_or_create_stock_form(
-            material_id=canonical_mat_id,
-            form_type=out_it["form_type"],
-            width=out_it["width"],
-            length=out_it["length"],
-            thickness=out_it["thickness"],
-            dimension_unit=out_it["dimension_unit"],
-            stock_unit=out_it["stock_unit"],
-            label=out_it["label"],
-            notes=out_it["notes"],
-            admin=admin
-        )
+        target_sf_id = out_it.get("stock_form_id")
+        out_sf = None
+        if target_sf_id:
+            out_sf = await db.stock_forms.find_one({"_id": id_query(target_sf_id)})
+            if not out_sf:
+                raise HTTPException(status_code=404, detail=f"Bentuk stok output dengan ID '{target_sf_id}' tidak ditemukan")
+            if str(out_sf.get("material_id")) != canonical_mat_id:
+                raise HTTPException(status_code=400, detail="Bentuk stok output tidak sesuai dengan bahan yang dipilih")
+            if not out_sf.get("is_active", True):
+                raise HTTPException(status_code=400, detail="Bentuk stok output yang dipilih tidak aktif")
+        else:
+            out_sf = await get_or_create_stock_form(
+                material_id=canonical_mat_id,
+                form_type=out_it["form_type"],
+                width=out_it["width"],
+                length=out_it["length"],
+                thickness=out_it["thickness"],
+                dimension_unit=out_it["dimension_unit"],
+                stock_unit=out_it["stock_unit"],
+                label=out_it["label"],
+                notes=out_it["notes"],
+                admin=admin
+            )
         resolved_outputs.append({
             **out_it,
             "stock_form_id": str(out_sf["_id"]),

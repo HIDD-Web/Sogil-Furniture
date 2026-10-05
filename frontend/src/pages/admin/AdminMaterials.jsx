@@ -438,16 +438,19 @@ export default function AdminMaterials() {
   };
 
   // Stock Adjustment Handlers
-  const openAdjustmentModal = async (presetMaterial = null) => {
+  const openAdjustmentModal = async (presetMaterial = null, presetStockForm = null) => {
     const matId = presetMaterial ? presetMaterial.id : "";
+    const sfId = presetStockForm ? presetStockForm.id : "";
     setAdjustmentForm({
       material_id: matId,
-      stock_form_id: "",
+      stock_form_id: sfId,
       adjustment_type: "adjustment_in",
       quantity: "",
       movement_date: new Date().toISOString().slice(0, 10),
-      reason: "",
+      reason: presetStockForm ? "Stok Awal Fisik" : "",
       notes: "",
+      _lockedStockForm: !!presetStockForm,
+      _lockedStockFormDoc: presetStockForm || null,
     });
     setAdjustmentModalOpen(true);
     if (matId) {
@@ -602,6 +605,7 @@ export default function AdminMaterials() {
         source_stock_form_id: transformationForm.source_stock_form_id,
         source_quantity: Number(transformationForm.source_quantity),
         outputs: validOutputs.map(o => ({
+          stock_form_id: o.existing_form_id || undefined,
           form_type: o.form_type || "standard",
           label: (o.label || "").trim(),
           width: o.width ? Number(o.width) : undefined,
@@ -2224,27 +2228,51 @@ export default function AdminMaterials() {
               {selectedAdjustmentMaterial && (
                 <div>
                   <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
-                    Pilih Bentuk Stok Fisik (Opsional)
+                    Bentuk Stok Fisik {adjustmentForm._lockedStockForm ? "(Terkunci)" : "(Opsional)"}
                   </Label>
-                  <Select
-                    value={adjustmentForm.stock_form_id || "all"}
-                    onValueChange={(val) => setAdjustmentForm({ ...adjustmentForm, stock_form_id: val === "all" ? "" : val })}
-                  >
-                    <SelectTrigger className="bg-white" data-testid="adjustment-form-stock-form">
-                      <SelectValue placeholder="-- Semua / Stok Agregat Bahan --" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">-- Semua / Stok Agregat Bahan --</SelectItem>
-                      {adjustmentStockForms.map((sf) => (
-                        <SelectItem key={sf.id} value={sf.id}>
-                          [{sf.form_type === "raw" ? "Raw" : sf.form_type === "custom" ? "Custom/Sisa" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} — Tersisa: {sf.current_quantity || 0} {sf.stock_unit || selectedAdjustmentMaterial.unit}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <span className="mt-1 block text-[10px] text-[#8B7355]">
-                    Pilih bentuk stok tertentu jika penyesuaian opname dilakukan pada bentuk fisik spesifik.
-                  </span>
+                  {adjustmentForm._lockedStockForm ? (
+                    <div className="rounded-lg border border-purple-200 bg-purple-50 p-2.5 text-xs text-[#2C1E16]">
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-purple-900">
+                          {adjustmentForm._lockedStockFormDoc?.label || "Bentuk Fisik Khusus"}
+                        </span>
+                        <Badge variant="outline" className="text-[10px] bg-white text-purple-800 border-purple-300">
+                          {adjustmentForm._lockedStockFormDoc?.form_type === "custom" ? "Custom/Sisa" : "Standard"}
+                        </Badge>
+                      </div>
+                      <div className="mt-1 flex items-center gap-2 text-[11px] text-[#5C4A3D]">
+                        <span>
+                          Dimensi: {adjustmentForm._lockedStockFormDoc?.length || "-"} × {adjustmentForm._lockedStockFormDoc?.width || "-"} {adjustmentForm._lockedStockFormDoc?.dimension_unit || "cm"}
+                        </span>
+                        <span>·</span>
+                        <span>
+                          Stok saat ini: <strong className="text-emerald-700">{adjustmentForm._lockedStockFormDoc?.current_quantity || 0} {adjustmentForm._lockedStockFormDoc?.stock_unit || selectedAdjustmentMaterial.unit}</strong>
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <Select
+                        value={adjustmentForm.stock_form_id || "all"}
+                        onValueChange={(val) => setAdjustmentForm({ ...adjustmentForm, stock_form_id: val === "all" ? "" : val })}
+                      >
+                        <SelectTrigger className="bg-white" data-testid="adjustment-form-stock-form">
+                          <SelectValue placeholder="-- Semua / Stok Agregat Bahan --" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">-- Semua / Stok Agregat Bahan --</SelectItem>
+                          {adjustmentStockForms.map((sf) => (
+                            <SelectItem key={sf.id} value={sf.id}>
+                              [{sf.form_type === "raw" ? "Raw" : sf.form_type === "custom" ? "Custom/Sisa" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} — Tersisa: {sf.current_quantity || 0} {sf.stock_unit || selectedAdjustmentMaterial.unit}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <span className="mt-1 block text-[10px] text-[#8B7355]">
+                        Pilih bentuk stok tertentu jika penyesuaian opname dilakukan pada bentuk fisik spesifik.
+                      </span>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -2270,17 +2298,25 @@ export default function AdminMaterials() {
                   <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
                     Jumlah (Qty) <span className="text-red-500">*</span>
                   </Label>
-                  <Input
-                    type="number"
-                    step="any"
-                    min="0.0001"
-                    placeholder="0"
-                    value={adjustmentForm.quantity}
-                    onChange={(e) => setAdjustmentForm({ ...adjustmentForm, quantity: e.target.value })}
-                    required
-                    data-testid="adjustment-form-qty"
-                    className="bg-white"
-                  />
+                  <div className="flex items-center gap-1.5">
+                    <Input
+                      type="number"
+                      step="any"
+                      min="0.0001"
+                      placeholder="0"
+                      value={adjustmentForm.quantity}
+                      onChange={(e) => setAdjustmentForm({ ...adjustmentForm, quantity: e.target.value })}
+                      required
+                      data-testid="adjustment-form-qty"
+                      className="bg-white flex-1"
+                    />
+                    <span className="text-xs font-semibold px-2.5 py-2 bg-[#F9F6F0] rounded-md border border-[#E5DCC5] text-[#5C4A3D]">
+                      {adjustmentForm._lockedStockFormDoc?.stock_unit ||
+                        adjustmentStockForms.find(sf => sf.id === adjustmentForm.stock_form_id)?.stock_unit ||
+                        selectedAdjustmentMaterial?.unit ||
+                        "pcs"}
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -2869,6 +2905,7 @@ export default function AdminMaterials() {
                         <th className="px-3 py-2">Dimensi (P × L × T)</th>
                         <th className="px-3 py-2 text-right">Stok Fisik Tersedia</th>
                         <th className="px-3 py-2">Catatan</th>
+                        <th className="px-3 py-2 text-center">Aksi</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#E5DCC5]">
@@ -2906,6 +2943,26 @@ export default function AdminMaterials() {
                           </td>
                           <td className="px-3 py-2.5 text-[#8B7355]">
                             {sf.notes || "-"}
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
+                            {sf.form_type !== "raw" ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  setStockFormsModalOpen(false);
+                                  openAdjustmentModal(selectedStockFormMaterial, sf);
+                                }}
+                                className="h-6 text-[10px] px-2 text-[#8B5A2B] border-[#8B5A2B] hover:bg-[#FAF8F5]"
+                                title="Sesuaikan stok fisik atau masukkan stok awal bentuk ini"
+                                data-testid={`adjust-stock-form-${sf.id}`}
+                              >
+                                Sesuaikan / Stok Awal
+                              </Button>
+                            ) : (
+                              <span className="text-[10px] text-gray-400 italic">Stok Bahan Utama</span>
+                            )}
                           </td>
                         </tr>
                       ))}

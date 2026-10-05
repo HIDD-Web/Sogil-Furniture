@@ -162,6 +162,8 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
                             continue
                         if "length" in query and query["length"] != f.get("length"):
                             continue
+                        if "label" in query and query["label"] != f.get("label"):
+                            continue
                         return {**f}
             return None
 
@@ -1356,6 +1358,279 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         self.assertEqual(len(tr["output_stock_forms"]), 5)
         # Material aggregate stock reduced by 3.0
         self.assertEqual(self.stored_mat["current_stock"], 17.0)
+
+    @patch("server.db")
+    def test_42_transformation_with_existing_stock_form_ids(self, mock_db):
+        """42. Multi-output transformation resolving existing stock_forms directly by stock_form_id."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        self.stored_forms[str(source_sf_id)] = {
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 5.0,
+            "is_active": True
+        }
+
+        # Create 2 existing forms
+        sf1_id = ObjectId()
+        self.stored_forms[str(sf1_id)] = {
+            "_id": sf1_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "width": 40.0,
+            "length": 80.0,
+            "thickness": None,
+            "dimension_unit": "cm",
+            "stock_unit": "pcs",
+            "label": "Meja 80x40",
+            "current_quantity": 2.0,
+            "is_active": True
+        }
+        sf2_id = ObjectId()
+        self.stored_forms[str(sf2_id)] = {
+            "_id": sf2_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "width": 50.0,
+            "length": 80.0,
+            "thickness": None,
+            "dimension_unit": "cm",
+            "stock_unit": "pcs",
+            "label": "Meja 80x50",
+            "current_quantity": 5.0,
+            "is_active": True
+        }
+
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=2.0,
+            transformation_date="2026-10-05",
+            reason="Pemotongan ke existing forms",
+            outputs=[
+                StockFormOutputItemInput(stock_form_id=str(sf1_id), quantity=3.0, label="Meja 80x40"),
+                StockFormOutputItemInput(stock_form_id=str(sf2_id), quantity=6.0, label="Meja 80x50"),
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        tr = res["transformation"]
+        self.assertEqual(len(tr["output_stock_forms"]), 2)
+        # Verify both existing stock forms received exact increments
+        self.assertEqual(self.stored_forms[str(sf1_id)]["current_quantity"], 5.0)  # 2 + 3
+        self.assertEqual(self.stored_forms[str(sf2_id)]["current_quantity"], 11.0) # 5 + 6
+        # Source form decreased
+        self.assertEqual(self.stored_forms[str(source_sf_id)]["current_quantity"], 3.0) # 5 - 2
+        # Canonical aggregate decreased by 2.0
+        self.assertEqual(self.stored_mat["current_stock"], 18.0)
+
+    @patch("server.db")
+    def test_43_transformation_mixed_existing_and_new_forms(self, mock_db):
+        """43. Mixed transformation with existing stock_form_ids and newly generated stock forms."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        self.stored_forms[str(source_sf_id)] = {
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 5.0,
+            "is_active": True
+        }
+
+        existing_sf_id = ObjectId()
+        self.stored_forms[str(existing_sf_id)] = {
+            "_id": existing_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "width": 20.0,
+            "length": 80.0,
+            "dimension_unit": "cm",
+            "stock_unit": "pcs",
+            "label": "Rak 80x20",
+            "current_quantity": 4.0,
+            "is_active": True
+        }
+
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=1.0,
+            transformation_date="2026-10-05",
+            outputs=[
+                StockFormOutputItemInput(stock_form_id=str(existing_sf_id), quantity=5.0, label="Rak 80x20"),
+                StockFormOutputItemInput(form_type="custom", width=15.0, length=40.0, quantity=2.0, label="Sisa Potong 40x15"),
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        self.assertEqual(self.stored_forms[str(existing_sf_id)]["current_quantity"], 9.0) # 4 + 5
+        # Verify the new form was added
+        new_form_matches = [f for f in self.stored_forms.values() if f.get("label") == "Sisa Potong 40x15"]
+        self.assertEqual(len(new_form_matches), 1)
+        self.assertEqual(new_form_matches[0]["current_quantity"], 2.0)
+
+    @patch("server.db")
+    def test_44_production_blockboard_5_existing_forms_preserves_all_outputs(self, mock_db):
+        """44. Exact BlockBoard scenario: 5 outputs (Meja 80x40, Meja 80x50, Kaki Rak 244x20, Rak 80x20, Rak 60x20) all incremented."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        self.stored_forms[str(source_sf_id)] = {
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 5.0,
+            "is_active": True
+        }
+
+        # Setup 5 forms with initial 0 pcs
+        item_configs = [
+            ("Meja 80x40", 80.0, 40.0, 1.0),
+            ("Meja 80x50", 80.0, 50.0, 8.0),
+            ("Kaki Rak 244x20", 244.0, 20.0, 12.0),
+            ("Rak 80x20", 80.0, 20.0, 5.0),
+            ("Rak 60x20", 60.0, 20.0, 24.0),
+        ]
+        outputs_inp = []
+        created_ids = {}
+        for lbl, l, w, q in item_configs:
+            f_id = ObjectId()
+            self.stored_forms[str(f_id)] = {
+                "_id": f_id,
+                "material_id": str(self.sample_mat_id),
+                "form_type": "standard",
+                "width": w,
+                "length": l,
+                "thickness": None,
+                "dimension_unit": "cm",
+                "stock_unit": "pcs",
+                "label": lbl,
+                "current_quantity": 0.0,
+                "is_active": True
+            }
+            created_ids[lbl] = str(f_id)
+            outputs_inp.append(StockFormOutputItemInput(stock_form_id=str(f_id), quantity=q, label=lbl))
+
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=3.0,
+            transformation_date="2026-10-05",
+            outputs=outputs_inp
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        # Confirm every single one of the 5 forms has the exact non-zero quantity
+        self.assertEqual(self.stored_forms[created_ids["Meja 80x40"]]["current_quantity"], 1.0)
+        self.assertEqual(self.stored_forms[created_ids["Meja 80x50"]]["current_quantity"], 8.0)
+        self.assertEqual(self.stored_forms[created_ids["Kaki Rak 244x20"]]["current_quantity"], 12.0)
+        self.assertEqual(self.stored_forms[created_ids["Rak 80x20"]]["current_quantity"], 5.0)
+        self.assertEqual(self.stored_forms[created_ids["Rak 60x20"]]["current_quantity"], 24.0)
+
+    @patch("server.db")
+    def test_45_physical_stock_adjustment_in_out_and_negative_guard(self, mock_db):
+        """45. Manual adjustment directly on stock form: IN (+10), OUT (-2), and OUT exceeding stock fails with 400."""
+        self._setup_mock_db(mock_db)
+        sf_id = ObjectId()
+        self.stored_forms[str(sf_id)] = {
+            "_id": sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "width": 20.0,
+            "length": 80.0,
+            "dimension_unit": "cm",
+            "stock_unit": "pcs",
+            "label": "Rak 80x20",
+            "current_quantity": 0.0,
+            "is_active": True
+        }
+
+        # 1. Adjustment IN: +10 pcs
+        adj_in = MaterialStockAdjustmentInput(
+            adjustment_type="adjustment_in",
+            quantity=10.0,
+            reason="Stok Awal Fisik",
+            stock_form_id=str(sf_id)
+        )
+        res1 = asyncio.run(create_material_stock_adjustment(str(self.sample_mat_id), adj_in, admin=self.owner_user))
+        self.assertTrue(res1["ok"])
+        self.assertEqual(self.stored_forms[str(sf_id)]["current_quantity"], 10.0)
+        # materials.current_stock must remain untouched (canonical 20.0)
+        self.assertEqual(self.stored_mat["current_stock"], 20.0)
+
+        # 2. Adjustment OUT: -2 pcs
+        adj_out = MaterialStockAdjustmentInput(
+            adjustment_type="adjustment_out",
+            quantity=2.0,
+            reason="Koreksi fisik rusak",
+            stock_form_id=str(sf_id)
+        )
+        res2 = asyncio.run(create_material_stock_adjustment(str(self.sample_mat_id), adj_out, admin=self.owner_user))
+        self.assertTrue(res2["ok"])
+        self.assertEqual(self.stored_forms[str(sf_id)]["current_quantity"], 8.0)
+        self.assertEqual(self.stored_mat["current_stock"], 20.0)
+
+        # 3. Adjustment OUT exceeding current quantity (8 pcs) -> Must raise HTTPException 400
+        adj_excess = MaterialStockAdjustmentInput(
+            adjustment_type="adjustment_out",
+            quantity=15.0,
+            reason="Penyesuaian melebihi stok",
+            stock_form_id=str(sf_id)
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(create_material_stock_adjustment(str(self.sample_mat_id), adj_excess, admin=self.owner_user))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("Stok bentuk fisik tidak mencukupi", ctx.exception.detail)
+
+    @patch("server.db")
+    def test_46_opening_stock_scenario_with_zero_raw_and_no_finance_impact(self, mock_db):
+        """46. Opening physical stock when raw=0 lembar: forms hold positive pcs, raw stays 0, zero finance txns."""
+        self._setup_mock_db(mock_db)
+        # Set raw stock to 0
+        self.stored_mat["current_stock"] = 0.0
+
+        sf1 = ObjectId()
+        sf2 = ObjectId()
+        self.stored_forms[str(sf1)] = {
+            "_id": sf1,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "label": "Rak 80x20",
+            "stock_unit": "pcs",
+            "current_quantity": 0.0,
+            "is_active": True
+        }
+        self.stored_forms[str(sf2)] = {
+            "_id": sf2,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "standard",
+            "label": "Rak 60x20",
+            "stock_unit": "pcs",
+            "current_quantity": 0.0,
+            "is_active": True
+        }
+
+        # Add opening stock for sf1 (+10) and sf2 (+24)
+        asyncio.run(create_material_stock_adjustment(
+            str(self.sample_mat_id),
+            MaterialStockAdjustmentInput(adjustment_type="adjustment_in", quantity=10.0, reason="Stok Awal Fisik", stock_form_id=str(sf1)),
+            admin=self.owner_user
+        ))
+        asyncio.run(create_material_stock_adjustment(
+            str(self.sample_mat_id),
+            MaterialStockAdjustmentInput(adjustment_type="adjustment_in", quantity=24.0, reason="Stok Awal Fisik", stock_form_id=str(sf2)),
+            admin=self.owner_user
+        ))
+
+        # Invariant checks:
+        self.assertEqual(self.stored_forms[str(sf1)]["current_quantity"], 10.0)
+        self.assertEqual(self.stored_forms[str(sf2)]["current_quantity"], 24.0)
+        self.assertEqual(self.stored_mat["current_stock"], 0.0) # Raw is STILL 0 lembar!
+        # Finance collection was NEVER written to
+        mock_db.finance_transactions.insert_one.assert_not_called()
 
 
 if __name__ == "__main__":
