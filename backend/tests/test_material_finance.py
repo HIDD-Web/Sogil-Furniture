@@ -319,7 +319,13 @@ class TestMaterialFinanceIntegration(unittest.TestCase):
         mock_db.material_purchases.find_one = AsyncMock(return_value=active_pb)
         mock_db.materials.find_one = AsyncMock(return_value={**self.sample_material, "current_stock": 50.0})
         mock_db.materials.find_one_and_update = AsyncMock(return_value={**self.sample_material, "current_stock": 40.0})
-        mock_db.material_stocks.find_one = AsyncMock(side_effect=[orig_mov, None])
+        def mock_stock_t8(query, **kwargs):
+            if query.get("movement_number"):
+                return None
+            if query.get("movement_type") == "purchase_in":
+                return orig_mov
+            return None
+        mock_db.material_stocks.find_one = AsyncMock(side_effect=mock_stock_t8)
         mock_db.finance_transactions.find_one = AsyncMock(side_effect=[orig_fin, None])
         mock_db.material_purchases.find_one_and_update = AsyncMock(return_value={**active_pb, "is_void": True})
 
@@ -412,7 +418,13 @@ class TestMaterialFinanceIntegration(unittest.TestCase):
         mock_db.material_purchases.find_one = AsyncMock(return_value=old_pb)
         mock_db.materials.find_one = AsyncMock(return_value={**self.sample_material, "current_stock": 50.0})
         mock_db.materials.find_one_and_update = AsyncMock(return_value={**self.sample_material, "current_stock": 40.0})
-        mock_db.material_stocks.find_one = AsyncMock(side_effect=[orig_mov, None])
+        def mock_stock_t8(query, **kwargs):
+            if query.get("movement_number"):
+                return None
+            if query.get("movement_type") == "purchase_in":
+                return orig_mov
+            return None
+        mock_db.material_stocks.find_one = AsyncMock(side_effect=mock_stock_t8)
         # Finance find_one returns None (no finance expense exists for this old purchase)
         mock_db.finance_transactions.find_one = AsyncMock(return_value=None)
         mock_db.material_purchases.find_one_and_update = AsyncMock(return_value={**old_pb, "is_void": True})

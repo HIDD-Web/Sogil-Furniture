@@ -304,7 +304,13 @@ class TestMaterialStockPhase3(unittest.TestCase):
             "movement_type": "purchase_in",
             "quantity_delta": 20.0,
         }
-        mock_db.material_stocks.find_one = AsyncMock(side_effect=[orig_mov, None])
+        def mock_stock_t14(query, **kwargs):
+            if query.get("movement_number"):
+                return None
+            if query.get("movement_type") == "purchase_in":
+                return orig_mov
+            return None
+        mock_db.material_stocks.find_one = AsyncMock(side_effect=mock_stock_t14)
         mock_db.counters.find_one = AsyncMock(return_value={"_id": "stock_20261001", "seq": 5})
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 5})
         mock_db.material_stocks.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))

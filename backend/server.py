@@ -5335,7 +5335,12 @@ async def get_next_transformation_number(date_str: Optional[str] = None, session
     return f"{prefix}{seq:04d}"
 
 async def get_next_movement_number(date_str: Optional[str] = None, session=None) -> str:
-    kw = {"session": session} if session else {}
+    """
+    Allocates the next unique movement number for date_str.
+    Counter sequence generation is strictly autonomous (session=None) to ensure sequence increments
+    never participate in business transaction aborts or suffer write conflicts.
+    It automatically synchronizes with the high-watermark of material_stocks to prevent collisions.
+    """
     try:
         if date_str and len(date_str) >= 10:
             dt_part = date_str[:10].replace("-", "")
@@ -5347,36 +5352,56 @@ async def get_next_movement_number(date_str: Optional[str] = None, session=None)
     counter_id = f"stock_{dt_part}"
     prefix = f"ST-{dt_part}-"
 
-    existing_counter = await db.counters.find_one({"_id": counter_id}, **kw)
-    if existing_counter is None:
-        last_st = await db.material_stocks.find_one(
+    # 1. High-watermark check against physical material_stocks
+    last_st = None
+    if hasattr(db.material_stocks, "find_one"):
+        st_res = db.material_stocks.find_one(
             {"movement_number": {"$regex": f"^{prefix}"}},
-            sort=[("movement_number", -1)],
-            **kw
+            sort=[("movement_number", -1)]
         )
-        current_max = 0
-        if last_st and "movement_number" in last_st:
-            try:
-                current_max = int(last_st["movement_number"].split("-")[-1])
-            except (ValueError, IndexError):
-                current_max = 0
+        if asyncio.iscoroutine(st_res) or hasattr(st_res, "__await__"):
+            last_st = await st_res
+    current_max = 0
+    if last_st and "movement_number" in last_st:
+        try:
+            current_max = int(last_st["movement_number"].split("-")[-1])
+        except (ValueError, IndexError):
+            current_max = 0
 
+    # 2. Ensure counter is at least current_max using atomic $max
+    if current_max > 0:
         await db.counters.update_one(
             {"_id": counter_id},
-            {"$set": {"seq": current_max}},
-            upsert=True,
-            **kw
+            {"$max": {"seq": current_max}},
+            upsert=True
         )
+
+    # 3. Atomically increment sequence (autonomous, session=None)
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = res["seq"]
+    if seq <= current_max:
+        seq = current_max + 1
+        await db.counters.update_one(
+            {"_id": counter_id},
+            {"$set": {"seq": seq}},
+            upsert=True
+        )
+    return f"{prefix}{seq:04d}"
 
 async def get_next_movement_numbers(count: int, date_str: Optional[str] = None, session=None) -> list[str]:
     """
-    Allocates a contiguous batch of `count` movement numbers in a single atomic counter update.
-    This avoids repeated find_one_and_update calls on the same counter document during multi-item
-    transactions, preventing write conflicts.
+    Allocates a contiguous batch of `count` movement numbers in a single atomic autonomous counter update.
+    Counter sequence generation is strictly autonomous (session=None) to ensure sequence increments
+    never participate in business transaction aborts or suffer write conflicts.
+    It automatically synchronizes with the high-watermark of material_stocks to prevent collisions.
     """
     if count <= 0:
         return []
-    kw = {"session": session} if session else {}
     try:
         if date_str and len(date_str) >= 10:
             dt_part = date_str[:10].replace("-", "")
@@ -5388,37 +5413,52 @@ async def get_next_movement_numbers(count: int, date_str: Optional[str] = None, 
     counter_id = f"stock_{dt_part}"
     prefix = f"ST-{dt_part}-"
 
-    existing_counter = await db.counters.find_one({"_id": counter_id}, **kw)
-    if existing_counter is None:
-        last_st = await db.material_stocks.find_one(
+    # 1. High-watermark check against physical material_stocks
+    last_st = None
+    if hasattr(db.material_stocks, "find_one"):
+        st_res = db.material_stocks.find_one(
             {"movement_number": {"$regex": f"^{prefix}"}},
-            sort=[("movement_number", -1)],
-            **kw
+            sort=[("movement_number", -1)]
         )
-        current_max = 0
-        if last_st and "movement_number" in last_st:
-            try:
-                current_max = int(last_st["movement_number"].split("-")[-1])
-            except (ValueError, IndexError):
-                current_max = 0
+        if asyncio.iscoroutine(st_res) or hasattr(st_res, "__await__"):
+            last_st = await st_res
+    current_max = 0
+    if last_st and "movement_number" in last_st:
+        try:
+            current_max = int(last_st["movement_number"].split("-")[-1])
+        except (ValueError, IndexError):
+            current_max = 0
 
+    # 2. Ensure counter is at least current_max using atomic $max
+    if current_max > 0:
         await db.counters.update_one(
             {"_id": counter_id},
-            {"$set": {"seq": current_max}},
-            upsert=True,
-            **kw
+            {"$max": {"seq": current_max}},
+            upsert=True
         )
 
+    # 3. Atomically allocate batch sequence (autonomous, session=None)
     res = await db.counters.find_one_and_update(
         {"_id": counter_id},
         {"$inc": {"seq": count}},
         upsert=True,
-        return_document=ReturnDocument.AFTER,
-        **kw
+        return_document=ReturnDocument.AFTER
     )
     final_seq = res["seq"]
     start_seq = final_seq - count + 1
+
+    # If start_seq collided with existing current_max, jump ahead
+    if start_seq <= current_max:
+        start_seq = current_max + 1
+        final_seq = start_seq + count - 1
+        await db.counters.update_one(
+            {"_id": counter_id},
+            {"$set": {"seq": final_seq}},
+            upsert=True
+        )
+
     return [f"{prefix}{s:04d}" for s in range(start_seq, final_seq + 1)]
+
 
 async def apply_stock_movement_atomic(
     material_id: str,
@@ -5578,7 +5618,9 @@ async def apply_stock_movement_atomic(
             if movement_number and attempt == 0:
                 m_num = movement_number
             else:
-                m_num = await get_next_movement_number(movement_date, session=session)
+                # When retrying or allocating fresh numbers, always run autonomously (session=None)
+                # with high-watermark synchronization against physical material_stocks
+                m_num = await get_next_movement_number(movement_date, session=None)
             movement_doc["movement_number"] = m_num
             res = await db.material_stocks.insert_one(movement_doc, **kw)
             movement_doc["_id"] = res.inserted_id
@@ -6397,17 +6439,18 @@ async def create_stock_transformation(
     reason = (data.reason or "").strip() or "Transformasi / pemotongan stok bahan"
     notes = (data.notes or "").strip()
 
+    # Pre-allocate unique movement numbers AUTONOMOUSLY (session=None) BEFORE starting the transaction.
+    # This guarantees that counter allocation is isolated, high-watermark synchronized,
+    # and completely immune to transaction write conflicts or transient rollbacks.
+    total_movements_needed = 1 + len(resolved_outputs)
+    movement_numbers = await get_next_movement_numbers(total_movements_needed, tr_date, session=None)
+    source_mov_num = movement_numbers[0] if len(movement_numbers) > 0 else None
+    output_mov_nums = movement_numbers[1:] if len(movement_numbers) > 1 else [None] * len(resolved_outputs)
+
     async def _execute_transformation_tx(session):
         # 1. Allocate unique transformation number
         tr_num = await get_next_transformation_number(tr_date, session=session)
         now = datetime.now(timezone.utc).isoformat()
-
-        # Batch allocate movement numbers for 1 source out movement + N output in movements.
-        # This reduces N+1 counter writes down to 1 single atomic counter increment inside or outside tx.
-        total_movements_needed = 1 + len(resolved_outputs)
-        movement_numbers = await get_next_movement_numbers(total_movements_needed, tr_date, session=session)
-        source_mov_num = movement_numbers[0] if len(movement_numbers) > 0 else None
-        output_mov_nums = movement_numbers[1:] if len(movement_numbers) > 1 else [None] * len(resolved_outputs)
 
         # 2. transformation_out from source stock form
         # Only mutate materials.current_stock if source form was raw/canonical

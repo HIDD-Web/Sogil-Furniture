@@ -811,7 +811,13 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
             "movement_type": "purchase_in",
             "quantity_delta": 10.0
         }
-        mock_db.material_stocks.find_one = AsyncMock(side_effect=[orig_mov, None])
+        def smart_find_stock(query, **kwargs):
+            if query.get("movement_number"):
+                return None
+            if query.get("related_purchase_id"):
+                return orig_mov
+            return None
+        mock_db.material_stocks.find_one = AsyncMock(side_effect=smart_find_stock)
 
         res = asyncio.run(void_material_purchase(str(pb_id), VoidPurchaseInput(void_reason="Salah nota"), admin=self.owner_user))
         self.assertTrue(res["ok"])
@@ -1109,7 +1115,15 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
             "movement_type": "purchase_in",
             "quantity_delta": 10.0
         }
-        mock_db.material_stocks.find_one = AsyncMock(side_effect=[orig_mov, None])
+        def smart_find_stock_36(query, **kwargs):
+            if query.get("movement_number"):
+                return None
+            if query.get("movement_type") == "purchase_in":
+                return orig_mov
+            if query.get("movement_type") == "adjustment_out":
+                return None
+            return None
+        mock_db.material_stocks.find_one = AsyncMock(side_effect=smart_find_stock_36)
 
         # Find the orig finance transaction recorded during purchase
         fin_call = mock_db.finance_transactions.insert_one.call_args[0][0]
@@ -1250,6 +1264,101 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         self.assertEqual(self.stored_mat["current_stock"], 18.0)
 
 
+    @patch("server.db")
+    def test_40_batch_movement_allocation_with_existing_high_sequence(self, mock_db):
+        """40. Counter automatically synchronizes to high-watermark when material_stocks has higher sequences."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        mock_db.stock_forms.find_one = AsyncMock(return_value={
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 8.0,
+            "is_active": True
+        })
+
+        # Simulate scenario:
+        # material_stocks already has high sequence ST-20261005-0015
+        # but counters is lagging behind at seq: 2
+        mock_db.material_stocks.find_one = AsyncMock(return_value={"movement_number": "ST-20261005-0015"})
+        stored_counter = {"_id": "stock_20261005", "seq": 2}
+
+        def fake_find_one_and_update(query, update, **kwargs):
+            nonlocal stored_counter
+            if "$inc" in update:
+                stored_counter["seq"] += update["$inc"]["seq"]
+            return {"seq": stored_counter["seq"]}
+
+        def fake_update_one(query, update, **kwargs):
+            nonlocal stored_counter
+            if "$max" in update:
+                max_val = update["$max"]["seq"]
+                if stored_counter.get("seq", 0) < max_val:
+                    stored_counter["seq"] = max_val
+            elif "$set" in update:
+                stored_counter["seq"] = update["$set"]["seq"]
+            return None
+
+        mock_db.counters.find_one_and_update = AsyncMock(side_effect=fake_find_one_and_update)
+        mock_db.counters.update_one = AsyncMock(side_effect=fake_update_one)
+
+        # Allocate batch of 3 movement numbers
+        mov_nums = asyncio.run(get_next_movement_numbers(3, "2026-10-05"))
+        self.assertEqual(len(mov_nums), 3)
+        # Sequence MUST be strictly greater than 15 (i.e., 16, 17, 18)
+        self.assertEqual(mov_nums[0], "ST-20261005-0016")
+        self.assertEqual(mov_nums[1], "ST-20261005-0017")
+        self.assertEqual(mov_nums[2], "ST-20261005-0018")
+        self.assertGreaterEqual(stored_counter["seq"], 18)
+
+    @patch("server.db")
+    def test_41_multi_output_cutting_resilience_matching_production_items(self, mock_db):
+        """41. Multi-output cutting with 5-6 outputs (Kaki Rak 244x20, Meja 80x50, Meja 80x40, etc.) runs cleanly."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        mock_db.stock_forms.find_one = AsyncMock(return_value={
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 10.0,
+            "is_active": True
+        })
+
+        # Ensure high watermark is checked cleanly
+        mock_db.material_stocks.find_one = AsyncMock(return_value={"movement_number": "ST-20261005-0020"})
+        counter_val = 20
+        def inc_counter(query, update, **kwargs):
+            nonlocal counter_val
+            counter_val += update["$inc"]["seq"]
+            return {"seq": counter_val}
+        mock_db.counters.find_one_and_update = AsyncMock(side_effect=inc_counter)
+
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=3.0,
+            transformation_date="2026-10-05",
+            reason="Pemotongan Blockboard multi-output produksi",
+            outputs=[
+                StockFormOutputItemInput(form_type="standard", width=244, length=20, quantity=12.0, label="Kaki Rak 244x20"),
+                StockFormOutputItemInput(form_type="standard", width=80, length=50, quantity=8.0, label="Meja 80x50"),
+                StockFormOutputItemInput(form_type="standard", width=80, length=40, quantity=1.0, label="Meja 80x40"),
+                StockFormOutputItemInput(form_type="standard", width=60, length=30, quantity=4.0, label="Ambalan 60x30"),
+                StockFormOutputItemInput(form_type="custom", width=30, length=20, quantity=2.0, label="Sisa Potongan"),
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        tr = res["transformation"]
+        self.assertEqual(tr["source_quantity"], 3.0)
+        self.assertEqual(len(tr["output_stock_forms"]), 5)
+        # Material aggregate stock reduced by 3.0
+        self.assertEqual(self.stored_mat["current_stock"], 17.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
