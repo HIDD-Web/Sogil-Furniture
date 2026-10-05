@@ -1105,8 +1105,8 @@ async def execute_transaction_with_safety(motor_client, coro_func):
     Executes coro_func(session) inside a MongoDB multi-document transaction.
     If the deployment is a local standalone MongoDB instance lacking replica set support,
     falls back gracefully to atomic operations with compensating rollback.
-    In production (Atlas replica set), transactions are strictly executed and
-    any error inside coro_func will properly abort the transaction without fallback.
+    In production (Atlas replica set), transactions are strictly executed with automatic
+    retry on TransientTransactionError (up to 3 attempts) before raising an exception.
     """
     session = None
     use_tx = False
@@ -1122,13 +1122,26 @@ async def execute_transaction_with_safety(motor_client, coro_func):
             use_tx = False
 
     if use_tx and session:
-        try:
-            async with session:
-                async with session.start_transaction():
-                    return await coro_func(session)
-        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation) as e:
-            logger.warning(f"Standalone deployment detected during transaction start ({e}); using atomic fallback.")
-            return await coro_func(None)
+        max_tx_retries = 3
+        for attempt in range(max_tx_retries):
+            try:
+                async with session:
+                    async with session.start_transaction():
+                        return await coro_func(session)
+            except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation) as e:
+                logger.warning(f"Standalone deployment detected during transaction start ({e}); using atomic fallback.")
+                return await coro_func(None)
+            except pymongo.errors.PyMongoError as e:
+                is_transient = e.has_error_label("TransientTransactionError") or "NoSuchTransaction" in str(e)
+                if is_transient and attempt < max_tx_retries - 1:
+                    logger.warning(f"Transient transaction error on attempt {attempt + 1} ({e}); retrying...")
+                    await asyncio.sleep(0.05 * (2 ** attempt))
+                    try:
+                        session = await motor_client.start_session()
+                    except Exception:
+                        pass
+                    continue
+                raise
     else:
         return await coro_func(None)
 
@@ -5434,8 +5447,8 @@ async def apply_stock_movement_atomic(
             target_new_stock = round(prev_stock + delta, 4)
 
             if not allow_negative and target_new_stock < 0:
-                # Rollback stock_form if we modified it
-                if stock_form_id and stock_form_doc:
+                # Rollback stock_form if we modified it and not in a transaction
+                if not session and stock_form_id and stock_form_doc:
                     await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(
                     status_code=400,
@@ -5458,7 +5471,7 @@ async def apply_stock_movement_atomic(
             if updated_mat:
                 break
             if attempt == max_retries - 1:
-                if stock_form_id and stock_form_doc:
+                if not session and stock_form_id and stock_form_doc:
                     await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(status_code=409, detail="Konflik konkurensi saat mengubah stok. Silakan coba kembali.")
     else:
@@ -5508,18 +5521,20 @@ async def apply_stock_movement_atomic(
         except pymongo.errors.DuplicateKeyError as dke:
             # Check if this duplicate is on related_purchase_id idempotency index
             if "uniq_purchase_stock_movement" in str(dke):
-                # Rollback current_stock and stock_form
-                if update_material_aggregate:
-                    await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
-                if stock_form_id and stock_form_doc:
-                    await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
+                # Rollback current_stock and stock_form if not in a transaction
+                if not session:
+                    if update_material_aggregate:
+                        await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                    if stock_form_id and stock_form_doc:
+                        await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(status_code=409, detail="Stok untuk pembelian ini sudah pernah dicatat.")
             if attempt == 4:
-                # Rollback on fatal failure
-                if update_material_aggregate:
-                    await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
-                if stock_form_id and stock_form_doc:
-                    await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
+                # Rollback on fatal failure if not in a transaction
+                if not session:
+                    if update_material_aggregate:
+                        await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                    if stock_form_id and stock_form_doc:
+                        await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pergerakan stok unik.")
 
     return clean(movement_doc)
@@ -6280,6 +6295,29 @@ async def create_stock_transformation(
             "notes": (out_item.notes or "").strip(),
         })
 
+    # Pre-resolve / pre-create all output stock_forms OUTSIDE the transaction.
+    # This prevents any implicit collection initialization, index build, or DuplicateKeyError
+    # inside MongoDB Atlas multi-document transactions when multiple output forms are created.
+    resolved_outputs = []
+    for out_it in valid_outputs:
+        out_sf = await get_or_create_stock_form(
+            material_id=canonical_mat_id,
+            form_type=out_it["form_type"],
+            width=out_it["width"],
+            length=out_it["length"],
+            thickness=out_it["thickness"],
+            dimension_unit=out_it["dimension_unit"],
+            stock_unit=out_it["stock_unit"],
+            label=out_it["label"],
+            notes=out_it["notes"],
+            admin=admin
+        )
+        resolved_outputs.append({
+            **out_it,
+            "stock_form_id": str(out_sf["_id"]),
+            "stock_form_doc": out_sf
+        })
+
     tr_date = (data.transformation_date or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         datetime.strptime(tr_date[:10], "%Y-%m-%d")
@@ -6314,20 +6352,9 @@ async def create_stock_transformation(
 
         # 3. transformation_in for each output form (never inflates canonical materials.current_stock)
         output_refs = []
-        for out_it in valid_outputs:
-            out_sf = await get_or_create_stock_form(
-                material_id=canonical_mat_id,
-                form_type=out_it["form_type"],
-                width=out_it["width"],
-                length=out_it["length"],
-                thickness=out_it["thickness"],
-                dimension_unit=out_it["dimension_unit"],
-                stock_unit=out_it["stock_unit"],
-                label=out_it["label"],
-                notes=out_it["notes"],
-                admin=admin,
-                session=session
-            )
+        for out_it in resolved_outputs:
+            out_sf_id = out_it["stock_form_id"]
+            out_sf = out_it["stock_form_doc"]
             await apply_stock_movement_atomic(
                 material_id=canonical_mat_id,
                 movement_type="transformation_in",
@@ -6338,12 +6365,12 @@ async def create_stock_transformation(
                 notes=out_it["notes"],
                 allow_negative=False,
                 session=session,
-                stock_form_id=str(out_sf["_id"]),
+                stock_form_id=out_sf_id,
                 transformation_number=tr_num,
                 update_material_aggregate=False
             )
             output_refs.append({
-                "stock_form_id": str(out_sf["_id"]),
+                "stock_form_id": out_sf_id,
                 "form_type": out_sf.get("form_type"),
                 "dimensions": {
                     "width": out_sf.get("width"),

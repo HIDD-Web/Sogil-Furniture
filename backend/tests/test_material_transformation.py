@@ -1162,6 +1162,47 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         # Canonical aggregate stock strictly preserved at 5.0 lembar!
         self.assertEqual(self.stored_mat["current_stock"], 5.0)
 
+    @patch("server.db")
+    def test_38_multi_output_transformation_cutting(self, mock_db):
+        """38. Cutting 1 sheet into 6 distinct outputs pre-resolves forms and records movements safely."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        mock_db.stock_forms.find_one = AsyncMock(return_value={
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 8.0,
+            "is_active": True
+        })
+
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=1.0,
+            transformation_date="2026-10-05",
+            reason="Potong BlockBoard untuk komponen kabinet",
+            notes="Rak, partisi, ambalan, laci",
+            outputs=[
+                StockFormOutputItemInput(form_type="standard", width=80, length=30, quantity=2.0, label="Rak 80x30"),
+                StockFormOutputItemInput(form_type="standard", width=60, length=30, quantity=2.0, label="Rak 60x30"),
+                StockFormOutputItemInput(form_type="standard", width=40, length=30, quantity=4.0, label="Partisi 40x30"),
+                StockFormOutputItemInput(form_type="standard", width=120, length=30, quantity=1.0, label="Top panel 120x30"),
+                StockFormOutputItemInput(form_type="standard", width=50, length=20, quantity=2.0, label="Alas laci 50x20"),
+                StockFormOutputItemInput(form_type="custom", width=25, length=15, quantity=1.0, label="Sisa potongan / remnant"),
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        self.assertIn("transformation", res)
+        tr = res["transformation"]
+        self.assertEqual(tr["source_quantity"], 1.0)
+        self.assertEqual(len(tr["output_stock_forms"]), 6)
+        self.assertTrue(tr["transformation_number"].startswith("TR-20261005-"))
+
+        # Verify raw material aggregate stock decremented by exactly 1.0 lembar
+        self.assertEqual(self.stored_mat["current_stock"], 19.0)
+
 
 if __name__ == "__main__":
     unittest.main()
