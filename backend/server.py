@@ -4751,7 +4751,17 @@ async def get_materials(
             {"sku": {"$regex": search_term, "$options": "i"}},
         ]
     docs = await db.materials.find(query).sort("created_at", -1).to_list(1000)
-    return [clean(d) for d in docs]
+    result = []
+    for d in docs:
+        c_item = clean(d)
+        try:
+            m_id = str(d["_id"])
+            s_forms = await db.stock_forms.find({"material_id": m_id, "is_active": True}).to_list(100)
+            c_item["stock_forms"] = [clean(sf) for sf in s_forms]
+        except Exception:
+            c_item["stock_forms"] = []
+        result.append(c_item)
+    return result
 
 @api_router.post("/admin/materials")
 async def create_material(
@@ -6032,6 +6042,11 @@ async def get_materials_stock_summary(
         c_item = clean(m)
         c_item["current_stock"] = round(float(c_item.get("current_stock") or 0.0), 4)
         c_item["last_movement"] = clean(last_mov) if last_mov else None
+        try:
+            s_forms = await db.stock_forms.find({"material_id": m_id, "is_active": True}).to_list(100)
+            c_item["stock_forms"] = [clean(sf) for sf in s_forms]
+        except Exception:
+            c_item["stock_forms"] = []
         result.append(c_item)
 
     return result

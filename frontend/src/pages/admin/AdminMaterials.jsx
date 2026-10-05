@@ -29,6 +29,8 @@ import {
   Split,
   Shapes,
   FileText,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -45,6 +47,8 @@ const INITIAL_FORM = {
 };
 
 const INITIAL_TRANSFORMATION_OUTPUT = {
+  form_source: "new", // "new" | "existing"
+  existing_form_id: "",
   form_type: "standard",
   label: "",
   width: "",
@@ -180,6 +184,9 @@ export default function AdminMaterials() {
   // Phase 5: Stock Forms for Adjustment Modal
   const [adjustmentStockForms, setAdjustmentStockForms] = useState([]);
   const [loadingAdjustmentStockForms, setLoadingAdjustmentStockForms] = useState(false);
+
+  // Expanded stock forms per material in main tables: { [materialId]: boolean }
+  const [expandedStockForms, setExpandedStockForms] = useState({});
 
   const loadMaterials = async () => {
     try {
@@ -1015,9 +1022,42 @@ export default function AdminMaterials() {
                             {m.unit}
                           </td>
                           <td className="px-4 py-3 text-xs">
-                            <span className={`font-bold ${stockVal > 0 ? "text-emerald-700" : "text-amber-800"}`}>
-                              {stockVal} {m.unit}
-                            </span>
+                            <div>
+                              <span className={`font-bold ${stockVal > 0 ? "text-emerald-700" : "text-amber-800"}`}>
+                                {stockVal} {m.unit}
+                              </span>
+                              {m.stock_forms && m.stock_forms.filter((sf) => sf.form_type !== "raw").length > 0 && (
+                                <div className="mt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedStockForms((prev) => ({ ...prev, [m.id]: !prev[m.id] }))}
+                                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8B5A2B] hover:text-[#5C4A3D] bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-1.5 py-0.5 transition"
+                                  >
+                                    <Scissors size={10} />
+                                    <span>
+                                      {m.stock_forms.filter((sf) => sf.form_type !== "raw").length} potong
+                                    </span>
+                                    {expandedStockForms[m.id] ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+                                  </button>
+                                  {expandedStockForms[m.id] && (
+                                    <div className="mt-1.5 space-y-1 pl-1 border-l-2 border-amber-300">
+                                      {m.stock_forms
+                                        .filter((sf) => sf.form_type !== "raw")
+                                        .map((sf) => (
+                                          <div key={sf.id} className="text-[10px] text-[#5C4A3D] flex items-center justify-between gap-2 py-0.5">
+                                            <span className="truncate max-w-[140px]" title={sf.label || sf.form_type}>
+                                              • {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : sf.form_type)}:
+                                            </span>
+                                            <span className={`font-semibold shrink-0 ${Number(sf.current_quantity || 0) > 0 ? "text-emerald-700" : "text-gray-400"}`}>
+                                              {sf.current_quantity || 0} {sf.stock_unit}
+                                            </span>
+                                          </div>
+                                        ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
                           </td>
                           <td className="px-4 py-3 text-xs">
                             {m.latest_price !== undefined && m.latest_price !== null ? (
@@ -1232,13 +1272,46 @@ export default function AdminMaterials() {
                             </Badge>
                           </td>
                           <td className="px-4 py-3 font-mono text-sm">
-                            <span className={`font-bold px-2 py-0.5 rounded-md ${
-                              stockVal > 0
-                                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                                : "bg-gray-100 text-gray-700 border border-gray-200"
-                            }`}>
-                              {stockVal} {m.unit}
-                            </span>
+                            <div>
+                              <span className={`font-bold px-2 py-0.5 rounded-md inline-block ${
+                                stockVal > 0
+                                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                  : "bg-gray-100 text-gray-700 border border-gray-200"
+                              }`}>
+                                {stockVal} {m.unit}
+                              </span>
+                              {m.stock_forms && m.stock_forms.filter((sf) => sf.form_type !== "raw").length > 0 && (
+                                <div className="mt-1 font-sans">
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedStockForms((prev) => ({ ...prev, [m.id]: !prev[m.id] }))}
+                                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8B5A2B] hover:text-[#5C4A3D] bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded px-1.5 py-0.5 transition"
+                                  >
+                                    <Scissors size={10} />
+                                    <span>
+                                      {m.stock_forms.filter((sf) => sf.form_type !== "raw").length} potong
+                                    </span>
+                                    {expandedStockForms[m.id] ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+                                  </button>
+                                  {expandedStockForms[m.id] && (
+                                    <div className="mt-1.5 space-y-1 pl-1 border-l-2 border-amber-300">
+                                      {m.stock_forms
+                                        .filter((sf) => sf.form_type !== "raw")
+                                        .map((sf) => (
+                                          <div key={sf.id} className="text-[10px] text-[#5C4A3D] flex items-center justify-between gap-2 py-0.5">
+                                            <span className="truncate max-w-[140px]" title={sf.label || sf.form_type}>
+                                              • {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : sf.form_type)}:
+                                            </span>
+                                            <span className={`font-semibold shrink-0 ${Number(sf.current_quantity || 0) > 0 ? "text-emerald-700" : "text-gray-400"}`}>
+                                              {sf.current_quantity || 0} {sf.stock_unit}
+                                            </span>
+                                          </div>
+                                        ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
                           </td>
                           <td className="px-4 py-3 text-[#5C4A3D]">
                             {m.unit}
@@ -3025,130 +3098,257 @@ export default function AdminMaterials() {
                 </div>
 
                 <div className="space-y-2">
-                  {(transformationForm.outputs || []).map((out, idx) => (
-                    <div key={idx} className="rounded-lg border border-[#E5DCC5] bg-white p-2.5 space-y-2 text-xs">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="font-semibold text-[#2C1E16]">Bentuk Hasil #{idx + 1}</span>
-                        <div className="flex items-center gap-2">
-                          <select
-                            value={out.form_type || "standard"}
-                            onChange={(e) => {
-                              const updated = [...transformationForm.outputs];
-                              updated[idx].form_type = e.target.value;
-                              setTransformationForm({ ...transformationForm, outputs: updated });
-                            }}
-                            className="text-[11px] rounded border border-[#E5DCC5] bg-white px-2 py-0.5"
-                          >
-                            <option value="standard">Standard (Komponen)</option>
-                            <option value="custom">Custom (Sisa Potong / Remnant)</option>
-                          </select>
-                          {transformationForm.outputs.length > 1 && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const updated = transformationForm.outputs.filter((_, i) => i !== idx);
-                                setTransformationForm({ ...transformationForm, outputs: updated });
-                              }}
-                              className="text-red-500 hover:text-red-700"
-                            >
-                              <Trash2 size={13} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
+                  {(transformationForm.outputs || []).map((out, idx) => {
+                    const existingFormsList = availableSourceForms.filter((sf) => sf.form_type !== "raw");
+                    const isExistingMode = out.form_source === "existing";
 
-                      <div className="grid grid-cols-2 gap-2">
-                        <Input
-                          placeholder="Label (contoh: Rak 80x30, Sisa 42x244)"
-                          value={out.label || ""}
-                          onChange={(e) => {
-                            const updated = [...transformationForm.outputs];
-                            updated[idx].label = e.target.value;
-                            setTransformationForm({ ...transformationForm, outputs: updated });
-                          }}
-                          className="h-8 text-xs bg-white"
-                        />
-                        <div className="flex items-center gap-1">
-                          <Input
-                            type="number"
-                            step="any"
-                            min="0.0001"
-                            placeholder="Qty"
-                            value={out.quantity || ""}
-                            onChange={(e) => {
-                              const updated = [...transformationForm.outputs];
-                              updated[idx].quantity = e.target.value;
-                              setTransformationForm({ ...transformationForm, outputs: updated });
-                            }}
-                            className="h-8 text-xs bg-white w-20"
-                            required
-                          />
-                          <Input
-                            placeholder="Satuan"
-                            value={out.stock_unit || selectedTransformationMaterial?.unit || "pcs"}
-                            onChange={(e) => {
-                              const updated = [...transformationForm.outputs];
-                              updated[idx].stock_unit = e.target.value;
-                              setTransformationForm({ ...transformationForm, outputs: updated });
-                            }}
-                            className="h-8 text-xs bg-white"
-                          />
-                        </div>
-                      </div>
+                    return (
+                      <div key={idx} className="rounded-lg border border-[#E5DCC5] bg-white p-2.5 space-y-2.5 text-xs">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-[#2C1E16]">Bentuk Hasil #{idx + 1}</span>
+                            {/* Toggle Mode: Ukuran Baru vs Ukuran Yang Ada */}
+                            {existingFormsList.length > 0 && (
+                              <div className="inline-flex rounded-md border border-[#E5DCC5] bg-[#FAF8F5] p-0.5 text-[10px]">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const updated = [...transformationForm.outputs];
+                                    updated[idx].form_source = "existing";
+                                    setTransformationForm({ ...transformationForm, outputs: updated });
+                                  }}
+                                  className={`px-2 py-0.5 rounded transition ${
+                                    isExistingMode
+                                      ? "bg-[#8B5A2B] text-white font-medium shadow-xs"
+                                      : "text-[#5C4A3D] hover:text-[#2C1E16]"
+                                  }`}
+                                >
+                                  Pilih Ukuran Yang Ada
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const updated = [...transformationForm.outputs];
+                                    updated[idx].form_source = "new";
+                                    setTransformationForm({ ...transformationForm, outputs: updated });
+                                  }}
+                                  className={`px-2 py-0.5 rounded transition ${
+                                    !isExistingMode
+                                      ? "bg-[#8B5A2B] text-white font-medium shadow-xs"
+                                      : "text-[#5C4A3D] hover:text-[#2C1E16]"
+                                  }`}
+                                >
+                                  Ukuran Baru
+                                </button>
+                              </div>
+                            )}
+                          </div>
 
-                      <div className="grid grid-cols-4 gap-1">
-                        <Input
-                          type="number"
-                          step="any"
-                          placeholder="P (Panjang)"
-                          value={out.length || ""}
-                          onChange={(e) => {
-                            const updated = [...transformationForm.outputs];
-                            updated[idx].length = e.target.value;
-                            setTransformationForm({ ...transformationForm, outputs: updated });
-                          }}
-                          className="h-7 text-[11px] bg-white"
-                        />
-                        <Input
-                          type="number"
-                          step="any"
-                          placeholder="L (Lebar)"
-                          value={out.width || ""}
-                          onChange={(e) => {
-                            const updated = [...transformationForm.outputs];
-                            updated[idx].width = e.target.value;
-                            setTransformationForm({ ...transformationForm, outputs: updated });
-                          }}
-                          className="h-7 text-[11px] bg-white"
-                        />
-                        <Input
-                          type="number"
-                          step="any"
-                          placeholder="T (Tebal)"
-                          value={out.thickness || ""}
-                          onChange={(e) => {
-                            const updated = [...transformationForm.outputs];
-                            updated[idx].thickness = e.target.value;
-                            setTransformationForm({ ...transformationForm, outputs: updated });
-                          }}
-                          className="h-7 text-[11px] bg-white"
-                        />
-                        <select
-                          value={out.dimension_unit || "cm"}
-                          onChange={(e) => {
-                            const updated = [...transformationForm.outputs];
-                            updated[idx].dimension_unit = e.target.value;
-                            setTransformationForm({ ...transformationForm, outputs: updated });
-                          }}
-                          className="h-7 text-[11px] rounded border border-[#E5DCC5] bg-white px-1"
-                        >
-                          <option value="cm">cm</option>
-                          <option value="mm">mm</option>
-                          <option value="m">m</option>
-                        </select>
+                          <div className="flex items-center gap-2">
+                            {!isExistingMode && (
+                              <select
+                                value={out.form_type || "standard"}
+                                onChange={(e) => {
+                                  const updated = [...transformationForm.outputs];
+                                  updated[idx].form_type = e.target.value;
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="text-[11px] rounded border border-[#E5DCC5] bg-white px-2 py-0.5"
+                              >
+                                <option value="standard">Standard (Komponen)</option>
+                                <option value="custom">Custom (Sisa Potong / Remnant)</option>
+                              </select>
+                            )}
+                            {transformationForm.outputs.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const updated = transformationForm.outputs.filter((_, i) => i !== idx);
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="text-red-500 hover:text-red-700"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* MODE A: PILIH UKURAN YANG ADA */}
+                        {isExistingMode ? (
+                          <div className="space-y-2 bg-[#FAF8F5] p-2 rounded border border-[#E5DCC5]">
+                            <div>
+                              <Label className="mb-1 block text-[11px] font-medium text-[#5C4A3D]">
+                                Pilih Ukuran / Bentuk yang Sudah Ada
+                              </Label>
+                              <select
+                                value={out.existing_form_id || ""}
+                                onChange={(e) => {
+                                  const selId = e.target.value;
+                                  const chosen = existingFormsList.find((sf) => sf.id === selId);
+                                  const updated = [...transformationForm.outputs];
+                                  if (chosen) {
+                                    updated[idx] = {
+                                      ...updated[idx],
+                                      existing_form_id: chosen.id,
+                                      form_type: chosen.form_type || "standard",
+                                      label: chosen.label || "",
+                                      width: chosen.width ?? "",
+                                      length: chosen.length ?? "",
+                                      thickness: chosen.thickness ?? "",
+                                      dimension_unit: chosen.dimension_unit || "cm",
+                                      stock_unit: chosen.stock_unit || selectedTransformationMaterial?.unit || "pcs",
+                                    };
+                                  } else {
+                                    updated[idx].existing_form_id = "";
+                                  }
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="w-full text-xs rounded border border-[#E5DCC5] bg-white px-2 py-1.5"
+                              >
+                                <option value="">-- Pilih Ukuran Terdaftar --</option>
+                                {existingFormsList.map((sf) => (
+                                  <option key={sf.id} value={sf.id}>
+                                    [{sf.form_type === "custom" ? "Custom" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} (Stok saat ini: {sf.current_quantity || 0} {sf.stock_unit})
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <Label className="mb-1 block text-[11px] font-medium text-[#5C4A3D]">
+                                  Jumlah Tambahan Hasil Potong (Qty) <span className="text-red-500">*</span>
+                                </Label>
+                                <div className="flex items-center gap-1">
+                                  <Input
+                                    type="number"
+                                    step="any"
+                                    min="0.0001"
+                                    placeholder="Qty"
+                                    value={out.quantity || ""}
+                                    onChange={(e) => {
+                                      const updated = [...transformationForm.outputs];
+                                      updated[idx].quantity = e.target.value;
+                                      setTransformationForm({ ...transformationForm, outputs: updated });
+                                    }}
+                                    className="h-8 text-xs bg-white w-24"
+                                    required
+                                  />
+                                  <span className="text-xs text-[#5C4A3D] font-medium px-2 py-1 bg-white rounded border border-[#E5DCC5]">
+                                    {out.stock_unit || selectedTransformationMaterial?.unit || "pcs"}
+                                  </span>
+                                </div>
+                              </div>
+
+                              {out.existing_form_id && (
+                                <div className="text-[11px] text-[#5C4A3D] self-end pb-1">
+                                  <span>Dimensi: </span>
+                                  <strong>
+                                    {out.length && out.width ? `${out.length} × ${out.width}` : "-"}{out.thickness ? ` × ${out.thickness}` : ""} {out.dimension_unit}
+                                  </strong>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          /* MODE B: UKURAN / KOMPONEN BARU */
+                          <div className="space-y-2">
+                            <div className="grid grid-cols-2 gap-2">
+                              <Input
+                                placeholder="Label (contoh: Rak 80x30, Sisa 42x244)"
+                                value={out.label || ""}
+                                onChange={(e) => {
+                                  const updated = [...transformationForm.outputs];
+                                  updated[idx].label = e.target.value;
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="h-8 text-xs bg-white"
+                              />
+                              <div className="flex items-center gap-1">
+                                <Input
+                                  type="number"
+                                  step="any"
+                                  min="0.0001"
+                                  placeholder="Qty"
+                                  value={out.quantity || ""}
+                                  onChange={(e) => {
+                                    const updated = [...transformationForm.outputs];
+                                    updated[idx].quantity = e.target.value;
+                                    setTransformationForm({ ...transformationForm, outputs: updated });
+                                  }}
+                                  className="h-8 text-xs bg-white w-20"
+                                  required
+                                />
+                                <Input
+                                  placeholder="Satuan"
+                                  value={out.stock_unit || selectedTransformationMaterial?.unit || "pcs"}
+                                  onChange={(e) => {
+                                    const updated = [...transformationForm.outputs];
+                                    updated[idx].stock_unit = e.target.value;
+                                    setTransformationForm({ ...transformationForm, outputs: updated });
+                                  }}
+                                  className="h-8 text-xs bg-white"
+                                />
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-4 gap-1">
+                              <Input
+                                type="number"
+                                step="any"
+                                placeholder="P (Panjang)"
+                                value={out.length || ""}
+                                onChange={(e) => {
+                                  const updated = [...transformationForm.outputs];
+                                  updated[idx].length = e.target.value;
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="h-7 text-[11px] bg-white"
+                              />
+                              <Input
+                                type="number"
+                                step="any"
+                                placeholder="L (Lebar)"
+                                value={out.width || ""}
+                                onChange={(e) => {
+                                  const updated = [...transformationForm.outputs];
+                                  updated[idx].width = e.target.value;
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="h-7 text-[11px] bg-white"
+                              />
+                              <Input
+                                type="number"
+                                step="any"
+                                placeholder="T (Tebal)"
+                                value={out.thickness || ""}
+                                onChange={(e) => {
+                                  const updated = [...transformationForm.outputs];
+                                  updated[idx].thickness = e.target.value;
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="h-7 text-[11px] bg-white"
+                              />
+                              <select
+                                value={out.dimension_unit || "cm"}
+                                onChange={(e) => {
+                                  const updated = [...transformationForm.outputs];
+                                  updated[idx].dimension_unit = e.target.value;
+                                  setTransformationForm({ ...transformationForm, outputs: updated });
+                                }}
+                                className="h-7 text-[11px] rounded border border-[#E5DCC5] bg-white px-1"
+                              >
+                                <option value="cm">cm</option>
+                                <option value="mm">mm</option>
+                                <option value="m">m</option>
+                              </select>
+                            </div>
+                          </div>
+                        )}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
 
