@@ -976,11 +976,11 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         src_sf = asyncio.run(mock_db.stock_forms.find_one({"_id": source_sf_id}))
         self.assertEqual(src_sf["current_quantity"], 9.0)
 
-        # Output form has 20.0 pcs
+        # Output form has 20.0 lembar (inherits material.unit='lembar', never converted to pcs)
         out_sf_id = res["transformation"]["output_stock_forms"][0]["stock_form_id"]
         out_sf = asyncio.run(mock_db.stock_forms.find_one({"_id": ObjectId(out_sf_id)}))
         self.assertEqual(out_sf["current_quantity"], 20.0)
-        self.assertEqual(out_sf["stock_unit"], "pcs")
+        self.assertEqual(out_sf["stock_unit"], "lembar")
 
     @patch("server.db")
     def test_34_purchase_precut_keeps_only_remaining_raw_stock_in_current_stock(self, mock_db):

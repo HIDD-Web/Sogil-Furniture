@@ -35,14 +35,27 @@ import {
 import { toast } from "sonner";
 
 const CATEGORIES = ["Material", "Parts"];
-const UNITS = ["pcs", "batang", "lembar", "meter", "kg", "box"];
+const UNITS = [
+  { value: "lembar", label: "lembar", helper: "Sheet / papan (BlockBoard, MDF, Triplek, HPL, Fiber, PVC)" },
+  { value: "pcs", label: "pcs", helper: "Komponen individual (engsel, bracket, baut, roda, gagang)" },
+  { value: "meter", label: "meter", helper: "Material memanjang linier (kayu list, edging, kabel)" },
+  { value: "kg", label: "kg", helper: "Material berdasar berat (dempul, lem bubuk, serbuk)" },
+  { value: "liter", label: "liter", helper: "Cairan / finishing (cat, pernis, thinner, lem cair)" },
+  { value: "set", label: "set", helper: "Kit / rakitan komersial lengkap (mounting kit)" },
+  { value: "roll", label: "roll", helper: "Material roll utuh (isolasi, packaging roll)" },
+  { value: "box", label: "box", helper: "Kemasan kotak (sekrup/paku per box)" },
+  { value: "pack", label: "pack", helper: "Kemasan pack" },
+  { value: "botol", label: "botol", helper: "Kemasan botol" },
+  { value: "kaleng", label: "kaleng", helper: "Kemasan kaleng" },
+  { value: "batang", label: "batang", helper: "Lumber / balok kayu (legacy)" },
+];
 
 const INITIAL_FORM = {
   name: "",
   category: "Material",
   specs: "",
   sku: "",
-  unit: "pcs",
+  unit: "lembar",
   notes: "",
 };
 
@@ -535,7 +548,7 @@ export default function AdminMaterials() {
         length: newStockForm.length ? Number(newStockForm.length) : undefined,
         thickness: newStockForm.thickness ? Number(newStockForm.thickness) : undefined,
         dimension_unit: newStockForm.dimension_unit || "cm",
-        stock_unit: newStockForm.stock_unit || selectedStockFormMaterial.unit || "pcs",
+        stock_unit: selectedStockFormMaterial.unit,
         label: newStockForm.label.trim(),
         notes: newStockForm.notes.trim(),
       };
@@ -2051,16 +2064,12 @@ export default function AdminMaterials() {
                                 className="h-8 text-xs bg-white w-20"
                                 required={purchaseForm.enable_precut}
                               />
-                              <Input
-                                placeholder="Satuan"
-                                value={out.stock_unit || selectedPurchaseMaterial?.unit || "pcs"}
-                                onChange={(e) => {
-                                  const updated = [...purchaseForm.precut_outputs];
-                                  updated[idx].stock_unit = e.target.value;
-                                  setPurchaseForm({ ...purchaseForm, precut_outputs: updated });
-                                }}
-                                className="h-8 text-xs bg-white"
-                              />
+                              <div
+                                title="Satuan inventaris diwarisi dari bahan master"
+                                className="h-8 px-2 flex items-center justify-center rounded-md border border-[#E5DCC5] bg-[#F7F4EE] text-xs font-semibold text-[#5C4A3D] cursor-not-allowed min-w-[60px]"
+                              >
+                                {selectedPurchaseMaterial?.unit || "lembar"}
+                              </div>
                             </div>
                           </div>
                           <div className="grid grid-cols-4 gap-1">
@@ -2666,7 +2675,7 @@ export default function AdminMaterials() {
 
                 <div>
                   <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
-                    Satuan <span className="text-red-500">*</span>
+                    Satuan Inventaris <span className="text-red-500">*</span>
                   </Label>
                   <Select
                     value={form.unit}
@@ -2675,10 +2684,13 @@ export default function AdminMaterials() {
                     <SelectTrigger className="bg-white" data-testid="material-form-unit">
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent>
+                    <SelectContent className="max-h-72">
                       {UNITS.map((u) => (
-                        <SelectItem key={u} value={u}>
-                          {u}
+                        <SelectItem key={u.value} value={u.value}>
+                          <div className="flex flex-col text-left py-0.5">
+                            <span className="font-semibold text-xs text-[#2C1E16]">{u.label}</span>
+                            <span className="text-[10px] text-[#8B7355]">{u.helper}</span>
+                          </div>
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -3337,16 +3349,12 @@ export default function AdminMaterials() {
                                   className="h-8 text-xs bg-white w-20"
                                   required
                                 />
-                                <Input
-                                  placeholder="Satuan"
-                                  value={out.stock_unit || selectedTransformationMaterial?.unit || "pcs"}
-                                  onChange={(e) => {
-                                    const updated = [...transformationForm.outputs];
-                                    updated[idx].stock_unit = e.target.value;
-                                    setTransformationForm({ ...transformationForm, outputs: updated });
-                                  }}
-                                  className="h-8 text-xs bg-white"
-                                />
+                                <div
+                                  title="Satuan inventaris diwarisi dari bahan master (tidak berubah saat transformasi)"
+                                  className="h-8 px-2 flex items-center justify-center rounded-md border border-[#E5DCC5] bg-[#F7F4EE] text-xs font-semibold text-[#5C4A3D] cursor-not-allowed min-w-[60px]"
+                                >
+                                  {selectedTransformationMaterial?.unit || "lembar"}
+                                </div>
                               </div>
                             </div>
 

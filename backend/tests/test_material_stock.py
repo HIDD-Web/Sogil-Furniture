@@ -1022,6 +1022,227 @@ class TestMaterialStockPhase3(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_36_material_master_unit_standard_allowed_and_rejected(self):
+        """Standard canonical units are accepted while invalid arbitrary free-text units are rejected."""
+        from mongomock_motor import AsyncMongoMockClient
+        from server import MaterialInput, create_material
+
+        client = AsyncMongoMockClient()
+        db = client["test_unit_std"]
+
+        async def scenario():
+            with patch("server.db", db):
+                admin = {"id": "adm_1", "name": "Admin", "role": "admin"}
+                # Canonical units
+                for valid_unit in ["lembar", "pcs", "meter", "kg", "liter", "set", "roll", "box", "pack", "botol", "kaleng", "batang"]:
+                    data = MaterialInput(
+                        name=f"Mat {valid_unit}",
+                        category="Material",
+                        specs="Specs A",
+                        unit=valid_unit
+                    )
+                    res = await create_material(data, admin=admin)
+                    self.assertEqual(res["unit"], valid_unit)
+
+                # Arbitrary invalid units must be rejected
+                for invalid_unit in ["buah", "biji", "potong", "lembaran", "unit", "pieces"]:
+                    data = MaterialInput(
+                        name=f"Mat {invalid_unit}",
+                        category="Material",
+                        specs="Specs B",
+                        unit=invalid_unit
+                    )
+                    with self.assertRaises(HTTPException) as cm:
+                        await create_material(data, admin=admin)
+                    self.assertEqual(cm.exception.status_code, 400)
+                    self.assertIn("Satuan tidak valid", cm.exception.detail)
+
+        asyncio.run(scenario())
+
+    def test_37_stock_form_strictly_inherits_material_unit(self):
+        """Stock form inherits material unit (e.g. lembar for BlockBoard) even if caller passes pcs."""
+        from mongomock_motor import AsyncMongoMockClient
+        from server import get_or_create_stock_form
+
+        client = AsyncMongoMockClient()
+        db = client["test_unit_inherit"]
+
+        async def scenario():
+            with patch("server.db", db):
+                # 1. Create BlockBoard with unit=lembar
+                mat_res = await db.materials.insert_one({
+                    "name": "BlockBoard",
+                    "specs": "122x244 cm",
+                    "unit": "lembar",
+                    "category": "Material",
+                    "status": "active"
+                })
+                mat_id = str(mat_res.inserted_id)
+
+                # 2. Create standard cut form (Rak 80x20) where caller mistakenly sends stock_unit="pcs"
+                sf = await get_or_create_stock_form(
+                    material_id=mat_id,
+                    form_type="standard",
+                    width=20.0,
+                    length=80.0,
+                    stock_unit="pcs",  # Should be ignored in favor of material's lembar
+                    label="Rak 80x20"
+                )
+                self.assertEqual(sf["stock_unit"], "lembar")
+                self.assertEqual(sf["label"], "Rak 80x20")
+
+                # 3. Create raw form
+                raw_sf = await get_or_create_stock_form(
+                    material_id=mat_id,
+                    form_type="raw",
+                    label="Raw / Bentuk Asal"
+                )
+                self.assertEqual(raw_sf["stock_unit"], "lembar")
+
+        asyncio.run(scenario())
+
+    def test_38_stock_form_creation_fails_if_material_unit_invalid_or_missing(self):
+        """Stock form creation rejects operation without fallback if material unit is missing or invalid."""
+        from mongomock_motor import AsyncMongoMockClient
+        from server import get_or_create_stock_form
+
+        client = AsyncMongoMockClient()
+        db = client["test_unit_invalid_mat"]
+
+        async def scenario():
+            with patch("server.db", db):
+                # Material without valid unit
+                mat_res = await db.materials.insert_one({
+                    "name": "Invalid Material",
+                    "specs": "Custom",
+                    "unit": "",  # Missing / empty
+                    "category": "Material"
+                })
+                mat_id = str(mat_res.inserted_id)
+
+                with self.assertRaises(HTTPException) as cm:
+                    await get_or_create_stock_form(
+                        material_id=mat_id,
+                        form_type="standard",
+                        label="Rak Test"
+                    )
+                self.assertEqual(cm.exception.status_code, 400)
+                self.assertIn("tidak memiliki satuan inventaris valid", cm.exception.detail)
+
+        asyncio.run(scenario())
+
+    def test_39_stock_transformation_locks_output_to_material_unit(self):
+        """Transforming BlockBoard (122x244) into Rak 80x20 and Rak 60x20 keeps stock_unit as lembar, NOT pcs."""
+        from mongomock_motor import AsyncMongoMockClient
+        from server import (
+            StockTransformationInput,
+            StockFormOutputItemInput,
+            create_stock_transformation,
+            get_or_create_stock_form
+        )
+
+        client = AsyncMongoMockClient()
+        db = client["test_trans_unit"]
+
+        async def scenario():
+            with patch("server.db", db):
+                admin = {"id": "adm_1", "name": "Admin", "role": "admin"}
+                mat_res = await db.materials.insert_one({
+                    "name": "BlockBoard",
+                    "specs": "122x244 cm",
+                    "unit": "lembar",
+                    "category": "Material",
+                    "status": "active",
+                    "current_stock": 2.0
+                })
+                mat_id = str(mat_res.inserted_id)
+
+                raw_sf = await get_or_create_stock_form(
+                    material_id=mat_id,
+                    form_type="raw",
+                    label="Raw / Bentuk Asal"
+                )
+                await db.stock_forms.update_one({"_id": raw_sf["_id"]}, {"$set": {"current_quantity": 2.0}})
+
+                # Transform 1 raw lembar into 18 pieces of Rak 80x20
+                trans_input = StockTransformationInput(
+                    material_id=mat_id,
+                    source_stock_form_id=str(raw_sf["_id"]),
+                    source_quantity=1.0,
+                    outputs=[
+                        StockFormOutputItemInput(
+                            form_type="standard",
+                            label="Rak 80x20",
+                            length=80.0,
+                            width=20.0,
+                            quantity=18.0,
+                            stock_unit="pcs"  # Caller passes pcs; must be overridden by material's lembar
+                        ),
+                        StockFormOutputItemInput(
+                            form_type="standard",
+                            label="Rak 60x20",
+                            length=60.0,
+                            width=20.0,
+                            quantity=24.0,
+                            stock_unit="pcs"  # Caller passes pcs; must be overridden by material's lembar
+                        )
+                    ]
+                )
+                res = await create_stock_transformation(trans_input, admin=admin)
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["transformation"]["source_stock_unit"], "lembar")
+
+                # Verify outputs in transformation doc
+                for out in res["transformation"]["output_stock_forms"]:
+                    self.assertEqual(out["stock_unit"], "lembar")
+                    self.assertNotEqual(out["stock_unit"], "pcs")
+
+                # Verify stock forms in DB
+                sf_80 = await db.stock_forms.find_one({"label": "Rak 80x20"})
+                self.assertIsNotNone(sf_80)
+                self.assertEqual(sf_80["stock_unit"], "lembar")
+                self.assertEqual(sf_80["current_quantity"], 18.0)
+
+                sf_60 = await db.stock_forms.find_one({"label": "Rak 60x20"})
+                self.assertIsNotNone(sf_60)
+                self.assertEqual(sf_60["stock_unit"], "lembar")
+                self.assertEqual(sf_60["current_quantity"], 24.0)
+
+        asyncio.run(scenario())
+
+    def test_40_hardware_and_linear_and_liquid_unit_fidelity(self):
+        """Hardware uses pcs, linear uses meter, liquid uses liter, and lumber keeps batang."""
+        from mongomock_motor import AsyncMongoMockClient
+        from server import get_or_create_stock_form
+
+        client = AsyncMongoMockClient()
+        db = client["test_other_units"]
+
+        async def scenario():
+            with patch("server.db", db):
+                # Hardware: L-Bracket -> pcs
+                m_hw = await db.materials.insert_one({"name": "L Bracket", "specs": "4x4 cm", "unit": "pcs", "status": "active"})
+                sf_hw = await get_or_create_stock_form(str(m_hw.inserted_id), form_type="standard", label="Standard")
+                self.assertEqual(sf_hw["stock_unit"], "pcs")
+
+                # Linear: Kayu List -> meter
+                m_lin = await db.materials.insert_one({"name": "Kayu List", "specs": "Profil 2 cm", "unit": "meter", "status": "active"})
+                sf_lin = await get_or_create_stock_form(str(m_lin.inserted_id), form_type="standard", label="Standard")
+                self.assertEqual(sf_lin["stock_unit"], "meter")
+
+                # Liquid: Cat -> liter
+                m_liq = await db.materials.insert_one({"name": "Cat Duco Putih", "specs": "White Gloss", "unit": "liter", "status": "active"})
+                sf_liq = await get_or_create_stock_form(str(m_liq.inserted_id), form_type="raw", label="Raw Kaleng")
+                self.assertEqual(sf_liq["stock_unit"], "liter")
+
+                # Lumber: Balok 5x5 -> batang (legacy)
+                m_lum = await db.materials.insert_one({"name": "Balok 5x5", "specs": "5x5x400 cm", "unit": "batang", "status": "active"})
+                sf_lum = await get_or_create_stock_form(str(m_lum.inserted_id), form_type="standard", label="Standard 4m")
+                self.assertEqual(sf_lum["stock_unit"], "batang")
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()
+

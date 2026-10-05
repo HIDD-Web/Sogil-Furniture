@@ -4748,7 +4748,24 @@ async def export_product_prices(admin: dict = Depends(require_perm("modify_produ
 # Master Data Bahan (Materials)
 # --------------------------------------------------------------------------
 ALLOWED_MATERIAL_CATEGORIES = ["Material", "Parts"]
-ALLOWED_MATERIAL_UNITS = ["pcs", "batang", "lembar", "meter", "kg", "box"]
+# Canonical master unit standard:
+# Primary: lembar (sheet/board), pcs (individual), meter (linear), kg (weight), liter (liquid),
+#          set (kit), roll (roll), box (box), pack (pack), botol (bottle), kaleng (can).
+# Legacy: batang (preserved strictly for backward compatibility of existing lumber/balok records).
+ALLOWED_MATERIAL_UNITS = [
+    "lembar",
+    "pcs",
+    "meter",
+    "kg",
+    "liter",
+    "set",
+    "roll",
+    "box",
+    "pack",
+    "botol",
+    "kaleng",
+    "batang",
+]
 
 def normalize_text_key(s: str) -> str:
     return " ".join(s.strip().lower().split())
@@ -5028,6 +5045,12 @@ async def create_material_purchase(
                     status_code=400,
                     detail=f"Jumlah yang diproses ({proc_qty}) tidak boleh melebihi jumlah pembelian ({qty})"
                 )
+            mat_unit = (mat.get("unit") or "").strip().lower()
+            if not mat_unit or mat_unit not in ALLOWED_MATERIAL_UNITS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Master bahan '{mat.get('name')}' tidak memiliki satuan inventaris valid."
+                )
             raw_rem = round(qty - proc_qty, 4)
             valid_outputs = []
             if proc_qty > 0:
@@ -5043,7 +5066,7 @@ async def create_material_purchase(
                         "length": round(float(out_item.length), 2) if out_item.length is not None and out_item.length != "" else None,
                         "thickness": round(float(out_item.thickness), 2) if out_item.thickness is not None and out_item.thickness != "" else None,
                         "dimension_unit": (out_item.dimension_unit or "cm").strip().lower(),
-                        "stock_unit": (out_item.stock_unit or mat.get("unit") or "pcs").strip(),
+                        "stock_unit": mat_unit,
                         "quantity": out_q,
                         "label": (out_item.label or "").strip(),
                         "notes": (out_item.notes or "").strip(),
@@ -5253,11 +5276,20 @@ async def get_or_create_stock_form(
         raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
 
     canonical_mat_id = str(mat["_id"])
+    mat_unit = (mat.get("unit") or "").strip().lower()
+    if not mat_unit or mat_unit not in ALLOWED_MATERIAL_UNITS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Master bahan '{mat.get('name', canonical_mat_id)}' tidak memiliki satuan inventaris valid. Satuan bahan harus salah satu dari: {', '.join(ALLOWED_MATERIAL_UNITS)}"
+        )
+    # Stock forms MUST strictly inherit the material's canonical inventory unit.
+    # Physical form describes the shape/cut, but the inventory counting unit remains the material unit.
+    s_unit = mat_unit
+
     w = round(float(width), 2) if width is not None and width != "" else None
     l = round(float(length), 2) if length is not None and length != "" else None
     th = round(float(thickness), 2) if thickness is not None and thickness != "" else None
     d_unit = (dimension_unit or "cm").strip().lower()
-    s_unit = (stock_unit or mat.get("unit") or "pcs").strip()
     lbl = (label or "").strip()
     f_type = (form_type or "standard").strip().lower()
     if f_type not in ["raw", "standard", "custom"]:
@@ -6325,7 +6357,7 @@ async def create_custom_stock_form(
         length=data.length,
         thickness=data.thickness,
         dimension_unit=data.dimension_unit or "cm",
-        stock_unit=data.stock_unit or mat.get("unit") or "pcs",
+        stock_unit=mat.get("unit"),
         label=(data.label or "").strip(),
         notes=(data.notes or "").strip(),
         admin=admin
@@ -6433,6 +6465,13 @@ async def create_stock_transformation(
     if not data.outputs or len(data.outputs) == 0:
         raise HTTPException(status_code=400, detail="Minimal satu bentuk hasil transformasi (output form) harus diisi")
 
+    mat_unit = (mat.get("unit") or "").strip().lower()
+    if not mat_unit or mat_unit not in ALLOWED_MATERIAL_UNITS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Master bahan '{mat.get('name')}' tidak memiliki satuan inventaris valid."
+        )
+
     valid_outputs = []
     for out_item in data.outputs:
         out_q = round(_num(out_item.quantity), 4)
@@ -6445,7 +6484,7 @@ async def create_stock_transformation(
             "length": round(float(out_item.length), 2) if out_item.length is not None and out_item.length != "" else None,
             "thickness": round(float(out_item.thickness), 2) if out_item.thickness is not None and out_item.thickness != "" else None,
             "dimension_unit": (out_item.dimension_unit or "cm").strip().lower(),
-            "stock_unit": (out_item.stock_unit or mat.get("unit") or "pcs").strip(),
+            "stock_unit": mat_unit,
             "quantity": out_q,
             "label": (out_item.label or "").strip(),
             "notes": (out_item.notes or "").strip(),
