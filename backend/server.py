@@ -5508,17 +5508,24 @@ async def apply_stock_movement_atomic(
         "previous_stock": prev_stock,
         "new_stock": target_new_stock,
         "movement_date": movement_date[:10],
-        "related_purchase_id": related_purchase_id,
-        "related_purchase_number": related_purchase_number,
-        "stock_form_id": str(stock_form_doc["_id"]) if stock_form_doc else (str(stock_form_id) if stock_form_id else None),
-        "transformation_id": transformation_id,
-        "transformation_number": transformation_number,
         "reason": reason.strip(),
         "notes": (notes or "").strip(),
         "created_at": now,
         "created_by_id": admin.get("id"),
         "created_by_name": admin.get("name", "Admin"),
     }
+    if related_purchase_id:
+        movement_doc["related_purchase_id"] = str(related_purchase_id)
+    if related_purchase_number:
+        movement_doc["related_purchase_number"] = str(related_purchase_number)
+    if stock_form_doc:
+        movement_doc["stock_form_id"] = str(stock_form_doc["_id"])
+    elif stock_form_id:
+        movement_doc["stock_form_id"] = str(stock_form_id)
+    if transformation_id:
+        movement_doc["transformation_id"] = str(transformation_id)
+    if transformation_number:
+        movement_doc["transformation_number"] = str(transformation_number)
 
     # Unique movement_number retry loop
     for attempt in range(5):
@@ -5530,7 +5537,7 @@ async def apply_stock_movement_atomic(
             break
         except pymongo.errors.DuplicateKeyError as dke:
             # Check if this duplicate is on related_purchase_id idempotency index
-            if "uniq_purchase_stock_movement" in str(dke):
+            if "uniq_purchase_stock_movement" in str(dke) and related_purchase_id:
                 # Rollback current_stock and stock_form if not in a transaction
                 if not session:
                     if update_material_aggregate:

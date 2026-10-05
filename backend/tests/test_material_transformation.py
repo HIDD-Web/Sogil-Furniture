@@ -583,6 +583,10 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         )
         res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
         self.assertEqual(len(res["transformation"]["output_stock_forms"]), 2)
+        # Verify that material_stocks movements created for transformation do NOT contain related_purchase_id
+        for call_args in mock_db.material_stocks.insert_one.call_args_list:
+            inserted_doc = call_args[0][0]
+            self.assertNotIn("related_purchase_id", inserted_doc)
 
     @patch("server.db")
     def test_19_20_insufficient_source_stock_rejected(self, mock_db):
