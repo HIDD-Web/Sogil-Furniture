@@ -4388,12 +4388,31 @@ async def seed():
             [("material_id", 1), ("movement_date", -1), ("created_at", -1)],
             name="idx_stock_material_date"
         )
-        await db.material_stocks.create_index(
-            [("related_purchase_id", 1), ("movement_type", 1)],
-            unique=True,
-            sparse=True,
-            name="uniq_purchase_stock_movement"
-        )
+        # Inspect existing index definition without dropping or mutating
+        legacy_incompatible_index = False
+        try:
+            cur_indexes = await db.material_stocks.index_information()
+            if "uniq_purchase_stock_movement" in cur_indexes:
+                idx_def = cur_indexes["uniq_purchase_stock_movement"]
+                # Incompatible if it has legacy sparse=True or is missing partialFilterExpression
+                if idx_def.get("sparse") or not idx_def.get("partialFilterExpression"):
+                    legacy_incompatible_index = True
+                    logger.warning(
+                        "INCOMPATIBLE INDEX DETECTED: 'uniq_purchase_stock_movement' on material_stocks has legacy sparse=True "
+                        "options instead of partialFilterExpression. Automated drop on startup is disabled per production safety policy. "
+                        "Run the explicit migration script 'scripts/migrate_purchase_stock_movement_index.py' to safely migrate the index."
+                    )
+        except Exception as e:
+            logger.warning(f"Unable to inspect material_stocks index information: {e}")
+
+        # Only attempt create_index if no incompatible legacy index was detected
+        if not legacy_incompatible_index:
+            await db.material_stocks.create_index(
+                [("related_purchase_id", 1), ("movement_type", 1)],
+                unique=True,
+                partialFilterExpression={"related_purchase_id": {"$type": "string"}},
+                name="uniq_purchase_stock_movement"
+            )
     except Exception:
         pass
 
@@ -5627,23 +5646,46 @@ async def apply_stock_movement_atomic(
             movement_doc["_id"] = res.inserted_id
             break
         except pymongo.errors.DuplicateKeyError as dke:
-            # Check if this duplicate is on related_purchase_id idempotency index
-            if "uniq_purchase_stock_movement" in str(dke) and related_purchase_id:
-                # Rollback current_stock and stock_form if not in a transaction
+            err_msg = str(dke)
+
+            # 1. Purchase idempotency index collision
+            if "uniq_purchase_stock_movement" in err_msg and related_purchase_id:
                 if not session:
                     if update_material_aggregate:
                         await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
                     if stock_form_id and stock_form_doc:
                         await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
                 raise HTTPException(status_code=409, detail="Stok untuk pembelian ini sudah pernah dicatat.")
-            if attempt == 4:
-                # Rollback on fatal failure if not in a transaction
-                if not session:
-                    if update_material_aggregate:
-                        await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
-                    if stock_form_id and stock_form_doc:
-                        await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
-                raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pergerakan stok unik.")
+
+            # 2. Movement number collision: check if collision belongs to uniq_movement_number
+            is_movement_number_collision = (
+                "uniq_movement_number" in err_msg or
+                "movement_number" in err_msg or
+                "movement_number_" in err_msg
+            )
+
+            if is_movement_number_collision:
+                if attempt == 4:
+                    if not session:
+                        if update_material_aggregate:
+                            await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                        if stock_form_id and stock_form_doc:
+                            await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
+                    raise HTTPException(status_code=500, detail="Gagal mengalokasikan nomor pergerakan stok unik.")
+                continue
+
+            # 3. Unrelated unique index collision: DO NOT retry movement allocation, rollback immediately
+            if not session:
+                if update_material_aggregate:
+                    await db.materials.update_one({"_id": mat["_id"]}, {"$set": {"current_stock": prev_stock}}, **kw)
+                if stock_form_id and stock_form_doc:
+                    await db.stock_forms.update_one({"_id": stock_form_doc["_id"]}, {"$set": {"current_quantity": prev_sf_qty}}, **kw)
+
+            logger.error(f"Unrelated DuplicateKeyError during stock movement insertion: {dke}")
+            raise HTTPException(
+                status_code=409,
+                detail="Konflik indeks unik pada pergerakan stok (data pergerakan duplikat terdeteksi)."
+            )
 
     return clean(movement_doc)
 
