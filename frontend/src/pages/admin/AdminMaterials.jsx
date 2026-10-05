@@ -550,7 +550,7 @@ export default function AdminMaterials() {
     setTransformationForm({
       material_id: matId,
       transformation_date: new Date().toISOString().slice(0, 10),
-      source_stock_form_id: "",
+      source_stock_form_id: matId ? "raw" : "",
       source_quantity: "",
       outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: presetMaterial?.unit || "pcs" }],
       notes: "",
@@ -748,8 +748,17 @@ export default function AdminMaterials() {
   }, [materials, transformationForm.material_id]);
 
   const selectedSourceStockForm = useMemo(() => {
+    if (transformationForm.source_stock_form_id === "raw") {
+      return {
+        id: "raw",
+        form_type: "raw",
+        label: "Stok Mentah Utuh",
+        current_quantity: selectedTransformationMaterial?.current_stock || 0,
+        stock_unit: selectedTransformationMaterial?.unit || "lembar",
+      };
+    }
     return availableSourceForms.find((sf) => sf.id === transformationForm.source_stock_form_id);
-  }, [availableSourceForms, transformationForm.source_stock_form_id]);
+  }, [availableSourceForms, transformationForm.source_stock_form_id, selectedTransformationMaterial]);
 
   const purchaseEstimatedTotal = useMemo(() => {
     const q = Number(purchaseForm.quantity) || 0;
@@ -2884,7 +2893,7 @@ export default function AdminMaterials() {
                     setTransformationForm({
                       ...transformationForm,
                       material_id: val,
-                      source_stock_form_id: "",
+                      source_stock_form_id: "raw",
                       outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: materials.find(m => m.id === val)?.unit || "pcs" }]
                     });
                     if (val) loadSourceForms(val);
@@ -2929,11 +2938,18 @@ export default function AdminMaterials() {
                         <SelectValue placeholder="-- Pilih Bentuk Asal --" />
                       </SelectTrigger>
                       <SelectContent>
-                        {availableSourceForms.map((sf) => (
-                          <SelectItem key={sf.id} value={sf.id}>
-                            [{sf.form_type === "raw" ? "Raw/Utuh" : sf.form_type === "custom" ? "Custom" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} (Stok: {sf.current_quantity || 0} {sf.stock_unit})
+                        {selectedTransformationMaterial && (
+                          <SelectItem value="raw">
+                            [Raw/Utuh] Stok Mentah Utuh ({selectedTransformationMaterial.specs || selectedTransformationMaterial.name}) (Stok: {selectedTransformationMaterial.current_stock || 0} {selectedTransformationMaterial.unit || "lembar"})
                           </SelectItem>
-                        ))}
+                        )}
+                        {availableSourceForms
+                          .filter((sf) => sf.form_type !== "raw")
+                          .map((sf) => (
+                            <SelectItem key={sf.id} value={sf.id}>
+                              [{sf.form_type === "custom" ? "Custom" : "Standard"}] {sf.label || (sf.width && sf.length ? `${sf.length}×${sf.width} ${sf.dimension_unit}` : "Bentuk Stok")} (Stok: {sf.current_quantity || 0} {sf.stock_unit})
+                            </SelectItem>
+                          ))}
                       </SelectContent>
                     </Select>
                   )}

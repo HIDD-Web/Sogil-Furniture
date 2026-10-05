@@ -4796,108 +4796,6 @@ async def create_material(
     except pymongo.errors.DuplicateKeyError:
         raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{name}' dan spesifikasi '{specs}' sudah terdaftar")
 
-@api_router.get("/admin/materials/{mat_id}")
-async def get_material_detail(
-    mat_id: str,
-    admin: dict = Depends(require_material_perm())
-):
-    doc = await db.materials.find_one({"_id": id_query(mat_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
-    return clean(doc)
-
-@api_router.put("/admin/materials/{mat_id}")
-async def update_material(
-    mat_id: str,
-    data: MaterialUpdateInput,
-    admin: dict = Depends(require_material_perm())
-):
-    doc = await db.materials.find_one({"_id": id_query(mat_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
-
-    upd: Dict[str, Any] = {}
-    new_name = data.name.strip() if data.name is not None else doc.get("name", "")
-    new_specs = data.specs.strip() if data.specs is not None else doc.get("specs", "")
-
-    if data.name is not None:
-        if not new_name:
-            raise HTTPException(status_code=400, detail="Nama bahan tidak boleh kosong")
-        upd["name"] = new_name
-        upd["name_normalized"] = normalize_text_key(new_name)
-
-    if data.category is not None:
-        cat = data.category.strip()
-        if cat not in ALLOWED_MATERIAL_CATEGORIES:
-            raise HTTPException(status_code=400, detail=f"Kategori tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_CATEGORIES)}")
-        upd["category"] = cat
-
-    if data.specs is not None:
-        if not new_specs:
-            raise HTTPException(status_code=400, detail="Spesifikasi/Ukuran tidak boleh kosong")
-        upd["specs"] = new_specs
-        upd["specs_normalized"] = normalize_text_key(new_specs)
-
-    if data.unit is not None:
-        u = data.unit.strip()
-        if u not in ALLOWED_MATERIAL_UNITS:
-            raise HTTPException(status_code=400, detail=f"Satuan tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_UNITS)}")
-        upd["unit"] = u
-
-    if data.sku is not None:
-        upd["sku"] = data.sku.strip() if data.sku else None
-
-    if data.notes is not None:
-        upd["notes"] = data.notes.strip()
-
-    if data.status is not None:
-        st = data.status.strip()
-        if st not in ["active", "archived"]:
-            raise HTTPException(status_code=400, detail="Status harus 'active' atau 'archived'")
-        upd["status"] = st
-
-    if not upd:
-        return clean(doc)
-
-    name_norm = upd.get("name_normalized", doc.get("name_normalized"))
-    specs_norm = upd.get("specs_normalized", doc.get("specs_normalized"))
-
-    # Check duplicate against other documents
-    existing = await db.materials.find_one({
-        "_id": {"$ne": doc["_id"]},
-        "name_normalized": name_norm,
-        "specs_normalized": specs_norm
-    })
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{new_name}' dan spesifikasi '{new_specs}' sudah terdaftar")
-
-    upd.update(audit_fields(admin))
-    try:
-        updated = await db.materials.find_one_and_update(
-            {"_id": doc["_id"]},
-            {"$set": upd},
-            return_document=ReturnDocument.AFTER
-        )
-        return clean(updated)
-    except pymongo.errors.DuplicateKeyError:
-        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{new_name}' dan spesifikasi '{new_specs}' sudah terdaftar")
-
-@api_router.delete("/admin/materials/{mat_id}")
-async def archive_material(
-    mat_id: str,
-    admin: dict = Depends(require_material_perm())
-):
-    doc = await db.materials.find_one({"_id": id_query(mat_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
-
-    upd = {"status": "archived", **audit_fields(admin)}
-    updated = await db.materials.find_one_and_update(
-        {"_id": doc["_id"]},
-        {"$set": upd},
-        return_document=ReturnDocument.AFTER
-    )
-    return {"ok": True, "message": "Bahan berhasil diarsipkan", "material": clean(updated)}
 
 # --------------------------------------------------------------------------
 # Material Purchases & Price History (Phase 2)
@@ -6323,7 +6221,16 @@ async def create_stock_transformation(
 
     canonical_mat_id = str(mat["_id"])
     source_sf_id = (data.source_stock_form_id or "").strip()
-    source_sf = await db.stock_forms.find_one({"_id": id_query(source_sf_id)})
+    if source_sf_id == "raw" or not source_sf_id:
+        source_sf = await get_or_create_stock_form(
+            material_id=canonical_mat_id,
+            form_type="raw",
+            stock_unit=mat.get("unit") or "pcs",
+            label="Raw / Bentuk Asal",
+            admin=admin
+        )
+    else:
+        source_sf = await db.stock_forms.find_one({"_id": id_query(source_sf_id)})
     if not source_sf:
         raise HTTPException(status_code=404, detail="Bentuk stok asal (source stock form) tidak ditemukan")
 
@@ -6335,6 +6242,17 @@ async def create_stock_transformation(
         raise HTTPException(status_code=400, detail="Jumlah bahan asal yang ditransformasi harus lebih besar dari 0")
 
     curr_src_qty = round(float(source_sf.get("current_quantity") or 0.0), 4)
+    mat_curr_stock = round(float(mat.get("current_stock") or 0.0), 4)
+    # If explicitly choosing "raw" canonical stock and stock_form was uninitialized (qty == 0),
+    # sync source_sf.current_quantity from materials.current_stock
+    if (source_sf_id == "raw" or not source_sf_id) and curr_src_qty == 0.0 and mat_curr_stock > 0:
+        await db.stock_forms.update_one(
+            {"_id": source_sf["_id"]},
+            {"$set": {"current_quantity": mat_curr_stock, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        curr_src_qty = mat_curr_stock
+        source_sf["current_quantity"] = mat_curr_stock
+
     if curr_src_qty < src_qty:
         sf_lbl = source_sf.get("label") or f"{source_sf.get('form_type')} ({source_sf.get('stock_unit')})"
         raise HTTPException(
@@ -6467,6 +6385,112 @@ async def create_stock_transformation(
     except Exception as e:
         logger.error(f"Failed transaction while transforming stock: {e}")
         raise HTTPException(status_code=500, detail=f"Gagal memproses transformasi stok: {str(e)}")
+
+# --------------------------------------------------------------------------
+# Material Detail, Update & Archive (placed after static /admin/materials routes)
+# --------------------------------------------------------------------------
+@api_router.get("/admin/materials/{mat_id}")
+async def get_material_detail(
+    mat_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+    return clean(doc)
+
+@api_router.put("/admin/materials/{mat_id}")
+async def update_material(
+    mat_id: str,
+    data: MaterialUpdateInput,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    upd: Dict[str, Any] = {}
+    new_name = data.name.strip() if data.name is not None else doc.get("name", "")
+    new_specs = data.specs.strip() if data.specs is not None else doc.get("specs", "")
+
+    if data.name is not None:
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Nama bahan tidak boleh kosong")
+        upd["name"] = new_name
+        upd["name_normalized"] = normalize_text_key(new_name)
+
+    if data.category is not None:
+        cat = data.category.strip()
+        if cat not in ALLOWED_MATERIAL_CATEGORIES:
+            raise HTTPException(status_code=400, detail=f"Kategori tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_CATEGORIES)}")
+        upd["category"] = cat
+
+    if data.specs is not None:
+        if not new_specs:
+            raise HTTPException(status_code=400, detail="Spesifikasi/Ukuran tidak boleh kosong")
+        upd["specs"] = new_specs
+        upd["specs_normalized"] = normalize_text_key(new_specs)
+
+    if data.unit is not None:
+        u = data.unit.strip()
+        if u not in ALLOWED_MATERIAL_UNITS:
+            raise HTTPException(status_code=400, detail=f"Satuan tidak valid. Pilihan: {', '.join(ALLOWED_MATERIAL_UNITS)}")
+        upd["unit"] = u
+
+    if data.sku is not None:
+        upd["sku"] = data.sku.strip() if data.sku else None
+
+    if data.notes is not None:
+        upd["notes"] = data.notes.strip()
+
+    if data.status is not None:
+        st = data.status.strip()
+        if st not in ["active", "archived"]:
+            raise HTTPException(status_code=400, detail="Status harus 'active' atau 'archived'")
+        upd["status"] = st
+
+    if not upd:
+        return clean(doc)
+
+    name_norm = upd.get("name_normalized", doc.get("name_normalized"))
+    specs_norm = upd.get("specs_normalized", doc.get("specs_normalized"))
+
+    # Check duplicate against other documents
+    existing = await db.materials.find_one({
+        "_id": {"$ne": doc["_id"]},
+        "name_normalized": name_norm,
+        "specs_normalized": specs_norm
+    })
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{new_name}' dan spesifikasi '{new_specs}' sudah terdaftar")
+
+    upd.update(audit_fields(admin))
+    try:
+        updated = await db.materials.find_one_and_update(
+            {"_id": doc["_id"]},
+            {"$set": upd},
+            return_document=ReturnDocument.AFTER
+        )
+        return clean(updated)
+    except pymongo.errors.DuplicateKeyError:
+        raise HTTPException(status_code=409, detail=f"Bahan dengan nama '{new_name}' dan spesifikasi '{new_specs}' sudah terdaftar")
+
+@api_router.delete("/admin/materials/{mat_id}")
+async def archive_material(
+    mat_id: str,
+    admin: dict = Depends(require_material_perm())
+):
+    doc = await db.materials.find_one({"_id": id_query(mat_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bahan tidak ditemukan")
+
+    upd = {"status": "archived", **audit_fields(admin)}
+    updated = await db.materials.find_one_and_update(
+        {"_id": doc["_id"]},
+        {"$set": upd},
+        return_document=ReturnDocument.AFTER
+    )
+    return {"ok": True, "message": "Bahan berhasil diarsipkan", "material": clean(updated)}
 
 app.include_router(api_router)
 

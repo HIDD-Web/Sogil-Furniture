@@ -173,11 +173,18 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
                 doc = {"_id": ObjectId(), "current_quantity": 0.0}
             return doc
 
+        def sf_update_one(query, update, **kwargs):
+            doc = sf_find_one(query)
+            if doc and "$set" in update:
+                doc.update(update["$set"])
+                stored_forms[str(doc["_id"])] = doc
+            return None
+
         self.stored_forms = stored_forms
         mock_db.stock_forms.insert_one = AsyncMock(side_effect=sf_insert_one)
         mock_db.stock_forms.find_one = AsyncMock(side_effect=sf_find_one)
         mock_db.stock_forms.find_one_and_update = AsyncMock(side_effect=sf_find_one_and_update)
-        mock_db.stock_forms.update_one = AsyncMock(return_value=None)
+        mock_db.stock_forms.update_one = AsyncMock(side_effect=sf_update_one)
 
         mock_db.stock_transformations.find_one = AsyncMock(return_value=None)
         mock_db.stock_transformations.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
@@ -700,6 +707,26 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         )
         res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
         self.assertEqual(res["transformation"]["output_stock_forms"][0]["form_type"], "custom")
+
+    @patch("server.db")
+    def test_24b_raw_transformation_without_existing_stock_form(self, mock_db):
+        """24b. Transformation directly from raw canonical stock auto-resolves raw stock form."""
+        self._setup_mock_db(mock_db)
+        # Material has 20.0 current_stock in self.sample_material
+        # source_stock_form_id is 'raw' and no stock_form exists yet
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id="raw",
+            source_quantity=2.0,
+            outputs=[
+                StockFormOutputItemInput(form_type="standard", width=80, length=30, quantity=4.0, label="Potongan 80x30")
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["transformation"]["source_quantity"], 2.0)
+        # Verify materials.current_stock was deducted by 2.0 (from 20.0 to 18.0)
+        self.assertEqual(self.stored_mat["current_stock"], 18.0)
 
     # =========================================================================
     # 25 - 27: ADJUSTMENT TESTS
