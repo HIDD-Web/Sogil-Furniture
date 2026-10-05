@@ -66,6 +66,7 @@ from server import (
     StockFormCreateInput,
     get_or_create_stock_form,
     get_next_transformation_number,
+    get_next_movement_numbers,
     get_material_stock_forms,
     create_custom_stock_form,
     get_stock_transformations,
@@ -1207,6 +1208,48 @@ class TestMaterialStockFormsPhase5(unittest.TestCase):
         # Verify raw material aggregate stock decremented by exactly 1.0 lembar
         self.assertEqual(self.stored_mat["current_stock"], 19.0)
 
+    @patch("server.db")
+    def test_39_batch_movement_numbers_and_multi_output_execution(self, mock_db):
+        """39. Verify batch movement number generation and multi-output execution matches production workload."""
+        self._setup_mock_db(mock_db)
+        source_sf_id = ObjectId()
+        mock_db.stock_forms.find_one = AsyncMock(return_value={
+            "_id": source_sf_id,
+            "material_id": str(self.sample_mat_id),
+            "form_type": "raw",
+            "stock_unit": "lembar",
+            "current_quantity": 8.0,
+            "is_active": True
+        })
+
+        # Test batch movement generator directly
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 10})
+        mov_nums = asyncio.run(get_next_movement_numbers(5, "2026-10-05"))
+        self.assertEqual(len(mov_nums), 5)
+        self.assertEqual(mov_nums[0], "ST-20261005-0006")
+        self.assertEqual(mov_nums[-1], "ST-20261005-0010")
+
+        # Test multi-output cutting matching user production screenshot
+        # Kaki Rak 244x20 (qty 12), Meja 80x50 (qty 8), Meja 80x40 (qty 1)
+        inp = StockTransformationInput(
+            material_id=str(self.sample_mat_id),
+            source_stock_form_id=str(source_sf_id),
+            source_quantity=2.0,
+            transformation_date="2026-10-05",
+            reason="Pemotongan BlockBoard lembaran",
+            outputs=[
+                StockFormOutputItemInput(form_type="standard", width=244, length=20, quantity=12.0, label="Kaki Rak 244x20"),
+                StockFormOutputItemInput(form_type="standard", width=80, length=50, quantity=8.0, label="Meja 80x50"),
+                StockFormOutputItemInput(form_type="standard", width=80, length=40, quantity=1.0, label="Meja 80x40"),
+            ]
+        )
+        res = asyncio.run(create_stock_transformation(inp, admin=self.owner_user))
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["transformation"]["output_stock_forms"]), 3)
+        self.assertEqual(res["transformation"]["source_quantity"], 2.0)
+        self.assertEqual(self.stored_mat["current_stock"], 18.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

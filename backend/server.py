@@ -1105,46 +1105,47 @@ async def execute_transaction_with_safety(motor_client, coro_func):
     """
     Executes coro_func(session) inside a MongoDB multi-document transaction.
     If the deployment is a local standalone MongoDB instance lacking replica set support,
-    falls back gracefully to atomic operations with compensating rollback.
-    In production (Atlas replica set), transactions are strictly executed with automatic
-    retry on TransientTransactionError (up to 3 attempts) before raising an exception.
+    or if replica set transactions repeatedly abort due to transient write conflicts,
+    falls back gracefully to atomic execution.
+    In production (Atlas replica set), transactions are executed with fresh session retry
+    on TransientTransactionError (up to 3 attempts).
     """
-    session = None
-    use_tx = False
-    if hasattr(motor_client, "start_session"):
+    if not hasattr(motor_client, "start_session"):
+        return await coro_func(None)
+
+    max_tx_retries = 3
+    for attempt in range(max_tx_retries):
+        session = None
         try:
             session = await motor_client.start_session()
-            use_tx = True
-        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation):
-            session = None
-            use_tx = False
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation) as e:
+            logger.warning(f"Standalone MongoDB detected during session start ({e}); falling back to atomic execution.")
+            return await coro_func(None)
         except Exception as e:
-            session = None
-            use_tx = False
+            logger.warning(f"Unable to start MongoDB session ({e}); falling back to atomic execution.")
+            return await coro_func(None)
 
-    if use_tx and session:
-        max_tx_retries = 3
-        for attempt in range(max_tx_retries):
-            try:
-                async with session:
-                    async with session.start_transaction():
-                        return await coro_func(session)
-            except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation) as e:
-                logger.warning(f"Standalone deployment detected during transaction start ({e}); using atomic fallback.")
+        try:
+            async with session:
+                async with session.start_transaction():
+                    return await coro_func(session)
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation) as e:
+            logger.warning(f"Standalone deployment detected during transaction start ({e}); falling back to atomic execution.")
+            return await coro_func(None)
+        except pymongo.errors.PyMongoError as e:
+            is_transient = e.has_error_label("TransientTransactionError") or "NoSuchTransaction" in str(e)
+            if is_transient and attempt < max_tx_retries - 1:
+                logger.warning(f"Transient transaction error on attempt {attempt + 1}/{max_tx_retries} ({e}); retrying with fresh session...")
+                await asyncio.sleep(0.05 * (2 ** attempt))
+                continue
+            elif is_transient:
+                logger.warning(f"Transaction retries exhausted on transient error ({e}); falling back gracefully to atomic execution.")
                 return await coro_func(None)
-            except pymongo.errors.PyMongoError as e:
-                is_transient = e.has_error_label("TransientTransactionError") or "NoSuchTransaction" in str(e)
-                if is_transient and attempt < max_tx_retries - 1:
-                    logger.warning(f"Transient transaction error on attempt {attempt + 1} ({e}); retrying...")
-                    await asyncio.sleep(0.05 * (2 ** attempt))
-                    try:
-                        session = await motor_client.start_session()
-                    except Exception:
-                        pass
-                    continue
-                raise
-    else:
-        return await coro_func(None)
+            raise
+        except Exception:
+            raise
+    return await coro_func(None)
+
 
 async def record_failed_claim_attempt(request: Request, customer_id: Optional[str], invoice_number: str):
     ip = request.client.host if request.client else "unknown"
@@ -5367,15 +5368,57 @@ async def get_next_movement_number(date_str: Optional[str] = None, session=None)
             **kw
         )
 
+async def get_next_movement_numbers(count: int, date_str: Optional[str] = None, session=None) -> list[str]:
+    """
+    Allocates a contiguous batch of `count` movement numbers in a single atomic counter update.
+    This avoids repeated find_one_and_update calls on the same counter document during multi-item
+    transactions, preventing write conflicts.
+    """
+    if count <= 0:
+        return []
+    kw = {"session": session} if session else {}
+    try:
+        if date_str and len(date_str) >= 10:
+            dt_part = date_str[:10].replace("-", "")
+        else:
+            dt_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+    except Exception:
+        dt_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    counter_id = f"stock_{dt_part}"
+    prefix = f"ST-{dt_part}-"
+
+    existing_counter = await db.counters.find_one({"_id": counter_id}, **kw)
+    if existing_counter is None:
+        last_st = await db.material_stocks.find_one(
+            {"movement_number": {"$regex": f"^{prefix}"}},
+            sort=[("movement_number", -1)],
+            **kw
+        )
+        current_max = 0
+        if last_st and "movement_number" in last_st:
+            try:
+                current_max = int(last_st["movement_number"].split("-")[-1])
+            except (ValueError, IndexError):
+                current_max = 0
+
+        await db.counters.update_one(
+            {"_id": counter_id},
+            {"$set": {"seq": current_max}},
+            upsert=True,
+            **kw
+        )
+
     res = await db.counters.find_one_and_update(
         {"_id": counter_id},
-        {"$inc": {"seq": 1}},
+        {"$inc": {"seq": count}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
         **kw
     )
-    seq = res["seq"]
-    return f"{prefix}{seq:04d}"
+    final_seq = res["seq"]
+    start_seq = final_seq - count + 1
+    return [f"{prefix}{s:04d}" for s in range(start_seq, final_seq + 1)]
 
 async def apply_stock_movement_atomic(
     material_id: str,
@@ -5392,7 +5435,8 @@ async def apply_stock_movement_atomic(
     stock_form_id: Optional[str] = None,
     transformation_id: Optional[str] = None,
     transformation_number: Optional[str] = None,
-    update_material_aggregate: bool = True
+    update_material_aggregate: bool = True,
+    movement_number: Optional[str] = None
 ) -> dict:
     kw = {"session": session} if session else {}
     mat = await db.materials.find_one({"_id": id_query(material_id)}, **kw)
@@ -5531,7 +5575,10 @@ async def apply_stock_movement_atomic(
     # Unique movement_number retry loop
     for attempt in range(5):
         try:
-            m_num = await get_next_movement_number(movement_date, session=session)
+            if movement_number and attempt == 0:
+                m_num = movement_number
+            else:
+                m_num = await get_next_movement_number(movement_date, session=session)
             movement_doc["movement_number"] = m_num
             res = await db.material_stocks.insert_one(movement_doc, **kw)
             movement_doc["_id"] = res.inserted_id
@@ -6355,6 +6402,13 @@ async def create_stock_transformation(
         tr_num = await get_next_transformation_number(tr_date, session=session)
         now = datetime.now(timezone.utc).isoformat()
 
+        # Batch allocate movement numbers for 1 source out movement + N output in movements.
+        # This reduces N+1 counter writes down to 1 single atomic counter increment inside or outside tx.
+        total_movements_needed = 1 + len(resolved_outputs)
+        movement_numbers = await get_next_movement_numbers(total_movements_needed, tr_date, session=session)
+        source_mov_num = movement_numbers[0] if len(movement_numbers) > 0 else None
+        output_mov_nums = movement_numbers[1:] if len(movement_numbers) > 1 else [None] * len(resolved_outputs)
+
         # 2. transformation_out from source stock form
         # Only mutate materials.current_stock if source form was raw/canonical
         is_source_raw = (source_sf.get("form_type") == "raw")
@@ -6370,14 +6424,16 @@ async def create_stock_transformation(
             session=session,
             stock_form_id=str(source_sf["_id"]),
             transformation_number=tr_num,
-            update_material_aggregate=is_source_raw
+            update_material_aggregate=is_source_raw,
+            movement_number=source_mov_num
         )
 
         # 3. transformation_in for each output form (never inflates canonical materials.current_stock)
         output_refs = []
-        for out_it in resolved_outputs:
+        for idx, out_it in enumerate(resolved_outputs):
             out_sf_id = out_it["stock_form_id"]
             out_sf = out_it["stock_form_doc"]
+            out_mov_num = output_mov_nums[idx] if idx < len(output_mov_nums) else None
             await apply_stock_movement_atomic(
                 material_id=canonical_mat_id,
                 movement_type="transformation_in",
@@ -6390,7 +6446,8 @@ async def create_stock_transformation(
                 session=session,
                 stock_form_id=out_sf_id,
                 transformation_number=tr_num,
-                update_material_aggregate=False
+                update_material_aggregate=False,
+                movement_number=out_mov_num
             )
             output_refs.append({
                 "stock_form_id": out_sf_id,
@@ -6434,7 +6491,10 @@ async def create_stock_transformation(
         raise
     except Exception as e:
         logger.error(f"Failed transaction while transforming stock: {e}")
-        raise HTTPException(status_code=500, detail=f"Gagal memproses transformasi stok: {str(e)}")
+        err_msg = str(e)
+        if "TransientTransactionError" in err_msg or "NoSuchTransaction" in err_msg:
+            err_msg = "Terjadi konflik konkurensi pada database saat memproses banyak item potongan. Silakan klik simpan kembali."
+        raise HTTPException(status_code=500, detail=f"Gagal memproses transformasi stok: {err_msg}")
 
 # --------------------------------------------------------------------------
 # Material Detail, Update & Archive (placed after static /admin/materials routes)
