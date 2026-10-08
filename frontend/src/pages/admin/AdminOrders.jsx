@@ -287,9 +287,16 @@ export default function AdminOrders() {
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-1 items-center justify-end">
-                      <Badge variant="outline" className={`px-2 py-0.5 text-[10px] ${payCfg.color}`}>
-                        {payCfg.label}
-                      </Badge>
+                      <div className="flex flex-col items-end gap-0.5">
+                        <Badge variant="outline" className={`px-2 py-0.5 text-[10px] ${payCfg.color}`}>
+                          {payCfg.label}
+                        </Badge>
+                        {o.legacy_dp_unknown && (
+                          <span className="text-[9px] text-amber-700 font-medium">
+                            Nominal Tidak Tersedia
+                          </span>
+                        )}
+                      </div>
                       <Badge variant="outline" className={`px-2 py-0.5 text-[10px] ${stCfg.color}`}>
                         {stCfg.label}
                       </Badge>
@@ -374,9 +381,16 @@ export default function AdminOrders() {
                           {fmtLE(o.total_le)} LE
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
-                          <Badge variant="outline" className={payCfg.color}>
-                            {payCfg.label}
-                          </Badge>
+                          <div className="flex flex-col gap-0.5">
+                            <Badge variant="outline" className={payCfg.color}>
+                              {payCfg.label}
+                            </Badge>
+                            {o.legacy_dp_unknown && (
+                              <span className="text-[10px] text-amber-700 font-medium">
+                                Nominal Tidak Tersedia
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
                           <Badge variant="outline" className={stCfg.color}>

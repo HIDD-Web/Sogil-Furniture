@@ -294,6 +294,97 @@ class OrderStatusUpdate(BaseModel):
     total_le: Optional[float] = None
     items: Optional[List[dict]] = None
 
+class PaymentAllocationInput(BaseModel):
+    target_type: str  # "product" | "shipping" | "unallocated_credit"
+    amount: float
+    order_item_id: Optional[str] = None
+    notes: Optional[str] = ""
+
+class PaymentCreateInput(BaseModel):
+    amount: float
+    currency: Optional[str] = "EGP"
+    payment_method: str  # "cash" | "transfer"
+    payment_date: Optional[str] = None
+    reference: Optional[str] = ""
+    notes: Optional[str] = ""
+    allocations: Optional[List[PaymentAllocationInput]] = None
+    idempotency_key: Optional[str] = None
+
+class PaymentVoidInput(BaseModel):
+    reason: str
+
+async def compute_order_payment_summary(order_doc: dict) -> dict:
+    order_oid = id_query(str(order_doc.get("_id") or order_doc.get("id")))
+    recorded_payments = await db.payments.find({
+        "order_id": order_oid,
+        "status": "recorded"
+    }).to_list(1000)
+
+    total_le = _num(order_doc.get("total_le", 0.0))
+
+    if recorded_payments:
+        paid_amount_le = round(sum(_num(p.get("amount_le", 0.0)) for p in recorded_payments), 2)
+        outstanding_amount_le = round(max(0.0, total_le - paid_amount_le), 2)
+        if paid_amount_le <= 0:
+            payment_status = "belum_dibayar"
+        elif paid_amount_le < total_le:
+            payment_status = "dp"
+        elif paid_amount_le == total_le:
+            payment_status = "lunas"
+        else:
+            payment_status = "overpaid"
+        return {
+            "payment_status": payment_status,
+            "paid_amount_le": paid_amount_le,
+            "outstanding_amount_le": outstanding_amount_le,
+            "is_legacy_derived": False,
+            "legacy_dp_unknown": False,
+            "valid_payments_count": len(recorded_payments)
+        }
+
+    # Legacy fallback when zero payment records exist
+    legacy_status = order_doc.get("payment_status") or "belum_dibayar"
+    if legacy_status == "lunas":
+        return {
+            "payment_status": "lunas",
+            "paid_amount_le": total_le,
+            "outstanding_amount_le": 0.0,
+            "is_legacy_derived": True,
+            "legacy_dp_unknown": False,
+            "valid_payments_count": 0
+        }
+    elif legacy_status == "dp":
+        return {
+            "payment_status": "dp",
+            "paid_amount_le": None,
+            "outstanding_amount_le": None,
+            "is_legacy_derived": True,
+            "legacy_dp_unknown": True,
+            "valid_payments_count": 0
+        }
+    else:  # belum_dibayar or unknown
+        return {
+            "payment_status": "belum_dibayar",
+            "paid_amount_le": 0.0,
+            "outstanding_amount_le": total_le,
+            "is_legacy_derived": True,
+            "legacy_dp_unknown": False,
+            "valid_payments_count": 0
+        }
+
+async def generate_payment_number() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    counter_id = f"payment_{today}"
+    prefix = f"PAY-{today}-"
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:03d}"
+
 class CustomRequestInput(BaseModel):
     customer_name: str
     customer_phone: str
@@ -1633,6 +1724,10 @@ async def get_order_public(order_id: str, request: Request):
         buyer = await get_optional_customer(request)
         if not buyer or str(buyer["_id"]) != str(order["customer_id"]):
             raise HTTPException(status_code=403, detail="Tidak diizinkan mengakses pesanan ini")
+
+    pay_summary = await compute_order_payment_summary(order)
+    order.update(pay_summary)
+
     order = clean(order)
     order["whatsapp_message"] = build_whatsapp_message(order)
     order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
@@ -1654,13 +1749,18 @@ async def admin_list_orders(status: Optional[str] = None, payment_status: Option
         query["$or"] = [{"order_number": rx}, {"customer_name": rx}, {"customer_phone": rx},
                         {"customer_username": rx}, {"items.product_name_snapshot": rx}, {"referral.code": rx}]
     orders = await db.orders.find(query).sort("created_at", -1).to_list(2000)
-    return [clean(o) for o in orders]
+    res = []
+    for o in orders:
+        summary = await compute_order_payment_summary(o)
+        o.update(summary)
+        res.append(clean(o))
+    return res
 
 @api_router.get("/admin/overview")
 async def admin_overview(admin: dict = Depends(require_perm("manage_orders"))):
     orders = await db.orders.find({}).to_list(5000)
     stats = {"total": len(orders), "pesanan_masuk": 0, "dikonfirmasi": 0, "diproses": 0, "siap": 0,
-             "selesai": 0, "dibatalkan": 0, "lunas": 0, "belum_dibayar": 0, "dp": 0, "estimated_revenue_le": 0.0}
+             "selesai": 0, "dibatalkan": 0, "lunas": 0, "belum_dibayar": 0, "dp": 0, "overpaid": 0, "estimated_revenue_le": 0.0}
     for o in orders:
         st = o.get("order_status")
         if st in stats:
@@ -1711,6 +1811,8 @@ async def admin_get_order(order_id: str, admin: dict = Depends(require_perm("man
     order = await db.orders.find_one({"_id": id_query(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    pay_summary = await compute_order_payment_summary(order)
+    order.update(pay_summary)
     order = clean(order)
     order["whatsapp_message"] = build_whatsapp_message(order)
     order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
@@ -1946,6 +2048,311 @@ async def admin_delete_order(order_id: str, admin: dict = Depends(require_perm("
         status_code=400,
         detail="Penghapusan pesanan wajib melalui endpoint POST /api/admin/orders/{order_id}/permanent-delete dengan frasa konfirmasi 'HAPUS PERMANEN'."
     )
+
+# --------------------------------------------------------------------------
+# Admin: Order Payments (Phase 1)
+# --------------------------------------------------------------------------
+@api_router.get("/admin/orders/{order_id}/payments")
+async def admin_list_order_payments(order_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    order = await db.orders.find_one({"_id": id_query(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    payments = await db.payments.find({"order_id": id_query(order_id)}).sort("created_at", -1).to_list(1000)
+    summary = await compute_order_payment_summary(order)
+    return {
+        "order_id": str(order["_id"]),
+        "order_number": order.get("order_number"),
+        "total_le": _num(order.get("total_le")),
+        "summary": summary,
+        "payments": [clean(p) for p in payments]
+    }
+
+@api_router.get("/admin/orders/{order_id}/payment-summary")
+async def admin_get_order_payment_summary(order_id: str, admin: dict = Depends(require_perm("manage_orders"))):
+    order = await db.orders.find_one({"_id": id_query(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    summary = await compute_order_payment_summary(order)
+    return {
+        "order_id": str(order["_id"]),
+        "order_number": order.get("order_number"),
+        "total_le": _num(order.get("total_le")),
+        **summary
+    }
+
+@api_router.post("/admin/orders/{order_id}/payments")
+async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput, admin: dict = Depends(require_perm("manage_orders"))):
+    # Financial write operation requires access_finance or owner role
+    role = admin.get("role")
+    perms = admin.get("permissions") or {}
+    if role != "owner" and not perms.get("access_finance"):
+        raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat mencatat pembayaran")
+
+    order = await db.orders.find_one({"_id": id_query(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    # 1. Idempotency Check
+    if payload.idempotency_key and payload.idempotency_key.strip():
+        existing_pmt = await db.payments.find_one({"idempotency_key": payload.idempotency_key.strip()})
+        if existing_pmt:
+            return clean(existing_pmt)
+
+    # 2. Validation
+    raw_amount = _num(payload.amount)
+    if raw_amount <= 0:
+        raise HTTPException(status_code=400, detail="Nominal pembayaran harus lebih besar dari 0")
+
+    currency = (payload.currency or "EGP").strip().upper()
+    if currency != "EGP":
+        raise HTTPException(status_code=400, detail="Mata uang transaksi pokok harus EGP")
+
+    payment_method = (payload.payment_method or "cash").strip().lower()
+    if payment_method not in ("cash", "transfer"):
+        raise HTTPException(status_code=400, detail="Metode pembayaran harus cash atau transfer")
+
+    now = datetime.now(timezone.utc).isoformat()
+    payment_date = payload.payment_date or now
+
+    # 3. Allocations Validation & Invariant
+    # Default allocation if not provided: Allocate to product first, then shipping, remainder to unallocated_credit
+    total_le = _num(order.get("total_le", 0.0))
+    shipping_fee_le = _num(order.get("delivery_fee_le", 0.0))
+    product_portion = max(0.0, total_le - shipping_fee_le)
+
+    allocations = []
+    if payload.allocations is not None and len(payload.allocations) > 0:
+        for alloc in payload.allocations:
+            alloc_type = alloc.target_type.strip().lower()
+            if alloc_type not in ("product", "shipping", "unallocated_credit"):
+                raise HTTPException(status_code=400, detail=f"Target alokasi tidak valid: {alloc.target_type}")
+            alloc_amt = _num(alloc.amount)
+            if alloc_amt < 0:
+                raise HTTPException(status_code=400, detail="Nominal alokasi tidak boleh negatif")
+            allocations.append({
+                "target_type": alloc_type,
+                "amount_le": round(alloc_amt, 2),
+                "order_item_id": alloc.order_item_id,
+                "notes": alloc.notes or ""
+            })
+        sum_allocs = round(sum(a["amount_le"] for a in allocations), 2)
+        if sum_allocs != round(raw_amount, 2):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Jumlah alokasi ({sum_allocs}) harus sama persis dengan total pembayaran ({round(raw_amount, 2)})"
+            )
+    else:
+        # Configurable default policy: product up to product_portion, then shipping up to shipping_fee, excess unallocated_credit
+        curr_summary = await compute_order_payment_summary(order)
+        curr_paid = curr_summary.get("paid_amount_le") or 0.0
+        remaining_product = max(0.0, product_portion - curr_paid)
+        alloc_prod = min(raw_amount, remaining_product)
+        remaining_after_prod = raw_amount - alloc_prod
+        alloc_ship = min(remaining_after_prod, shipping_fee_le)
+        alloc_credit = remaining_after_prod - alloc_ship
+
+        if alloc_prod > 0:
+            allocations.append({"target_type": "product", "amount_le": round(alloc_prod, 2), "order_item_id": None, "notes": "Auto-alokasi Produk"})
+        if alloc_ship > 0:
+            allocations.append({"target_type": "shipping", "amount_le": round(alloc_ship, 2), "order_item_id": None, "notes": "Auto-alokasi Ongkir"})
+        if alloc_credit > 0 or len(allocations) == 0:
+            allocations.append({"target_type": "unallocated_credit", "amount_le": round(alloc_credit if alloc_credit > 0 else raw_amount, 2), "order_item_id": None, "notes": "Kredit Belum Teralokasi"})
+
+    # 4. Exchange rate snapshot & counterpart computation
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    rate = resolve_transaction_rate(None, order.get("exchange_rate_idr_per_le"), settings_rate)
+
+    if payment_method == "transfer":
+        primary_currency = "IDR"
+        primary_account = "IDR"
+        conv = compute_currency_conversion("IDR", round(raw_amount * rate), rate)
+    else:
+        primary_currency = "EGP"
+        primary_account = "EGP"
+        conv = compute_currency_conversion("EGP", raw_amount, rate)
+
+    payment_num = await generate_payment_number()
+    txn_desc = f"Penerimaan pembayaran {payment_num} pesanan {order.get('order_number')}"
+
+    # 5. Atomic Execution
+    async def _do_create_payment(session):
+        ins_kw = {"session": session} if session else {}
+        # Insert Finance Transaction (Cash Receipt)
+        txn_doc = {
+            "date": payment_date,
+            "type": "order_revenue",
+            "category": "Penjualan",
+            "amount": conv["primary_amount"],
+            "currency": primary_currency,
+            "account": primary_account,
+            "exchange_rate": rate,
+            "counterpart_amount": conv["counterpart_amount"],
+            "counterpart_currency": conv["counterpart_currency"],
+            "payment_method": payment_method,
+            "description": txn_desc,
+            "related_order_id": str(order["_id"]),
+            "related_payment_number": payment_num,
+            "created_by_name": admin.get("name", "Admin"),
+            "created_by_id": admin.get("id"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        txn_res = await db.finance_transactions.insert_one(txn_doc, **ins_kw)
+        txn_id = str(txn_res.inserted_id)
+
+        # Insert Payment Document
+        pmt_doc = {
+            "payment_number": payment_num,
+            "order_id": str(order["_id"]),
+            "order_number": order.get("order_number"),
+            "amount_le": round(raw_amount, 2),
+            "currency": "EGP",
+            "exchange_rate_snapshot": rate,
+            "primary_amount": conv["primary_amount"],
+            "primary_currency": primary_currency,
+            "payment_method": payment_method,
+            "payment_date": payment_date,
+            "reference": (payload.reference or "").strip(),
+            "notes": (payload.notes or "").strip(),
+            "allocations": allocations,
+            "finance_transaction_id": txn_id,
+            "status": "recorded",
+            "idempotency_key": (payload.idempotency_key or "").strip() or None,
+            "created_by_id": admin.get("id"),
+            "created_by_name": admin.get("name", "Admin"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        pmt_res = await db.payments.insert_one(pmt_doc, **ins_kw)
+        created_pmt_id = str(pmt_res.inserted_id)
+
+        # Update link on finance transaction
+        await db.finance_transactions.update_one(
+            {"_id": txn_res.inserted_id},
+            {"$set": {"payment_id": created_pmt_id}},
+            **ins_kw
+        )
+
+        return created_pmt_id, txn_id
+
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                pmt_id, txn_id = await _do_create_payment(session)
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, Exception):
+        # Standalone MongoDB without replica set, closed loop, or unconfigured client in tests
+        pmt_id, txn_id = await _do_create_payment(None)
+
+    # 6. Recalculate and update order cached payment status
+    fresh_order = await db.orders.find_one({"_id": order["_id"]})
+    new_summary = await compute_order_payment_summary(fresh_order)
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {"$set": {
+            "payment_status": new_summary["payment_status"],
+            "paid_amount_le": new_summary["paid_amount_le"],
+            "outstanding_amount_le": new_summary["outstanding_amount_le"],
+            "payment_method": payment_method,
+            "updated_at": now,
+            "updated_by_name": admin.get("name", "Admin"),
+        }}
+    )
+
+    created_payment = await db.payments.find_one({"_id": id_query(pmt_id)}) or {
+        "_id": pmt_id,
+        "payment_number": payment_num,
+        "order_id": str(order["_id"]),
+        "amount_le": round(raw_amount, 2),
+        "status": "recorded",
+        "finance_transaction_id": txn_id,
+        "allocations": allocations,
+    }
+    clean_pmt = clean(created_payment)
+    clean_pmt["order_summary"] = new_summary
+    return clean_pmt
+
+@api_router.post("/admin/orders/{order_id}/payments/{payment_id}/void")
+async def admin_void_order_payment(order_id: str, payment_id: str, payload: PaymentVoidInput, admin: dict = Depends(require_perm("manage_orders"))):
+    role = admin.get("role")
+    perms = admin.get("permissions") or {}
+    if role != "owner" and not perms.get("access_finance"):
+        raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat membatalkan pembayaran")
+
+    reason = (payload.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Alasan pembatalan pembayaran wajib diisi")
+
+    order = await db.orders.find_one({"_id": id_query(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    pmt = await db.payments.find_one({"_id": id_query(payment_id), "order_id": id_query(order_id)})
+    if not pmt:
+        raise HTTPException(status_code=404, detail="Data pembayaran tidak ditemukan")
+
+    if pmt.get("status") == "voided":
+        raise HTTPException(status_code=400, detail="Pembayaran sudah dibatalkan sebelumnya")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    txn_id = pmt.get("finance_transaction_id")
+
+    async def _do_void(session):
+        ins_kw = {"session": session} if session else {}
+        # Mark payment voided
+        await db.payments.update_one(
+            {"_id": pmt["_id"]},
+            {"$set": {
+                "status": "voided",
+                "void_reason": reason,
+                "voided_at": now_iso,
+                "voided_by_id": admin.get("id"),
+                "voided_by_name": admin.get("name", "Admin"),
+                "updated_at": now_iso
+            }},
+            **ins_kw
+        )
+        # Mark finance transaction voided
+        if txn_id:
+            await db.finance_transactions.update_one(
+                {"_id": id_query(txn_id)},
+                {"$set": {
+                    "is_void": True,
+                    "status": "void",
+                    "void_source": "payment_void",
+                    "void_reason": reason,
+                    "voided_at": now_iso,
+                    "voided_by_name": admin.get("name", "Admin"),
+                    "updated_at": now_iso
+                }},
+                **ins_kw
+            )
+
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                await _do_void(session)
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, Exception):
+        await _do_void(None)
+
+    # Recalculate order status
+    fresh_order = await db.orders.find_one({"_id": order["_id"]})
+    new_summary = await compute_order_payment_summary(fresh_order)
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {"$set": {
+            "payment_status": new_summary["payment_status"],
+            "paid_amount_le": new_summary["paid_amount_le"],
+            "outstanding_amount_le": new_summary["outstanding_amount_le"],
+            "updated_at": now_iso,
+            "updated_by_name": admin.get("name", "Admin"),
+        }}
+    )
+
+    voided_pmt = await db.payments.find_one({"_id": pmt["_id"]}) or {**pmt, "status": "voided"}
+    clean_p = clean(voided_pmt)
+    clean_p["order_summary"] = new_summary
+    return clean_p
 
 # --------------------------------------------------------------------------
 # Admin: products
@@ -4457,6 +4864,30 @@ async def seed():
             [("related_purchase_id", 1)],
             sparse=True,
             name="idx_transformation_purchase"
+        )
+    except Exception:
+        pass
+
+    # Ensure indexes for payments (Phase 1)
+    try:
+        await db.payments.create_index(
+            [("payment_number", 1)],
+            unique=True,
+            name="uniq_payment_number"
+        )
+        await db.payments.create_index(
+            [("order_id", 1), ("status", 1)],
+            name="idx_payments_order_status"
+        )
+        await db.payments.create_index(
+            [("finance_transaction_id", 1)],
+            name="idx_payments_finance_txn"
+        )
+        await db.payments.create_index(
+            [("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+            name="uniq_payments_idempotency"
         )
     except Exception:
         pass

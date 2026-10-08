@@ -11,6 +11,7 @@ export const PAYMENT_STATUS = {
   belum_dibayar: { label: "Belum Dibayar", color: "bg-red-100 text-red-700 border-red-200" },
   dp: { label: "DP", color: "bg-amber-100 text-amber-800 border-amber-200" },
   lunas: { label: "Lunas", color: "bg-green-100 text-green-800 border-green-200" },
+  overpaid: { label: "Kelebihan Bayar (Overpaid)", color: "bg-purple-100 text-purple-800 border-purple-200" },
 };
 
 export const CATEGORY_LABELS = {

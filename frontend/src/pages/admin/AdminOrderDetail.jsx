@@ -9,7 +9,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
@@ -29,12 +29,31 @@ export default function AdminOrderDetail() {
   const [publishModalOpen, setPublishModalOpen] = useState(false);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [payments, setPayments] = useState([]);
+  const [paymentModalOpen, setPaymentModalOpen] = useState(false);
+  const [paymentLoading, setPaymentLoading] = useState(false);
+  const [paymentForm, setPaymentForm] = useState({
+    amount: "",
+    payment_method: "cash",
+    reference: "",
+    notes: "",
+    alloc_product: "",
+    alloc_shipping: "",
+    alloc_credit: "",
+    use_custom_alloc: false,
+  });
   const [priceForm, setPriceForm] = useState({
     subtotal_le: 0,
     delivery_fee_le: 0,
     discount_le: 0,
     reason: "",
   });
+
+  const loadPayments = () => {
+    api.get(`/admin/orders/${id}/payments`)
+      .then((r) => { setPayments(r.data.payments || []); })
+      .catch(() => {});
+  };
 
   const load = () => {
     api.get(`/admin/orders/${id}`)
@@ -44,12 +63,81 @@ export default function AdminOrderDetail() {
         setLoadError(msg);
         toast.error(msg);
       });
+    loadPayments();
   };
   useEffect(() => { load(); }, [id]);
 
   const update = async (patch) => {
     try { const { data } = await api.patch(`/admin/orders/${id}`, patch); setOrder((o) => ({ ...o, ...data })); toast.success("Pesanan diperbarui"); }
     catch { toast.error("Gagal memperbarui"); }
+  };
+
+  const handleRecordPayment = async (e) => {
+    e.preventDefault();
+    const amt = parseFloat(paymentForm.amount);
+    if (!amt || amt <= 0) {
+      toast.error("Nominal pembayaran harus lebih besar dari 0");
+      return;
+    }
+
+    const payload = {
+      amount: amt,
+      currency: "EGP",
+      payment_method: paymentForm.payment_method,
+      reference: paymentForm.reference || undefined,
+      notes: paymentForm.notes || undefined,
+    };
+
+    if (paymentForm.use_custom_alloc) {
+      const pAmt = parseFloat(paymentForm.alloc_product) || 0;
+      const sAmt = parseFloat(paymentForm.alloc_shipping) || 0;
+      const cAmt = parseFloat(paymentForm.alloc_credit) || 0;
+      const sum = Math.round((pAmt + sAmt + cAmt) * 100) / 100;
+      if (sum !== Math.round(amt * 100) / 100) {
+        toast.error(`Jumlah alokasi (${sum} LE) harus sama persis dengan total (${amt} LE)`);
+        return;
+      }
+      payload.allocations = [
+        { target_type: "product", amount: pAmt, notes: "Alokasi Produk" },
+        { target_type: "shipping", amount: sAmt, notes: "Alokasi Ongkir" },
+        { target_type: "unallocated_credit", amount: cAmt, notes: "Kredit Belum Teralokasi" },
+      ].filter((a) => a.amount > 0);
+    }
+
+    setPaymentLoading(true);
+    try {
+      await api.post(`/admin/orders/${id}/payments`, payload);
+      toast.success("Pembayaran berhasil dicatat & masuk kas keuangan");
+      setPaymentModalOpen(false);
+      setPaymentForm({
+        amount: "",
+        payment_method: "cash",
+        reference: "",
+        notes: "",
+        alloc_product: "",
+        alloc_shipping: "",
+        alloc_credit: "",
+        use_custom_alloc: false,
+      });
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal mencatat pembayaran");
+    } finally {
+      setPaymentLoading(false);
+    }
+  };
+
+  const handleVoidPayment = async (paymentId) => {
+    const reason = window.prompt("Masukkan alasan pembatalan pembayaran ini:");
+    if (!reason || !reason.trim()) return;
+
+    try {
+      await api.post(`/admin/orders/${id}/payments/${paymentId}/void`, { reason: reason.trim() });
+      toast.success("Pembayaran berhasil dibatalkan");
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal membatalkan pembayaran");
+    }
   };
 
   const openPriceModal = () => {
@@ -306,10 +394,147 @@ export default function AdminOrderDetail() {
               </span>
             }
           />
-          <Row k="Status Bayar" v={PAYMENT_STATUS[order.payment_status]?.label} />
+          <Row
+            k="Status Bayar"
+            v={
+              <div className="flex flex-col items-end gap-1">
+                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold ${PAYMENT_STATUS[order.payment_status]?.color || "bg-stone-100 text-stone-700"}`}>
+                  {PAYMENT_STATUS[order.payment_status]?.label || order.payment_status}
+                </span>
+                {order.legacy_dp_unknown && (
+                  <span className="text-[11px] text-amber-700 font-medium">
+                    (DP — Nominal Historis Tidak Tersedia)
+                  </span>
+                )}
+                {order.is_legacy_derived && !order.legacy_dp_unknown && (
+                  <span className="text-[10px] text-[#8B7355]">
+                    (Berdasarkan Status Historis)
+                  </span>
+                )}
+              </div>
+            }
+          />
+          <Row
+            k="Terbayar"
+            v={
+              order.paid_amount_le !== null && order.paid_amount_le !== undefined
+                ? `${fmtLE(order.paid_amount_le)} LE`
+                : <span className="text-amber-700 font-medium">Tidak Tersedia (Unknown)</span>
+            }
+          />
+          <Row
+            k="Sisa Tagihan"
+            v={
+              order.outstanding_amount_le !== null && order.outstanding_amount_le !== undefined
+                ? `${fmtLE(order.outstanding_amount_le)} LE`
+                : <span className="text-amber-700 font-medium">Tidak Tersedia (Unknown)</span>
+            }
+          />
           <Row k="Pengiriman" v={order.delivery_method === "delivery" ? "Delivery" : "Ambil di Toko"} />
           {order.delivery_zone_name && <Row k="Zona" v={order.delivery_zone_name} />}
         </Block>
+
+        {/* Riwayat Pembayaran (Phase 1) */}
+        <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm lg:col-span-2">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div>
+              <h3 className="font-heading text-base font-bold text-[#8B5A2B] flex items-center gap-2">
+                <CreditCard size={18} />
+                Riwayat Pembayaran
+              </h3>
+              <p className="text-xs text-[#8B7355]">
+                Setiap pembayaran yang dicatat secara otomatis membentuk arus kas masuk (Cash Receipt) di Keuangan.
+              </p>
+            </div>
+            {canEditPrice && (
+              <Button
+                onClick={() => setPaymentModalOpen(true)}
+                data-testid="btn-record-payment"
+                className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+              >
+                <CreditCard size={14} className="mr-1.5" /> Catat Pembayaran Baru
+              </Button>
+            )}
+          </div>
+
+          {payments.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-[#E5DCC5] p-6 text-center text-xs text-[#8B7355]">
+              {order.is_legacy_derived ? (
+                <div>
+                  <p className="font-medium text-[#5C4A3D]">Belum ada pencatatan transaksi pembayaran individual untuk pesanan ini.</p>
+                  <p className="mt-1 text-stone-500">
+                    Status pembayaran saat ini berasal dari data historis sebelum modul kasir & pembayaran aktif.
+                  </p>
+                </div>
+              ) : (
+                <p>Belum ada pembayaran yang dicatat untuk pesanan ini.</p>
+              )}
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="border-b border-[#F1EBE0] text-[#8B7355] font-semibold">
+                    <th className="py-2.5 px-3">No. Bayar</th>
+                    <th className="py-2.5 px-3">Tanggal</th>
+                    <th className="py-2.5 px-3">Metode</th>
+                    <th className="py-2.5 px-3">Nominal (LE)</th>
+                    <th className="py-2.5 px-3">Alokasi</th>
+                    <th className="py-2.5 px-3">Status</th>
+                    {canEditPrice && <th className="py-2.5 px-3 text-right">Aksi</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#F1EBE0]">
+                  {payments.map((p) => {
+                    const isVoid = p.status === "voided";
+                    return (
+                      <tr key={p.id || p._id} className={isVoid ? "opacity-50 line-through bg-stone-50" : ""}>
+                        <td className="py-2.5 px-3 font-mono font-medium text-[#8B5A2B]">{p.payment_number}</td>
+                        <td className="py-2.5 px-3 text-stone-600">
+                          {p.payment_date ? new Date(p.payment_date).toLocaleDateString("id-ID") : "-"}
+                        </td>
+                        <td className="py-2.5 px-3 capitalize">
+                          {p.payment_method === "transfer" ? "Transfer (IDR)" : "Cash (EGP)"}
+                        </td>
+                        <td className="py-2.5 px-3 font-bold text-[#2C1E16]">
+                          {fmtLE(p.amount_le)} LE
+                        </td>
+                        <td className="py-2.5 px-3 text-stone-600">
+                          {(p.allocations || []).map((a, idx) => (
+                            <span key={idx} className="mr-2 inline-block">
+                              {a.target_type === "product" && `Produk: ${fmtLE(a.amount_le)} LE`}
+                              {a.target_type === "shipping" && `Ongkir: ${fmtLE(a.amount_le)} LE`}
+                              {a.target_type === "unallocated_credit" && `Kredit: ${fmtLE(a.amount_le)} LE`}
+                            </span>
+                          ))}
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <span className={`inline-block px-2 py-0.5 rounded text-[11px] font-semibold ${isVoid ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-800"}`}>
+                            {isVoid ? "Dibatalkan (Void)" : "Tercatat (Recorded)"}
+                          </span>
+                        </td>
+                        {canEditPrice && (
+                          <td className="py-2.5 px-3 text-right">
+                            {!isVoid && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => handleVoidPayment(p.id || p._id)}
+                                className="h-7 px-2 text-red-600 hover:text-red-800 hover:bg-red-50 text-xs"
+                              >
+                                Batalkan
+                              </Button>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
 
       {priceModalOpen && (
@@ -457,6 +682,147 @@ export default function AdminOrderDetail() {
         ].filter(Boolean)}
         loading={deleteLoading}
       />
+
+      {/* Modal Pencatatan Pembayaran (Phase 1) */}
+      {paymentModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-xl max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-[#F1EBE0] pb-3">
+              <div>
+                <h3 className="font-heading text-lg font-bold text-[#2C1E16]">Catat Pembayaran Masuk</h3>
+                <p className="text-xs text-[#8B7355]">Penerimaan kas/transfer nyata dari pelanggan</p>
+              </div>
+              <button onClick={() => setPaymentModalOpen(false)} className="rounded-lg p-1 text-[#8B7355] hover:bg-[#F1EBE0]">
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleRecordPayment} className="mt-4 space-y-3">
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Nominal Pembayaran (LE) *</Label>
+                <Input
+                  type="number"
+                  step="0.01"
+                  required
+                  placeholder="Contoh: 500"
+                  value={paymentForm.amount}
+                  onChange={(e) => setPaymentForm({ ...paymentForm, amount: e.target.value })}
+                  className="mt-1"
+                  data-testid="input-payment-amount"
+                />
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Metode Pembayaran *</Label>
+                <Select
+                  value={paymentForm.payment_method}
+                  onValueChange={(v) => setPaymentForm({ ...paymentForm, payment_method: v })}
+                >
+                  <SelectTrigger className="h-10 bg-white mt-1">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="cash">Cash / Tunai (Kas EGP)</SelectItem>
+                    <SelectItem value="transfer">Transfer Bank (Kas IDR)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">No. Referensi / Transfer (Opsional)</Label>
+                <Input
+                  placeholder="Contoh: Bukti transfer BCA 12345"
+                  value={paymentForm.reference}
+                  onChange={(e) => setPaymentForm({ ...paymentForm, reference: e.target.value })}
+                  className="mt-1 text-xs"
+                />
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Catatan (Opsional)</Label>
+                <Input
+                  placeholder="Contoh: Pembayaran DP 50%"
+                  value={paymentForm.notes}
+                  onChange={(e) => setPaymentForm({ ...paymentForm, notes: e.target.value })}
+                  className="mt-1 text-xs"
+                />
+              </div>
+
+              <div className="pt-2 border-t border-[#F1EBE0]">
+                <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-[#5C4A3D]">
+                  <input
+                    type="checkbox"
+                    checked={paymentForm.use_custom_alloc}
+                    onChange={(e) => setPaymentForm({ ...paymentForm, use_custom_alloc: e.target.checked })}
+                    className="rounded border-[#E5DCC5] text-[#8B5A2B]"
+                  />
+                  Atur Klasifikasi Alokasi Manual
+                </label>
+                <p className="text-[11px] text-[#8B7355] mt-0.5">
+                  Secara default, sistem otomatis mengalokasikan pembayaran ke produk, ongkir, lalu kelebihan ke kredit.
+                </p>
+
+                {paymentForm.use_custom_alloc && (
+                  <div className="mt-3 p-3 bg-[#FAF5EE] rounded-xl space-y-2 text-xs">
+                    <div>
+                      <Label className="text-[11px] text-[#5C4A3D]">Alokasi ke Produk (LE)</Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        placeholder="0"
+                        value={paymentForm.alloc_product}
+                        onChange={(e) => setPaymentForm({ ...paymentForm, alloc_product: e.target.value })}
+                        className="mt-0.5 bg-white h-8 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[11px] text-[#5C4A3D]">Alokasi ke Ongkir (LE)</Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        placeholder="0"
+                        value={paymentForm.alloc_shipping}
+                        onChange={(e) => setPaymentForm({ ...paymentForm, alloc_shipping: e.target.value })}
+                        className="mt-0.5 bg-white h-8 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[11px] text-[#5C4A3D]">Kredit Belum Teralokasi (LE)</Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        placeholder="0"
+                        value={paymentForm.alloc_credit}
+                        onChange={(e) => setPaymentForm({ ...paymentForm, alloc_credit: e.target.value })}
+                        className="mt-0.5 bg-white h-8 text-xs"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-5 flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setPaymentModalOpen(false)}
+                  className="flex-1 rounded-xl border-[#E5DCC5]"
+                >
+                  Batal
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={paymentLoading}
+                  data-testid="btn-submit-payment"
+                  className="flex-1 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs"
+                >
+                  {paymentLoading ? "Menyimpan..." : "Simpan Pembayaran"}
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
