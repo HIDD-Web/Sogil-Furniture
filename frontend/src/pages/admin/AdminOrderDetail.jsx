@@ -9,7 +9,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History, Wrench, UserCheck, ShieldCheck, CheckSquare } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
@@ -49,6 +49,45 @@ export default function AdminOrderDetail() {
     reason: "",
   });
 
+  // Phase 2 Work Assignments State
+  const [assignments, setAssignments] = useState([]);
+  const [workers, setWorkers] = useState([]);
+  const [wageRules, setWageRules] = useState([]);
+  const [assignModalOpen, setAssignModalOpen] = useState(false);
+  const [assignLoading, setAssignLoading] = useState(false);
+  const [selectedOrderItem, setSelectedOrderItem] = useState(null);
+  const [assignForm, setAssignForm] = useState({
+    worker_id: "",
+    task_category: "whole_item",
+    pricing_basis: "per_unit",
+    agreed_rate_le: "",
+    target_quantity: 1,
+    rate_source: "standard_rule", // "standard_rule" | "manual_override"
+    rate_override_reason: "",
+    task_notes: "",
+  });
+
+  const [verifyModalOpen, setVerifyModalOpen] = useState(false);
+  const [verifyingAssignment, setVerifyingAssignment] = useState(null);
+  const [verifyAcceptedQty, setVerifyAcceptedQty] = useState(1);
+  const [verifyNotes, setVerifyNotes] = useState("");
+  const [verifyLoading, setVerifyLoading] = useState(false);
+
+  const loadAssignments = () => {
+    api.get(`/admin/orders/${id}/assignments`)
+      .then((r) => { setAssignments(r.data || []); })
+      .catch(() => {});
+  };
+
+  const loadWorkersAndRules = () => {
+    api.get("/admin/workers")
+      .then((r) => { setWorkers(r.data || []); })
+      .catch(() => {});
+    api.get("/admin/wage-rules")
+      .then((r) => { setWageRules(r.data || []); })
+      .catch(() => {});
+  };
+
   const loadPayments = () => {
     api.get(`/admin/orders/${id}/payments`)
       .then((r) => { setPayments(r.data.payments || []); })
@@ -64,12 +103,147 @@ export default function AdminOrderDetail() {
         toast.error(msg);
       });
     loadPayments();
+    loadAssignments();
   };
-  useEffect(() => { load(); }, [id]);
+  useEffect(() => {
+    load();
+    loadWorkersAndRules();
+  }, [id]);
 
   const update = async (patch) => {
     try { const { data } = await api.patch(`/admin/orders/${id}`, patch); setOrder((o) => ({ ...o, ...data })); toast.success("Pesanan diperbarui"); }
     catch { toast.error("Gagal memperbarui"); }
+  };
+
+  const handleOpenAssignModal = (it) => {
+    setSelectedOrderItem(it);
+    // Find matching default wage rule if any
+    const defaultRule = wageRules.find((r) => r.task_category === "whole_item" && r.pricing_basis === "per_unit");
+    setAssignForm({
+      worker_id: workers[0]?.id || "",
+      task_category: "whole_item",
+      pricing_basis: "per_unit",
+      agreed_rate_le: defaultRule ? defaultRule.standard_rate_le : "",
+      target_quantity: it?.quantity || 1,
+      rate_source: defaultRule ? "standard_rule" : "manual_override",
+      rate_override_reason: "",
+      task_notes: "",
+    });
+    setAssignModalOpen(true);
+  };
+
+  const handleCategoryBasisChange = (newCat, newBasis) => {
+    const matched = wageRules.find((r) => r.task_category === newCat && r.pricing_basis === newBasis);
+    setAssignForm((prev) => ({
+      ...prev,
+      task_category: newCat,
+      pricing_basis: newBasis,
+      agreed_rate_le: matched ? matched.standard_rate_le : prev.agreed_rate_le,
+      rate_source: matched ? "standard_rule" : "manual_override",
+    }));
+  };
+
+  const handleCreateAssignment = async (e) => {
+    e.preventDefault();
+    if (!assignForm.worker_id) {
+      toast.error("Silakan pilih pekerja/pengrajin");
+      return;
+    }
+    const rate = parseFloat(assignForm.agreed_rate_le);
+    if (!rate || rate <= 0) {
+      toast.error("Tarif upah harus lebih besar dari 0");
+      return;
+    }
+    const qty = parseInt(assignForm.target_quantity, 10);
+    if (!qty || qty <= 0) {
+      toast.error("Target kuantitas harus minimal 1");
+      return;
+    }
+    if (assignForm.rate_source === "manual_override" && !assignForm.rate_override_reason.trim()) {
+      toast.error("Alasan penyesuaian tarif manual wajib diisi");
+      return;
+    }
+
+    setAssignLoading(true);
+    try {
+      const payload = {
+        worker_id: assignForm.worker_id,
+        order_item_id: selectedOrderItem?.item_id,
+        task_category: assignForm.task_category,
+        pricing_basis: assignForm.pricing_basis,
+        agreed_rate_le: rate,
+        target_quantity: qty,
+        rate_override_reason: assignForm.rate_source === "manual_override" ? assignForm.rate_override_reason.trim() : undefined,
+        task_notes: assignForm.task_notes.trim() || undefined,
+      };
+      await api.post(`/admin/orders/${id}/assignments`, payload);
+      toast.success("Penugasan kerja berhasil dibuat");
+      setAssignModalOpen(false);
+      loadAssignments();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal membuat penugasan kerja");
+    } finally {
+      setAssignLoading(false);
+    }
+  };
+
+  const handleProgressChange = async (asnId, newStatus) => {
+    try {
+      await api.patch(`/admin/assignments/${asnId}/progress`, { status: newStatus });
+      toast.success(`Status penugasan diubah ke ${newStatus}`);
+      loadAssignments();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal memperbarui status penugasan");
+    }
+  };
+
+  const handleOpenVerifyModal = (asn) => {
+    setVerifyingAssignment(asn);
+    setVerifyAcceptedQty(asn.target_quantity || 1);
+    setVerifyNotes("");
+    setVerifyModalOpen(true);
+  };
+
+  const handleVerifySubmit = async (e) => {
+    e.preventDefault();
+    if (!verifyingAssignment) return;
+    const qty = parseInt(verifyAcceptedQty, 10);
+    if (!qty || qty <= 0) {
+      toast.error("Kuantitas diterima harus minimal 1");
+      return;
+    }
+    if (verifyingAssignment.pricing_basis === "lump_sum" && qty < verifyingAssignment.target_quantity) {
+      toast.error(`Pekerjaan borongan (lump-sum) wajib diselesaikan 100% (target: ${verifyingAssignment.target_quantity})`);
+      return;
+    }
+
+    setVerifyLoading(true);
+    try {
+      await api.post(`/admin/assignments/${verifyingAssignment.id || verifyingAssignment._id}/verify`, {
+        accepted_quantity: qty,
+        notes: verifyNotes.trim() || undefined,
+      });
+      toast.success("Penugasan berhasil diverifikasi dan upah terakru!");
+      setVerifyModalOpen(false);
+      loadAssignments();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal memverifikasi penugasan");
+    } finally {
+      setVerifyLoading(false);
+    }
+  };
+
+  const handleCancelAssignment = async (asnId) => {
+    const reason = window.prompt("Masukkan alasan pembatalan penugasan kerja:");
+    if (!reason || !reason.trim()) return;
+
+    try {
+      await api.post(`/admin/assignments/${asnId}/cancel`, { reason: reason.trim() });
+      toast.success("Penugasan kerja berhasil dibatalkan");
+      loadAssignments();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal membatalkan penugasan kerja");
+    }
   };
 
   const handleRecordPayment = async (e) => {
@@ -316,14 +490,124 @@ export default function AdminOrderDetail() {
           {order.customer_maps_url && <Row k="Maps" v={order.customer_maps_url} />}
         </Block>
 
-        <Block title="Produk">
-          {items.map((it, i) => it && (
-            <div key={i} className="border-b border-[#F1EBE0] pb-2 last:border-0">
-              <Row k={it.product_name_snapshot} v={`×${it.quantity}`} />
-              <div className="text-xs text-[#8B7355]">{config_summary_client(it.category, it.configuration_snapshot)}</div>
-              <div className="text-xs text-[#8B7355]">{fmtLE(it.subtotal_le)} LE</div>
-            </div>
-          ))}
+        <Block title="Produk & Penugasan Pengrajin">
+          {items.map((it, i) => {
+            if (!it) return null;
+            const itId = it.item_id;
+            const itemAssignments = assignments.filter((a) => a.order_item_id === itId);
+            return (
+              <div key={i} className="border-b border-[#F1EBE0] pb-4 last:border-0 mb-3">
+                <div className="flex justify-between items-start gap-2">
+                  <div>
+                    <Row k={it.product_name_snapshot} v={`×${it.quantity}`} />
+                    <div className="text-xs text-[#8B7355]">{config_summary_client(it.category, it.configuration_snapshot)}</div>
+                    <div className="text-xs text-[#8B7355]">{fmtLE(it.subtotal_le)} LE</div>
+                  </div>
+                  {itId && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleOpenAssignModal(it)}
+                      data-testid={`btn-assign-item-${i}`}
+                      className="rounded-xl border-[#8B5A2B]/40 text-[#8B5A2B] text-xs font-semibold hover:bg-[#8B5A2B] hover:text-white"
+                    >
+                      <Wrench size={13} className="mr-1.5" /> Tugaskan Pengrajin
+                    </Button>
+                  )}
+                </div>
+
+                {/* Assignment list for this item */}
+                {itemAssignments.length > 0 && (
+                  <div className="mt-3 bg-[#FAF5EE] rounded-xl p-3 border border-[#E5DCC5]">
+                    <div className="text-xs font-bold text-[#8B5A2B] mb-2 flex items-center gap-1.5">
+                      <UserCheck size={14} /> Daftar Penugasan Kerja ({itemAssignments.length})
+                    </div>
+                    <div className="space-y-2">
+                      {itemAssignments.map((asn) => {
+                        const statusColors = {
+                          assigned: "bg-stone-100 text-stone-700 border-stone-300",
+                          in_progress: "bg-blue-100 text-blue-800 border-blue-200",
+                          ready_for_review: "bg-amber-100 text-amber-800 border-amber-200",
+                          accruing: "bg-purple-100 text-purple-800 border-purple-200",
+                          completed: "bg-emerald-100 text-emerald-800 border-emerald-200",
+                          cancelled: "bg-red-100 text-red-700 border-red-200",
+                        };
+                        return (
+                          <div key={asn.id || asn._id} className="bg-white rounded-lg p-2.5 border border-[#E5DCC5] flex flex-wrap justify-between items-center gap-2 text-xs">
+                            <div>
+                              <div className="font-semibold text-[#2C1E16] flex items-center gap-2">
+                                <span>{asn.worker_name}</span>
+                                <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${statusColors[asn.status] || "bg-stone-100"}`}>
+                                  {asn.status}
+                                </span>
+                                {asn.is_owner_bypass && (
+                                  <span className="bg-amber-100 text-amber-800 border border-amber-200 px-1.5 py-0.5 rounded text-[9px] font-bold">
+                                    Owner Self-Approval
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[#8B7355] text-[11px] mt-0.5">
+                                Kategori: <span className="font-medium text-[#5C4A3D]">{asn.task_category}</span> | Basis: {asn.pricing_basis} | Tarif: {fmtLE(asn.agreed_rate_le)} LE | Target: {asn.target_quantity}
+                                {asn.accepted_quantity > 0 && ` | Diterima: ${asn.accepted_quantity}`}
+                              </div>
+                              {asn.wage_obligation_number && (
+                                <div className="text-emerald-700 text-[11px] font-medium mt-0.5">
+                                  No. Kewajiban: {asn.wage_obligation_number}
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Actions based on status */}
+                            <div className="flex items-center gap-1.5">
+                              {asn.status === "assigned" && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => handleProgressChange(asn.id || asn._id, "in_progress")}
+                                  className="h-7 text-[11px] rounded-lg border-blue-300 text-blue-700 hover:bg-blue-50"
+                                >
+                                  Mulai Kerjakan
+                                </Button>
+                              )}
+                              {asn.status === "in_progress" && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => handleProgressChange(asn.id || asn._id, "ready_for_review")}
+                                  className="h-7 text-[11px] rounded-lg border-amber-300 text-amber-700 hover:bg-amber-50"
+                                >
+                                  Siap Review
+                                </Button>
+                              )}
+                              {asn.status === "ready_for_review" && (
+                                <Button
+                                  size="sm"
+                                  onClick={() => handleOpenVerifyModal(asn)}
+                                  className="h-7 text-[11px] rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold"
+                                >
+                                  <ShieldCheck size={12} className="mr-1" /> Verifikasi & Akru Upah
+                                </Button>
+                              )}
+                              {asn.status !== "cancelled" && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => handleCancelAssignment(asn.id || asn._id)}
+                                  className="h-7 text-[11px] text-red-600 hover:bg-red-50 hover:text-red-700"
+                                >
+                                  Batalkan
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {order.notes && <Row k="Catatan" v={order.notes} />}
         </Block>
 
@@ -817,6 +1101,229 @@ export default function AdminOrderDetail() {
                   className="flex-1 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs"
                 >
                   {paymentLoading ? "Menyimpan..." : "Simpan Pembayaran"}
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Penugasan Pengrajin (Phase 2) */}
+      {assignModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl border border-[#E5DCC5] max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 border-b border-[#F1EBE0]">
+              <div className="font-heading text-base font-bold text-[#8B5A2B] flex items-center gap-2">
+                <Wrench size={18} /> Penugasan Kerja Pengrajin
+              </div>
+              <button
+                type="button"
+                onClick={() => setAssignModalOpen(false)}
+                className="text-stone-400 hover:text-stone-600"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateAssignment} className="mt-4 space-y-4 text-xs">
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Item Pesanan</Label>
+                <div className="mt-1 p-2 bg-[#FAF5EE] rounded-lg border border-[#E5DCC5] text-[#2C1E16]">
+                  <div className="font-medium">{selectedOrderItem?.product_name_snapshot}</div>
+                  <div className="text-[11px] text-[#8B7355]">Kuantitas Pesanan: {selectedOrderItem?.quantity} unit</div>
+                </div>
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Pilih Pengrajin / Pekerja</Label>
+                <select
+                  value={assignForm.worker_id}
+                  onChange={(e) => setAssignForm({ ...assignForm, worker_id: e.target.value })}
+                  className="mt-1 w-full rounded-xl border border-[#E5DCC5] p-2 text-xs focus:ring-1 focus:ring-[#8B5A2B]"
+                  required
+                >
+                  <option value="">-- Pilih Pekerja --</option>
+                  {workers.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.name} ({w.role})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs font-semibold text-[#5C4A3D]">Kategori Tugas</Label>
+                  <select
+                    value={assignForm.task_category}
+                    onChange={(e) => handleCategoryBasisChange(e.target.value, assignForm.pricing_basis)}
+                    className="mt-1 w-full rounded-xl border border-[#E5DCC5] p-2 text-xs"
+                  >
+                    <option value="whole_item">Borongan Penuh (whole_item)</option>
+                    <option value="assembly">Perakitan (assembly)</option>
+                    <option value="finishing">Finishing / Cat</option>
+                    <option value="cutting">Pemotongan (cutting)</option>
+                    <option value="custom">Tugas Khusus (custom)</option>
+                  </select>
+                </div>
+                <div>
+                  <Label className="text-xs font-semibold text-[#5C4A3D]">Dasar Tarif</Label>
+                  <select
+                    value={assignForm.pricing_basis}
+                    onChange={(e) => handleCategoryBasisChange(assignForm.task_category, e.target.value)}
+                    className="mt-1 w-full rounded-xl border border-[#E5DCC5] p-2 text-xs"
+                  >
+                    <option value="per_unit">Per Unit</option>
+                    <option value="lump_sum">Borongan Total (Lump-Sum)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs font-semibold text-[#5C4A3D]">Tarif Disepakati (LE)</Label>
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    value={assignForm.agreed_rate_le}
+                    onChange={(e) => setAssignForm({ ...assignForm, agreed_rate_le: e.target.value, rate_source: "manual_override" })}
+                    placeholder="0.00"
+                    className="mt-1"
+                    required
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs font-semibold text-[#5C4A3D]">Target Kuantitas</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    max={selectedOrderItem?.quantity || 1}
+                    value={assignForm.target_quantity}
+                    onChange={(e) => setAssignForm({ ...assignForm, target_quantity: e.target.value })}
+                    className="mt-1"
+                    required
+                  />
+                </div>
+              </div>
+
+              {assignForm.rate_source === "manual_override" && (
+                <div>
+                  <Label className="text-xs font-semibold text-amber-800">Alasan Penyesuaian Tarif Manual *</Label>
+                  <Input
+                    type="text"
+                    value={assignForm.rate_override_reason}
+                    onChange={(e) => setAssignForm({ ...assignForm, rate_override_reason: e.target.value })}
+                    placeholder="Contoh: Model kayu lebih keras / detail custom rumit"
+                    className="mt-1 border-amber-300 focus:ring-amber-500"
+                    required
+                  />
+                </div>
+              )}
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Catatan Tugas (Opsional)</Label>
+                <Textarea
+                  value={assignForm.task_notes}
+                  onChange={(e) => setAssignForm({ ...assignForm, task_notes: e.target.value })}
+                  placeholder="Instruksi khusus untuk pengrajin..."
+                  rows={2}
+                  className="mt-1"
+                />
+              </div>
+
+              <div className="mt-5 flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setAssignModalOpen(false)}
+                  className="flex-1 rounded-xl border-[#E5DCC5]"
+                >
+                  Batal
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={assignLoading}
+                  className="flex-1 rounded-xl bg-[#8B5A2B] hover:bg-[#724a23] text-white font-semibold text-xs"
+                >
+                  {assignLoading ? "Menyimpan..." : "Buat Penugasan"}
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Verifikasi & Akru Upah (Phase 2) */}
+      {verifyModalOpen && verifyingAssignment && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl border border-[#E5DCC5]">
+            <div className="flex items-center justify-between pb-3 border-b border-[#F1EBE0]">
+              <div className="font-heading text-base font-bold text-emerald-800 flex items-center gap-2">
+                <ShieldCheck size={18} /> Verifikasi Hasil Kerja & Akru Upah
+              </div>
+              <button
+                type="button"
+                onClick={() => setVerifyModalOpen(false)}
+                className="text-stone-400 hover:text-stone-600"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleVerifySubmit} className="mt-4 space-y-4 text-xs">
+              <div className="bg-[#FAF5EE] rounded-xl p-3 border border-[#E5DCC5] space-y-1">
+                <div>Pekerja: <span className="font-semibold text-[#2C1E16]">{verifyingAssignment.worker_name}</span></div>
+                <div>Kategori: <span className="font-semibold text-[#2C1E16]">{verifyingAssignment.task_category}</span> ({verifyingAssignment.pricing_basis})</div>
+                <div>Tarif Disepakati: <span className="font-semibold text-[#2C1E16]">{fmtLE(verifyingAssignment.agreed_rate_le)} LE</span></div>
+                <div>Target Kuantitas: <span className="font-semibold text-[#2C1E16]">{verifyingAssignment.target_quantity}</span></div>
+              </div>
+
+              {verifyingAssignment.pricing_basis === "lump_sum" && (
+                <div className="rounded-lg bg-amber-50 border border-amber-200 p-2.5 text-[11px] text-amber-800">
+                  <strong>Aturan Borongan (B-1):</strong> Pekerjaan lump-sum wajib diselesaikan 100% ({verifyingAssignment.target_quantity} unit). Verifikasi parsial tidak diizinkan.
+                </div>
+              )}
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Kuantitas Diterima</Label>
+                <Input
+                  type="number"
+                  min="1"
+                  max={verifyingAssignment.target_quantity}
+                  value={verifyAcceptedQty}
+                  onChange={(e) => setVerifyAcceptedQty(e.target.value)}
+                  className="mt-1"
+                  required
+                />
+              </div>
+
+              <div>
+                <Label className="text-xs font-semibold text-[#5C4A3D]">Catatan Verifikasi (Opsional)</Label>
+                <Textarea
+                  value={verifyNotes}
+                  onChange={(e) => setVerifyNotes(e.target.value)}
+                  placeholder="Catatan inspeksi kualitas..."
+                  rows={2}
+                  className="mt-1"
+                />
+              </div>
+
+              <div className="mt-5 flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setVerifyModalOpen(false)}
+                  className="flex-1 rounded-xl border-[#E5DCC5]"
+                >
+                  Batal
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={verifyLoading}
+                  className="flex-1 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs"
+                >
+                  {verifyLoading ? "Memverifikasi..." : "Konfirmasi Verifikasi"}
                 </Button>
               </div>
             </form>
