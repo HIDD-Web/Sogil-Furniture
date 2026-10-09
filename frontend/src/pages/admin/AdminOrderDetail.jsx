@@ -413,8 +413,18 @@ export default function AdminOrderDetail() {
           <div className="grid gap-4 sm:grid-cols-3">
             <div><Label className="mb-1.5 block text-sm font-semibold">Status Pesanan</Label>
               <Select value={order.order_status} onValueChange={(v) => update({ order_status: v })}><SelectTrigger data-testid="select-order-status" className="h-11 bg-white"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(ORDER_STATUS).map(([k, v]) => <SelectItem key={k} value={k}>{v.label}</SelectItem>)}</SelectContent></Select></div>
-            <div><Label className="mb-1.5 block text-sm font-semibold">Status Pembayaran</Label>
-              <Select value={order.payment_status} onValueChange={(v) => update({ payment_status: v })}><SelectTrigger data-testid="select-payment-status" className="h-11 bg-white"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(PAYMENT_STATUS).map(([k, v]) => <SelectItem key={k} value={k}>{v.label}</SelectItem>)}</SelectContent></Select></div>
+            <div>
+              <Label className="mb-1.5 block text-sm font-semibold">Status Pembayaran</Label>
+              <Select value={order.payment_status} disabled={true}>
+                <SelectTrigger data-testid="select-payment-status" className="h-11 bg-stone-100 cursor-not-allowed opacity-75">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {Object.entries(PAYMENT_STATUS).map(([k, v]) => <SelectItem key={k} value={k}>{v.label}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <p className="mt-1 text-[11px] text-[#8B7355]">Status pembayaran dihitung otomatis dari riwayat pembayaran.</p>
+            </div>
             <div><Label className="mb-1.5 block text-sm font-semibold">Metode Pembayaran</Label>
               <Select value={order.payment_method || "cash"} onValueChange={(v) => update({ payment_method: v })}><SelectTrigger data-testid="select-payment-method" className="h-11 bg-white"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="cash">Cash (Tunai — EGP)</SelectItem><SelectItem value="transfer">Transfer (IDR)</SelectItem></SelectContent></Select></div>
           </div>
@@ -701,17 +711,21 @@ export default function AdminOrderDetail() {
           <Row
             k="Terbayar"
             v={
-              order.paid_amount_le !== null && order.paid_amount_le !== undefined
-                ? `${fmtLE(order.paid_amount_le)} LE`
-                : <span className="text-amber-700 font-medium">Tidak Tersedia (Unknown)</span>
+              order.has_unrecorded_legacy_dp && order.canonical_paid_amount_le !== undefined && order.canonical_paid_amount_le !== null
+                ? <span>{fmtLE(order.canonical_paid_amount_le)} LE <span className="text-amber-700 text-[11px]">(Tercatat Baru) + DP Historis (Nominal Tidak Diketahui)</span></span>
+                : order.paid_amount_le !== null && order.paid_amount_le !== undefined
+                  ? `${fmtLE(order.paid_amount_le)} LE`
+                  : <span className="text-amber-700 font-medium">Tidak Tersedia (Unknown)</span>
             }
           />
           <Row
             k="Sisa Tagihan"
             v={
-              order.outstanding_amount_le !== null && order.outstanding_amount_le !== undefined
-                ? `${fmtLE(order.outstanding_amount_le)} LE`
-                : <span className="text-amber-700 font-medium">Tidak Tersedia (Unknown)</span>
+              order.has_unrecorded_legacy_dp
+                ? <span className="text-amber-700 font-medium">Belum Direkonsiliasi (Unknown)</span>
+                : order.outstanding_amount_le !== null && order.outstanding_amount_le !== undefined
+                  ? `${fmtLE(order.outstanding_amount_le)} LE`
+                  : <span className="text-amber-700 font-medium">Tidak Tersedia (Unknown)</span>
             }
           />
           <Row k="Pengiriman" v={order.delivery_method === "delivery" ? "Delivery" : "Ambil di Toko"} />
@@ -731,15 +745,50 @@ export default function AdminOrderDetail() {
               </p>
             </div>
             {canEditPrice && (
-              <Button
-                onClick={() => setPaymentModalOpen(true)}
-                data-testid="btn-record-payment"
-                className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
-              >
-                <CreditCard size={14} className="mr-1.5" /> Catat Pembayaran Baru
-              </Button>
+              <div className="flex items-center gap-2">
+                {order.outstanding_amount_le > 0 && !order.has_unrecorded_legacy_dp && (
+                  <Button
+                    onClick={() => {
+                      setPaymentForm({
+                        amount: String(order.outstanding_amount_le),
+                        payment_method: order.payment_method || "cash",
+                        reference: "",
+                        notes: "Pelunasan Pesanan",
+                        alloc_product: "",
+                        alloc_shipping: "",
+                        alloc_credit: "",
+                        use_custom_alloc: false,
+                      });
+                      setPaymentModalOpen(true);
+                    }}
+                    data-testid="btn-quick-settlement"
+                    className="rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-white text-xs font-semibold"
+                  >
+                    <CheckCircle2 size={14} className="mr-1.5" /> Lunaskan Pesanan ({fmtLE(order.outstanding_amount_le)} LE)
+                  </Button>
+                )}
+                <Button
+                  onClick={() => setPaymentModalOpen(true)}
+                  data-testid="btn-record-payment"
+                  className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                >
+                  <CreditCard size={14} className="mr-1.5" /> Catat Pembayaran Baru
+                </Button>
+              </div>
             )}
           </div>
+
+          {order.has_unrecorded_legacy_dp && (
+            <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 flex items-start gap-2" data-testid="banner-unreconciled-dp">
+              <AlertTriangle size={16} className="text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Perhatian: Nominal DP Historis Belum Direkonsiliasi</p>
+                <p className="mt-0.5 text-amber-800 text-[11px]">
+                  Pesanan ini memiliki status DP historis dengan nominal yang belum tercatat di sistem kasir. Pelunasan otomatis dinonaktifkan untuk mencegah kekeliruan perhitungan. Silakan catat pelunasan aktual secara manual.
+                </p>
+              </div>
+            </div>
+          )}
 
           {payments.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#E5DCC5] p-6 text-center text-xs text-[#8B7355]">

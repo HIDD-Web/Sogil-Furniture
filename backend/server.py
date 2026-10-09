@@ -323,8 +323,24 @@ async def compute_order_payment_summary(order_doc: dict) -> dict:
 
     total_le = _num(order_doc.get("total_le", 0.0))
 
+    has_unrecorded_legacy_dp = bool(order_doc.get("has_unrecorded_legacy_dp"))
+
     if recorded_payments:
         paid_amount_le = round(sum(_num(p.get("amount_le", 0.0)) for p in recorded_payments), 2)
+        if has_unrecorded_legacy_dp:
+            # Historical DP is unknown: outstanding balance remains unknown (None)
+            # and paid_amount_le represents only newly recorded payments while total paid remains unknown
+            return {
+                "payment_status": "dp",
+                "paid_amount_le": None,
+                "canonical_paid_amount_le": paid_amount_le,
+                "outstanding_amount_le": None,
+                "is_legacy_derived": False,
+                "legacy_dp_unknown": True,
+                "has_unrecorded_legacy_dp": True,
+                "valid_payments_count": len(recorded_payments)
+            }
+
         outstanding_amount_le = round(max(0.0, total_le - paid_amount_le), 2)
         if paid_amount_le <= 0:
             payment_status = "belum_dibayar"
@@ -340,6 +356,7 @@ async def compute_order_payment_summary(order_doc: dict) -> dict:
             "outstanding_amount_le": outstanding_amount_le,
             "is_legacy_derived": False,
             "legacy_dp_unknown": False,
+            "has_unrecorded_legacy_dp": False,
             "valid_payments_count": len(recorded_payments)
         }
 
@@ -352,6 +369,7 @@ async def compute_order_payment_summary(order_doc: dict) -> dict:
             "outstanding_amount_le": 0.0,
             "is_legacy_derived": True,
             "legacy_dp_unknown": False,
+            "has_unrecorded_legacy_dp": False,
             "valid_payments_count": 0
         }
     elif legacy_status == "dp":
@@ -361,6 +379,7 @@ async def compute_order_payment_summary(order_doc: dict) -> dict:
             "outstanding_amount_le": None,
             "is_legacy_derived": True,
             "legacy_dp_unknown": True,
+            "has_unrecorded_legacy_dp": True,
             "valid_payments_count": 0
         }
     else:  # belum_dibayar or unknown
@@ -370,6 +389,7 @@ async def compute_order_payment_summary(order_doc: dict) -> dict:
             "outstanding_amount_le": total_le,
             "is_legacy_derived": True,
             "legacy_dp_unknown": False,
+            "has_unrecorded_legacy_dp": False,
             "valid_payments_count": 0
         }
 
@@ -1986,14 +2006,19 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
     if not existing_order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
 
+    fields_set = getattr(data, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(data, "__fields_set__", set())
+    if "payment_status" in fields_set or data.payment_status is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Status pembayaran tidak dapat diubah secara manual. Status dikelola secara otomatis melalui pencatatan pembayaran riil."
+        )
+
     if data.order_status is not None:
         if data.order_status not in valid_status:
             raise HTTPException(status_code=400, detail="Status tidak valid")
         update["order_status"] = data.order_status
-    if data.payment_status is not None:
-        if data.payment_status not in valid_pay:
-            raise HTTPException(status_code=400, detail="Status pembayaran tidak valid")
-        update["payment_status"] = data.payment_status
     if data.payment_method is not None:
         if data.payment_method not in valid_methods:
             raise HTTPException(status_code=400, detail="Metode pembayaran tidak valid")
@@ -2095,79 +2120,6 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
 
     await db.orders.update_one({"_id": id_query(order_id)}, {"$set": update})
     order = await db.orders.find_one({"_id": id_query(order_id)})
-    effective_pay = data.payment_status if data.payment_status is not None else order.get("payment_status")
-    method_changed = data.payment_method is not None and data.payment_method != existing_order.get("payment_method")
-
-    if effective_pay == "lunas":
-        now_iso = datetime.now(timezone.utc).isoformat()
-        active_txn = await db.finance_transactions.find_one({
-            "related_order_id": str(order["_id"]),
-            "type": "order_revenue",
-            "is_void": {"$ne": True},
-            "status": {"$ne": "void"}
-        })
-        if active_txn:
-            # If manually edited by finance, do NOT overwrite financial details
-            if not active_txn.get("is_manual_override"):
-                if has_price_change or method_changed:
-                    new_total = _num(order.get("total_le"))
-                    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-                    txn_rate = resolve_transaction_rate(
-                        None,
-                        active_txn.get("exchange_rate") or order.get("exchange_rate_idr_per_le"),
-                        settings_rate
-                    )
-
-                    effective_method = (order.get("payment_method") or "cash").lower()
-                    if effective_method == "transfer":
-                        primary_cur = "IDR"
-                        primary_acc = "IDR"
-                        conv = compute_currency_conversion("IDR", round(new_total * txn_rate), txn_rate)
-                    else:  # cash
-                        primary_cur = "EGP"
-                        primary_acc = "EGP"
-                        conv = compute_currency_conversion("EGP", new_total, txn_rate)
-
-                    await db.finance_transactions.update_one(
-                        {"_id": active_txn["_id"]},
-                        {"$set": {
-                            "amount": conv["primary_amount"],
-                            "currency": primary_cur,
-                            "account": primary_acc,
-                            "exchange_rate": txn_rate,
-                            "counterpart_amount": conv["counterpart_amount"],
-                            "counterpart_currency": conv["counterpart_currency"],
-                            "payment_method": effective_method,
-                            "updated_at": now_iso,
-                            "description": f"Pendapatan otomatis dari pesanan {order.get('order_number')} (disesuaikan)"
-                        }}
-                    )
-        else:
-            await record_order_revenue(order)
-            await award_referral_points(order)
-    elif effective_pay in ("belum_dibayar", "dp"):
-        now_iso = datetime.now(timezone.utc).isoformat()
-        active_txn = await db.finance_transactions.find_one({
-            "related_order_id": str(order["_id"]),
-            "type": "order_revenue",
-            "is_void": {"$ne": True},
-            "status": {"$ne": "void"}
-        })
-        # If active txn exists and NOT manually overridden, mark order_sync void
-        if active_txn and not active_txn.get("is_manual_override"):
-            await db.finance_transactions.update_one(
-                {"_id": active_txn["_id"]},
-                {"$set": {
-                    "is_void": True,
-                    "status": "void",
-                    "void_source": "order_sync",
-                    "voided_at": now_iso,
-                    "voided_by_name": "Sistem (Status Pesanan)",
-                    "updated_at": now_iso
-                }}
-            )
-        await reverse_referral_points(order)
-
     return clean(order)
 
 @api_router.post("/admin/orders/{order_id}/permanent-delete")
@@ -2330,25 +2282,26 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             alloc_type = alloc.target_type.strip().lower()
             if alloc_type not in ("product", "shipping", "unallocated_credit"):
                 raise HTTPException(status_code=400, detail=f"Target alokasi tidak valid: {alloc.target_type}")
-            alloc_amt = _num(alloc.amount)
-            if alloc_amt < 0:
+            alloc_amt_dec = Decimal(str(alloc.amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if alloc_amt_dec < Decimal("0"):
                 raise HTTPException(status_code=400, detail="Nominal alokasi tidak boleh negatif")
             allocations.append({
                 "target_type": alloc_type,
-                "amount_le": round(alloc_amt, 2),
+                "amount_le": float(alloc_amt_dec),
                 "order_item_id": alloc.order_item_id,
                 "notes": alloc.notes or ""
             })
-        sum_allocs = round(sum(a["amount_le"] for a in allocations), 2)
-        if sum_allocs != round(raw_amount, 2):
+        sum_allocs_dec = sum(Decimal(str(a["amount_le"])) for a in allocations).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        raw_amt_dec = Decimal(str(raw_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if sum_allocs_dec != raw_amt_dec:
             raise HTTPException(
                 status_code=400,
-                detail=f"Jumlah alokasi ({sum_allocs}) harus sama persis dengan total pembayaran ({round(raw_amount, 2)})"
+                detail=f"Jumlah alokasi ({sum_allocs_dec}) harus sama persis dengan total pembayaran ({raw_amt_dec})"
             )
     else:
         # Configurable default policy: product up to product_portion, then shipping up to shipping_fee, excess unallocated_credit
         curr_summary = await compute_order_payment_summary(order)
-        curr_paid = curr_summary.get("paid_amount_le") or 0.0
+        curr_paid = curr_summary.get("paid_amount_le") or curr_summary.get("canonical_paid_amount_le") or 0.0
         remaining_product = max(0.0, product_portion - curr_paid)
         alloc_prod = min(raw_amount, remaining_product)
         remaining_after_prod = raw_amount - alloc_prod
@@ -2377,6 +2330,12 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
 
     payment_num = await generate_payment_number()
     txn_desc = f"Penerimaan pembayaran {payment_num} pesanan {order.get('order_number')}"
+
+    # Persistent marker: if this order had historical DP with 0 prior payment docs, mark it unreconciled
+    is_qualifying_legacy_dp = (
+        bool(order.get("has_unrecorded_legacy_dp")) or
+        (order.get("payment_status") == "dp" and (await db.payments.count_documents({"order_id": order["_id"], "status": "recorded"})) == 0)
+    )
 
     # 5. Atomic Execution
     async def _do_create_payment(session):
@@ -2448,18 +2407,30 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
         pmt_id, txn_id = await _do_create_payment(None)
 
     # 6. Recalculate and update order cached payment status
+    order_update_set = {
+        "payment_method": payment_method,
+        "updated_at": now,
+        "updated_by_name": admin.get("name", "Admin"),
+    }
+    if is_qualifying_legacy_dp:
+        order_update_set["has_unrecorded_legacy_dp"] = True
+
+    await db.orders.update_one({"_id": order["_id"]}, {"$set": order_update_set})
+
     fresh_order = await db.orders.find_one({"_id": order["_id"]})
     new_summary = await compute_order_payment_summary(fresh_order)
+
+    status_update = {
+        "payment_status": new_summary["payment_status"],
+        "paid_amount_le": new_summary["paid_amount_le"],
+        "outstanding_amount_le": new_summary["outstanding_amount_le"],
+    }
+    if "canonical_paid_amount_le" in new_summary:
+        status_update["canonical_paid_amount_le"] = new_summary["canonical_paid_amount_le"]
+
     await db.orders.update_one(
         {"_id": order["_id"]},
-        {"$set": {
-            "payment_status": new_summary["payment_status"],
-            "paid_amount_le": new_summary["paid_amount_le"],
-            "outstanding_amount_le": new_summary["outstanding_amount_le"],
-            "payment_method": payment_method,
-            "updated_at": now,
-            "updated_by_name": admin.get("name", "Admin"),
-        }}
+        {"$set": status_update}
     )
 
     created_payment = await db.payments.find_one({"_id": id_query(pmt_id)}) or {
