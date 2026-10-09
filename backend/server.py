@@ -2236,6 +2236,66 @@ async def admin_get_order_payment_summary(order_id: str, admin: dict = Depends(r
         **summary
     }
 
+def get_environment_mode() -> str:
+    """
+    Explicitly resolves the canonical runtime environment mode across all configured
+    environment variables (APP_ENV, ENV, ENVIRONMENT).
+
+    Rules:
+    1. Inspects every non-empty configured variable.
+    2. Maps supported aliases to canonical modes: 'production', 'development', 'test'.
+    3. If any configured value is unrecognized -> returns 'unknown' (fail-closed).
+    4. If multiple configured variables resolve to conflicting canonical modes -> returns 'unknown' (fail-closed).
+    5. If all configured variables agree on the same canonical mode -> returns that canonical mode.
+    6. If no variables are configured (missing/empty/whitespace-only) -> returns 'unknown' (fail-closed).
+    """
+    var_names = ("APP_ENV", "ENV", "ENVIRONMENT")
+    canonical_modes = set()
+
+    alias_map = {
+        "production": "production",
+        "prod": "production",
+        "development": "development",
+        "dev": "development",
+        "local": "development",
+        "test": "test",
+        "testing": "test",
+    }
+
+    configured_count = 0
+    for name in var_names:
+        raw = os.environ.get(name)
+        if raw is not None:
+            val = raw.strip().lower()
+            if val:
+                configured_count += 1
+                canonical = alias_map.get(val)
+                if not canonical:
+                    # Rule E: Unknown or unsupported value fails closed immediately
+                    return "unknown"
+                canonical_modes.add(canonical)
+
+    if configured_count == 0:
+        # Rule F: Missing or empty configuration fails closed
+        return "unknown"
+
+    if len(canonical_modes) == 1:
+        # Rule C & D: Unanimous agreement on canonical mode
+        return canonical_modes.pop()
+
+    # Rule C: Conflicting normalized modes fail closed
+    return "unknown"
+
+def is_standalone_fallback_permitted() -> bool:
+    """
+    Centralized environment-policy gate:
+    Standalone compensating fallback is permitted ONLY in explicitly and unambiguously
+    established development or test environments.
+    Production, unknown, unrecognized, or conflicting configurations strictly fail closed.
+    """
+    mode = get_environment_mode()
+    return mode in ("development", "test")
+
 @api_router.post("/admin/orders/{order_id}/payments")
 async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput, admin: dict = Depends(require_perm("manage_orders"))):
     # Financial write operation requires access_finance or owner role
@@ -2398,12 +2458,24 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
 
         return created_pmt_id, txn_id
 
+    session = None
     try:
-        async with await client.start_session() as session:
+        session = await client.start_session()
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+        if not is_standalone_fallback_permitted():
+            logger.error(f"Transaction capability unavailable for payment creation in mode {get_environment_mode()!r}: {sess_err}")
+            raise HTTPException(
+                status_code=503,
+                detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+            )
+        session = None
+
+    if session is not None:
+        async with session:
             async with session.start_transaction():
                 pmt_id, txn_id = await _do_create_payment(session)
-    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, Exception):
-        # Standalone MongoDB without replica set, closed loop, or unconfigured client in tests
+    else:
+        # Explicitly permitted standalone / test fallback
         pmt_id, txn_id = await _do_create_payment(None)
 
     # 6. Recalculate and update order cached payment status
@@ -2502,11 +2574,24 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 **ins_kw
             )
 
+    session = None
     try:
-        async with await client.start_session() as session:
+        session = await client.start_session()
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+        if not is_standalone_fallback_permitted():
+            logger.error(f"Transaction capability unavailable for payment void in mode {get_environment_mode()!r}: {sess_err}")
+            raise HTTPException(
+                status_code=503,
+                detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+            )
+        session = None
+
+    if session is not None:
+        async with session:
             async with session.start_transaction():
                 await _do_void(session)
-    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, Exception):
+    else:
+        # Explicitly permitted standalone / test fallback
         await _do_void(None)
 
     # Recalculate order status
@@ -2549,66 +2634,6 @@ def require_finance_or_owner():
             return admin
         raise HTTPException(status_code=403, detail="Akses ditolak: Membutuhkan akses keuangan atau owner")
     return dep
-
-def get_environment_mode() -> str:
-    """
-    Explicitly resolves the canonical runtime environment mode across all configured
-    environment variables (APP_ENV, ENV, ENVIRONMENT).
-
-    Rules:
-    1. Inspects every non-empty configured variable.
-    2. Maps supported aliases to canonical modes: 'production', 'development', 'test'.
-    3. If any configured value is unrecognized -> returns 'unknown' (fail-closed).
-    4. If multiple configured variables resolve to conflicting canonical modes -> returns 'unknown' (fail-closed).
-    5. If all configured variables agree on the same canonical mode -> returns that canonical mode.
-    6. If no variables are configured (missing/empty/whitespace-only) -> returns 'unknown' (fail-closed).
-    """
-    var_names = ("APP_ENV", "ENV", "ENVIRONMENT")
-    canonical_modes = set()
-
-    alias_map = {
-        "production": "production",
-        "prod": "production",
-        "development": "development",
-        "dev": "development",
-        "local": "development",
-        "test": "test",
-        "testing": "test",
-    }
-
-    configured_count = 0
-    for name in var_names:
-        raw = os.environ.get(name)
-        if raw is not None:
-            val = raw.strip().lower()
-            if val:
-                configured_count += 1
-                canonical = alias_map.get(val)
-                if not canonical:
-                    # Rule E: Unknown or unsupported value fails closed immediately
-                    return "unknown"
-                canonical_modes.add(canonical)
-
-    if configured_count == 0:
-        # Rule F: Missing or empty configuration fails closed
-        return "unknown"
-
-    if len(canonical_modes) == 1:
-        # Rule C & D: Unanimous agreement on canonical mode
-        return canonical_modes.pop()
-
-    # Rule C: Conflicting normalized modes fail closed
-    return "unknown"
-
-def is_standalone_fallback_permitted() -> bool:
-    """
-    Centralized environment-policy gate:
-    Standalone compensating fallback is permitted ONLY in explicitly and unambiguously
-    established development or test environments.
-    Production, unknown, unrecognized, or conflicting configurations strictly fail closed.
-    """
-    mode = get_environment_mode()
-    return mode in ("development", "test")
 
 def validate_currency_allowlist(currency: str):
     if not currency or not isinstance(currency, str):

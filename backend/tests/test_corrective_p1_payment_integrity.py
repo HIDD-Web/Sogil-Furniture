@@ -20,6 +20,7 @@ T16 - Transaction rollback on finance insertion failure leaves no orphaned docs
 T17 - Concurrent non-financial order update and canonical payment recording convergence
 """
 import asyncio
+import os
 import unittest
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,9 +31,11 @@ from pydantic import ValidationError
 from server import (
     compute_order_payment_summary,
     admin_create_order_payment,
+    admin_void_order_payment,
     admin_update_order,
     OrderStatusUpdate,
     PaymentCreateInput,
+    PaymentVoidInput,
     PaymentAllocationInput,
 )
 
@@ -45,6 +48,16 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             "role": "admin",
             "permissions": {"manage_orders": True, "access_finance": True},
         }
+
+        self.mock_session = AsyncMock()
+        self.mock_session.__aenter__.return_value = self.mock_session
+        self.mock_session.__aexit__.return_value = None
+        self.mock_session.start_transaction = MagicMock()
+        self.mock_session.start_transaction.return_value.__aenter__ = AsyncMock(return_value=self.mock_session)
+        self.mock_session.start_transaction.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        self.mock_client = MagicMock()
+        self.mock_client.start_session = AsyncMock(return_value=self.mock_session)
 
     def _setup_mock_db(self, mock_db):
         mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
@@ -84,7 +97,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 2000.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=2000.0, payment_method="cash")
             res = await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -120,7 +133,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[
             {"amount_le": 1000.0, "status": "recorded"}
         ])
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload_dp = PaymentCreateInput(amount=1000.0, payment_method="cash")
             res_dp = await admin_create_order_payment(order_id, payload_dp, self.admin_finance)
         self.assertEqual(res_dp["order_summary"]["payment_status"], "dp")
@@ -131,7 +144,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 1000.0, "status": "recorded"},
             {"amount_le": 1000.0, "status": "recorded"}
         ])
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload_settle = PaymentCreateInput(amount=1000.0, payment_method="cash")
             res_settle = await admin_create_order_payment(order_id, payload_settle, self.admin_finance)
         self.assertEqual(res_settle["order_summary"]["payment_status"], "lunas")
@@ -157,7 +170,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.update_one = AsyncMock()
         mock_db.finance_transactions.insert_one = AsyncMock()
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             # Case A: String value ("lunas")
             payload_str = OrderStatusUpdate(payment_status="lunas")
             with self.assertRaises(HTTPException) as cm_str:
@@ -195,7 +208,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.update_one = AsyncMock()
         mock_db.finance_transactions.insert_one = AsyncMock()
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = OrderStatusUpdate(admin_note="Urgent handling", order_status="diproses")
             res = await admin_update_order(order_id, payload, self.admin_finance)
 
@@ -211,7 +224,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": "ord_leg_lunas", "total_le": 1500.0, "payment_status": "lunas"}
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "lunas")
@@ -229,7 +242,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": "ord_leg_unpaid", "total_le": 1500.0, "payment_status": "belum_dibayar"}
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "belum_dibayar")
@@ -246,7 +259,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": "ord_leg_dp", "total_le": 2000.0, "payment_status": "dp"}
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "dp")
@@ -288,7 +301,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 500.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash")
             res = await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -311,7 +324,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 500.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertIsNone(summary["outstanding_amount_le"])
@@ -328,7 +341,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": ObjectId(order_id), "total_le": 1000.0, "payment_status": "lunas"}
         mock_db.orders.find_one = AsyncMock(return_value=order_doc)
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload_zero = PaymentCreateInput(amount=0.0, payment_method="cash")
             with self.assertRaises(HTTPException) as cm:
                 await admin_create_order_payment(order_id, payload_zero, self.admin_finance)
@@ -363,7 +376,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             [{"amount_le": 1250.0, "status": "recorded"}],  # Second call in fresh_order summary after insert
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=1250.0, payment_method="cash")
             res = await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -393,7 +406,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.update_one = AsyncMock()
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             # Sum mismatch by 0.01
             payload_bad = PaymentCreateInput(
                 amount=100.00,
@@ -426,7 +439,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.find_one = AsyncMock(return_value={"_id": ObjectId(order_id), "total_le": 1000.0})
         mock_db.payments.find_one = AsyncMock(return_value=existing_pmt)
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash", idempotency_key="unique-idem-T13")
             res = await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -463,7 +476,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
         mock_db.payments.insert_one = AsyncMock(side_effect=insert_one_side_effect)
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash", idempotency_key="race-key")
             # Thread 1 succeeds
             res1 = await admin_create_order_payment(order_id, payload, self.admin_finance)
@@ -489,7 +502,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         # Simulate payment insert failure
         mock_db.payments.insert_one = AsyncMock(side_effect=Exception("Disk full / MongoDB write error"))
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash")
             with self.assertRaises(Exception):
                 await admin_create_order_payment(order_id, payload, self.admin_finance)
@@ -512,7 +525,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         # Simulate finance failure
         mock_db.finance_transactions.insert_one = AsyncMock(side_effect=Exception("Network partition"))
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash")
             with self.assertRaises(Exception):
                 await admin_create_order_payment(order_id, payload, self.admin_finance)
@@ -547,7 +560,7 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 1000.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             # Concurrent execution of Worker A (Order Update) and Worker B (Payment Creation)
             task_a = admin_update_order(
                 order_id,
@@ -569,6 +582,180 @@ class TestCorrectiveP1PaymentIntegrity(unittest.IsolatedAsyncioTestCase):
         # 3. Both endpoints succeeded cleanly
         self.assertEqual(res_b["order_summary"]["payment_status"], "dp")
         self.assertEqual(res_b["order_summary"]["outstanding_amount_le"], 1000.0)
+
+    # =========================================================================
+    # D02 / D03 — Production fail-closed on transaction session start failure
+    # =========================================================================
+    async def test_D02_D03_production_payment_creation_fails_closed(self):
+        """D02 & D03: In production mode, missing transaction capability raises HTTP 503 and aborts with zero writes."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {"_id": ObjectId(order_id), "order_number": "SGF-D02", "total_le": 1000.0}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 301})
+        mock_db.payments.count_documents = AsyncMock(return_value=0)
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        # Client that fails session creation
+        failing_client = MagicMock()
+        import pymongo.errors
+        failing_client.start_session = AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))
+
+        with patch("server.db", mock_db), patch("server.client", failing_client), patch.dict("os.environ", {"APP_ENV": "production"}):
+            payload = PaymentCreateInput(amount=500.0, payment_method="cash")
+            with self.assertRaises(HTTPException) as cm:
+                await admin_create_order_payment(order_id, payload, self.admin_finance)
+            self.assertEqual(cm.exception.status_code, 503)
+            self.assertIn("Fail-Closed", cm.exception.detail)
+
+        # Confirm zero writes
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
+
+    # =========================================================================
+    # D10 / D13 — Production fail-closed on void transaction session start failure
+    # =========================================================================
+    async def test_D10_D13_production_payment_void_fails_closed(self):
+        """D10 & D13: In production mode, missing transaction capability for void raises HTTP 503 and preserves records."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        payment_id = "607f1f77bcf86cd799439022"
+        order_doc = {"_id": ObjectId(order_id), "order_number": "SGF-D10", "total_le": 1000.0}
+        pmt_doc = {"_id": ObjectId(payment_id), "order_id": ObjectId(order_id), "status": "recorded", "finance_transaction_id": "707f1f77bcf86cd799439033"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=pmt_doc)
+
+        failing_client = MagicMock()
+        import pymongo.errors
+        failing_client.start_session = AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))
+
+        with patch("server.db", mock_db), patch("server.client", failing_client), patch.dict("os.environ", {"APP_ENV": "production"}):
+            payload = PaymentVoidInput(reason="Customer cancelled")
+            with self.assertRaises(HTTPException) as cm:
+                await admin_void_order_payment(order_id, payment_id, payload, self.admin_finance)
+            self.assertEqual(cm.exception.status_code, 503)
+            self.assertIn("Fail-Closed", cm.exception.detail)
+
+        # Confirm zero mutations
+        mock_db.payments.update_one.assert_not_called()
+        mock_db.finance_transactions.update_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
+
+    # =========================================================================
+    # D05 — Second write failure in transaction does NOT trigger standalone replay
+    # =========================================================================
+    async def test_D05_second_write_failure_aborts_without_standalone_replay(self):
+        """D05: When db.payments.insert_one fails inside transaction, transaction aborts and no non-transactional replay occurs."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {"_id": ObjectId(order_id), "order_number": "SGF-D05", "total_le": 1000.0}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 302})
+        mock_db.payments.count_documents = AsyncMock(return_value=0)
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.payments.insert_one = AsyncMock(side_effect=Exception("Disk full on payments collection"))
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            payload = PaymentCreateInput(amount=500.0, payment_method="cash")
+            with self.assertRaises(Exception):
+                await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        # Crucial invariant: finance_transactions.insert_one was called exactly once in session, NEVER replayed without session!
+        self.assertEqual(mock_db.finance_transactions.insert_one.call_count, 1)
+        mock_db.orders.update_one.assert_not_called()
+
+    # =========================================================================
+    # D12 — Void second write failure inside transaction aborts cleanly
+    # =========================================================================
+    async def test_D12_void_second_write_failure_aborts_cleanly(self):
+        """D12: When updating finance transaction during void raises an error, it aborts cleanly without non-transactional replay."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        payment_id = "607f1f77bcf86cd799439022"
+        order_doc = {"_id": ObjectId(order_id), "order_number": "SGF-D12", "total_le": 1000.0}
+        pmt_doc = {"_id": ObjectId(payment_id), "order_id": ObjectId(order_id), "status": "recorded", "finance_transaction_id": "707f1f77bcf86cd799439033"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=pmt_doc)
+        mock_db.payments.update_one = AsyncMock()
+        mock_db.finance_transactions.update_one = AsyncMock(side_effect=Exception("Network drop on finance ledger"))
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            payload = PaymentVoidInput(reason="Void test")
+            with self.assertRaises(Exception):
+                await admin_void_order_payment(order_id, payment_id, payload, self.admin_finance)
+
+        # Crucial invariant: payments.update_one was called exactly once in session, never replayed outside session
+        self.assertEqual(mock_db.payments.update_one.call_count, 1)
+        mock_db.orders.update_one.assert_not_called()
+
+    # =========================================================================
+    # D04 / D11 — Missing / Unknown environment fail-closed direct regression tests
+    # =========================================================================
+    async def test_D04_unknown_env_payment_creation_fails_closed(self):
+        """D04: When environment variables are completely unset or conflicting (unknown mode), missing transaction capability raises HTTP 503 with zero writes."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {"_id": ObjectId(order_id), "order_number": "SGF-D04", "total_le": 1000.0}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 303})
+        mock_db.payments.count_documents = AsyncMock(return_value=0)
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        failing_client = MagicMock()
+        import pymongo.errors
+        failing_client.start_session = AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))
+
+        # Explicitly clear all environment markers (APP_ENV, ENV, ENVIRONMENT unset)
+        env_clean = {k: v for k, v in os.environ.items() if k not in ("APP_ENV", "ENV", "ENVIRONMENT")}
+        with patch("server.db", mock_db), patch("server.client", failing_client), patch.dict("os.environ", env_clean, clear=True):
+            payload = PaymentCreateInput(amount=500.0, payment_method="cash")
+            with self.assertRaises(HTTPException) as cm:
+                await admin_create_order_payment(order_id, payload, self.admin_finance)
+            self.assertEqual(cm.exception.status_code, 503)
+            self.assertIn("Fail-Closed", cm.exception.detail)
+
+        # Confirm zero writes
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
+
+    async def test_D11_unknown_env_payment_void_fails_closed(self):
+        """D11: When environment variables resolve to unknown, missing transaction capability for void raises HTTP 503 and zero mutations."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        payment_id = "607f1f77bcf86cd799439022"
+        order_doc = {"_id": ObjectId(order_id), "order_number": "SGF-D11", "total_le": 1000.0}
+        pmt_doc = {"_id": ObjectId(payment_id), "order_id": ObjectId(order_id), "status": "recorded", "finance_transaction_id": "707f1f77bcf86cd799439033"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=pmt_doc)
+
+        failing_client = MagicMock()
+        import pymongo.errors
+        failing_client.start_session = AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))
+
+        # Conflicting environment markers resolve to unknown mode
+        with patch("server.db", mock_db), patch("server.client", failing_client), patch.dict("os.environ", {"APP_ENV": "development", "ENV": "production", "ENVIRONMENT": ""}):
+            payload = PaymentVoidInput(reason="Void under unknown env")
+            with self.assertRaises(HTTPException) as cm:
+                await admin_void_order_payment(order_id, payment_id, payload, self.admin_finance)
+            self.assertEqual(cm.exception.status_code, 503)
+            self.assertIn("Fail-Closed", cm.exception.detail)
+
+        # Confirm zero mutations
+        mock_db.payments.update_one.assert_not_called()
+        mock_db.finance_transactions.update_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
 
 
 if __name__ == "__main__":

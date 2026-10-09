@@ -31,6 +31,15 @@ from server import (
 
 class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.mock_session = AsyncMock()
+        self.mock_session.__aenter__.return_value = self.mock_session
+        self.mock_session.__aexit__.return_value = None
+        self.mock_session.start_transaction = MagicMock()
+        self.mock_session.start_transaction.return_value.__aenter__ = AsyncMock(return_value=self.mock_session)
+        self.mock_session.start_transaction.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        self.mock_client = MagicMock()
+        self.mock_client.start_session = AsyncMock(return_value=self.mock_session)
         self.admin_finance = {
             "id": "admin_fin_01",
             "name": "Finance Head",
@@ -81,7 +90,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_find.to_list = AsyncMock(return_value=[])
         mock_db.payments.find.return_value = mock_find
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash")
             res = await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -114,7 +123,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_find.to_list = AsyncMock(return_value=[])
         mock_db.payments.find.return_value = mock_find
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash")
             await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -139,7 +148,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 103})
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=400.0, payment_method="cash")
             await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -159,7 +168,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 104})
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=400.0, payment_method="cash")
             with self.assertRaises(Exception):
                 await admin_create_order_payment(order_id, payload, self.admin_finance)
@@ -179,7 +188,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.find_one = AsyncMock(return_value=order_doc)
         mock_db.payments.find_one = AsyncMock(return_value=None)
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(
                 amount=500.0,
                 payment_method="cash",
@@ -208,7 +217,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 105})
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(
                 amount=600.0,
                 payment_method="cash",
@@ -240,7 +249,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 106})
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(
                 amount=1000.0,
                 payment_method="cash",
@@ -263,7 +272,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.find_one = AsyncMock(return_value=order_doc)
         mock_db.payments.find_one = AsyncMock(return_value=None)
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(
                 amount=500.0,
                 payment_method="cash",
@@ -286,7 +295,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 400.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "dp")
@@ -302,7 +311,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 600.0, "status": "recorded"},
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "lunas")
@@ -319,7 +328,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 449.50, "status": "recorded"},
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["paid_amount_le"], 1000.0)
@@ -337,7 +346,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 1250.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "overpaid")
@@ -356,7 +365,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 500.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "dp")
@@ -372,7 +381,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": "ord_leg_lunas", "total_le": 850.0, "payment_status": "lunas"}
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "lunas")
@@ -387,7 +396,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": "ord_leg_unpaid", "total_le": 850.0, "payment_status": "belum_dibayar"}
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "belum_dibayar")
@@ -402,7 +411,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         order_doc = {"_id": "ord_leg_dp", "total_le": 1200.0, "payment_status": "dp"}
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             summary = await compute_order_payment_summary(order_doc)
 
         self.assertEqual(summary["payment_status"], "dp")
@@ -433,7 +442,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 500.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             # Admin updates order status to selesai while payment remains DP
             res = await admin_update_order(
                 order_id=order_id,
@@ -469,7 +478,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             {"amount_le": 1000.0, "status": "recorded"}
         ])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=1000.0, payment_method="cash")
             await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -496,7 +505,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.find_one = AsyncMock(return_value={"_id": ObjectId(order_id), "order_number": "SGF-1", "total_le": 1000.0})
         mock_db.payments.find_one = AsyncMock(return_value=existing_pmt)
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             payload = PaymentCreateInput(amount=500.0, payment_method="cash", idempotency_key="unique-idem-key-123")
             res = await admin_create_order_payment(order_id, payload, self.admin_finance)
 
@@ -529,7 +538,7 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
         mock_db.system_rates.find_one = AsyncMock(return_value={"rate": 350.0})
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
 
-        with patch("server.db", mock_db):
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
             # Test Cash EGP
             payload_cash = PaymentCreateInput(amount=500.0, payment_method="cash")
             await admin_create_order_payment(order_id, payload_cash, self.admin_finance)
