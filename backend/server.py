@@ -317,6 +317,14 @@ class PaymentCreateInput(BaseModel):
 class PaymentVoidInput(BaseModel):
     reason: str
 
+class CustomerCreditRefundInput(BaseModel):
+    amount: float
+    currency: Optional[str] = "EGP"
+    refund_method: Optional[str] = "cash"  # "cash" | "transfer"
+    account: Optional[str] = None          # "EGP" | "IDR"
+    notes: Optional[str] = ""
+    idempotency_key: Optional[str] = None
+
 async def compute_order_payment_summary(order_doc: dict) -> dict:
     order_oid = id_query(str(order_doc.get("_id") or order_doc.get("id")))
     recorded_payments = await db.payments.find({
@@ -490,7 +498,7 @@ async def generate_credit_event_number() -> str:
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
 
-async def get_customer_credit_balance(customer_id: str, currency: str = "EGP") -> float:
+async def get_customer_credit_balance(customer_id: str, currency: str = "EGP", session=None) -> float:
     """
     Computes available customer credit balance from signed ledger events in db.customer_credit_events.
     Currencies (EGP, IDR) are tracked independently and never summed across currencies.
@@ -502,7 +510,8 @@ async def get_customer_credit_balance(customer_id: str, currency: str = "EGP") -
         {"$match": {"customer_id": str(customer_id), "currency": cur}},
         {"$group": {"_id": None, "total": {"$sum": "$signed_amount"}}}
     ]
-    cursor = db.customer_credit_events.aggregate(pipeline)
+    agg_kw = {"session": session} if session else {}
+    cursor = db.customer_credit_events.aggregate(pipeline, **agg_kw)
     res = await cursor.to_list(1) if hasattr(cursor, "to_list") else []
     if res and len(res) > 0:
         return round(float(res[0].get("total", 0.0)), 2)
@@ -2443,8 +2452,29 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
         raise HTTPException(status_code=400, detail="Mata uang transaksi pokok harus EGP")
 
     payment_method = (payload.payment_method or "cash").strip().lower()
-    if payment_method not in ("cash", "transfer"):
-        raise HTTPException(status_code=400, detail="Metode pembayaran harus cash atau transfer")
+    if payment_method not in ("cash", "transfer", "customer_credit"):
+        raise HTTPException(status_code=400, detail="Metode pembayaran harus cash, transfer, atau customer_credit")
+
+    # Phase 3.B.3 Validation: Customer Credit requires a registered customer and positive EGP balance
+    customer_doc = None
+    if payment_method == "customer_credit":
+        order_cust_id = str(order.get("customer_id") or "").strip()
+        if not order_cust_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Pembayaran menggunakan saldo kredit pelanggan membutuhkan pesanan dengan akun pelanggan terdaftar (bukan pesanan tamu/guest)"
+            )
+        customer_doc = await db.customers.find_one({"_id": id_query(order_cust_id)})
+        if not customer_doc:
+            raise HTTPException(status_code=400, detail="Data akun pelanggan tidak ditemukan di sistem")
+
+        # Initial preflight balance check (strict EGP)
+        preflight_balance = await get_customer_credit_balance(order_cust_id, "EGP")
+        if preflight_balance < raw_amount:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Saldo kredit pelanggan tidak mencukupi (Tersedia: {preflight_balance:.2f} EGP, Dibutuhkan: {raw_amount:.2f} EGP)"
+            )
 
     now = datetime.now(timezone.utc).isoformat()
     payment_date = payload.payment_date or now
@@ -2502,13 +2532,28 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
         primary_currency = "IDR"
         primary_account = "IDR"
         conv = compute_currency_conversion("IDR", round(raw_amount * rate), rate)
+    elif payment_method == "customer_credit":
+        # Non-cash settlement: EGP currency, non-cash settlement account, zero physical cash
+        primary_currency = "EGP"
+        primary_account = "CUSTOMER_CREDIT"
+        conv = {
+            "primary_amount": raw_amount,
+            "primary_currency": "EGP",
+            "counterpart_amount": round(raw_amount * rate),
+            "counterpart_currency": "IDR",
+            "rate": rate,
+        }
     else:
         primary_currency = "EGP"
         primary_account = "EGP"
         conv = compute_currency_conversion("EGP", raw_amount, rate)
 
     payment_num = await generate_payment_number()
-    txn_desc = f"Penerimaan pembayaran {payment_num} pesanan {order.get('order_number')}"
+    txn_desc = (
+        f"Pelunasan non-kas saldo kredit {payment_num} pesanan {order.get('order_number')}"
+        if payment_method == "customer_credit"
+        else f"Penerimaan pembayaran {payment_num} pesanan {order.get('order_number')}"
+    )
 
     # Persistent marker: if this order had historical DP with 0 prior payment docs, mark it unreconciled
     is_qualifying_legacy_dp = (
@@ -2519,14 +2564,43 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
     # 5. Atomic Execution
     async def _do_create_payment(session):
         ins_kw = {"session": session} if session else {}
-        # Insert Finance Transaction (Cash Receipt)
+
+        # Phase 3.B.3 Concurrency & Balance Gate inside transactional boundary
+        if payment_method == "customer_credit":
+            # Concurrency serialization: Acquire exclusive write conflict lock on the customer document
+            # within the transaction. In MongoDB WiredTiger, any concurrent transaction attempting to
+            # settle credit for the same customer will encounter a write-write conflict and be serialized,
+            # preventing write-skew double spending across independent document inserts.
+            cust_oid = id_query(str(order["customer_id"]))
+            cust_touch_res = await db.customers.update_one(
+                {"_id": cust_oid},
+                {"$set": {"last_credit_transaction_at": now}},
+                **ins_kw
+            )
+            if cust_touch_res.matched_count == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Akun pelanggan tidak ditemukan untuk serialisasi transaksi kredit"
+                )
+
+            # Concurrency-safe balance verification: enforce that available credit >= required amount
+            # evaluated immediately after acquiring the customer serialization lock within the snapshot.
+            in_txn_balance = await get_customer_credit_balance(str(order["customer_id"]), "EGP", session=session)
+            if in_txn_balance < raw_amount:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Konflik saldo: Saldo kredit pelanggan tidak mencukupi untuk transaksi ini (Tersedia: {in_txn_balance:.2f} EGP, Dibutuhkan: {raw_amount:.2f} EGP)"
+                )
+
+        # Insert Finance Transaction (Cash Receipt or Non-Cash Settlement)
         txn_doc = {
             "date": payment_date,
-            "type": "order_revenue",
+            "type": "credit_settlement" if payment_method == "customer_credit" else "order_revenue",
             "category": "Penjualan",
             "amount": conv["primary_amount"],
             "currency": primary_currency,
             "account": primary_account,
+            "classification": "credit_settlement" if payment_method == "customer_credit" else None,
             "exchange_rate": rate,
             "counterpart_amount": conv["counterpart_amount"],
             "counterpart_currency": conv["counterpart_currency"],
@@ -2575,9 +2649,37 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             **ins_kw
         )
 
+        # Phase 3.B.3: Record credit_applied event in customer_credit_events
+        if payment_method == "customer_credit":
+            cce_event_num = await generate_credit_event_number()
+            apply_cce_doc = {
+                "event_number": cce_event_num,
+                "event_type": "credit_applied",
+                "customer_id": str(order["customer_id"]),
+                "customer_name": order.get("customer_name") or order.get("name"),
+                "customer_phone": order.get("customer_phone") or order.get("phone"),
+                "source_payment_id": created_pmt_id,
+                "source_payment_number": payment_num,
+                "source_order_id": str(order["_id"]),
+                "source_order_number": order.get("order_number"),
+                "currency": "EGP",
+                "signed_amount": -round(float(raw_amount), 2),
+                "reason": f"Pelunasan pesanan {order.get('order_number')} menggunakan saldo kredit",
+                "idempotency_key": f"cce_pmt_{created_pmt_id}_apply",
+                "created_by_id": admin.get("id"),
+                "created_by_name": admin.get("name", "Admin"),
+                "created_at": now,
+                "updated_at": now,
+            }
+            cce_insert = getattr(db.customer_credit_events, "insert_one", None)
+            if callable(cce_insert):
+                res_coro = cce_insert(apply_cce_doc, **ins_kw)
+                if asyncio.iscoroutine(res_coro):
+                    await res_coro
+
         # Phase 3.B.2: Customer Credit Event Creation for Qualifying Overpayment
         unallocated_amt = sum(_num(a["amount_le"]) for a in allocations if a.get("target_type") == "unallocated_credit")
-        if unallocated_amt > 0:
+        if unallocated_amt > 0 and payment_method != "customer_credit":
             cust_id = str(order.get("customer_id") or "").strip() or None
             cce_event_num = await generate_credit_event_number()
             idem_key = f"cce_pmt_{created_pmt_id}_mint"
@@ -2608,25 +2710,56 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
 
         return created_pmt_id, txn_id
 
-    session = None
-    try:
-        session = await client.start_session()
-    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
-        if not is_standalone_fallback_permitted():
-            logger.error(f"Transaction capability unavailable for payment creation in mode {get_environment_mode()!r}: {sess_err}")
-            raise HTTPException(
-                status_code=503,
-                detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
-            )
-        session = None
+    def _is_transient_conflict(exc: Exception) -> bool:
+        if isinstance(exc, pymongo.errors.PyMongoError):
+            if hasattr(exc, "has_error_label") and exc.has_error_label("TransientTransactionError"):
+                return True
+            if isinstance(exc, pymongo.errors.OperationFailure) and getattr(exc, "code", None) == 112:
+                return True
+        return False
 
-    if session is not None:
-        async with session:
-            async with session.start_transaction():
-                pmt_id, txn_id = await _do_create_payment(session)
-    else:
-        # Explicitly permitted standalone / test fallback
-        pmt_id, txn_id = await _do_create_payment(None)
+    max_txn_retries = 3
+    pmt_id = None
+    txn_id = None
+
+    for attempt in range(1, max_txn_retries + 1):
+        session = None
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+            if not is_standalone_fallback_permitted():
+                logger.error(f"Transaction capability unavailable for payment creation in mode {get_environment_mode()!r}: {sess_err}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                )
+            session = None
+
+        try:
+            if session is not None:
+                async with session:
+                    async with session.start_transaction():
+                        pmt_id, txn_id = await _do_create_payment(session)
+            else:
+                # Explicitly permitted standalone / test fallback
+                pmt_id, txn_id = await _do_create_payment(None)
+            break
+        except Exception as txn_exc:
+            if _is_transient_conflict(txn_exc):
+                logger.warning(
+                    f"Transient transaction conflict on attempt {attempt}/{max_txn_retries} for order {order_id}: {txn_exc}"
+                )
+                if attempt < max_txn_retries:
+                    await asyncio.sleep(0.05 * attempt)
+                    continue
+                logger.error(
+                    f"Exhausted transaction retry attempts ({max_txn_retries}) for order {order_id} due to concurrency conflict: {txn_exc}"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Terjadi konflik transaksi bersamaan pada akun pelanggan. Silakan muat ulang halaman dan coba kembali."
+                )
+            raise
 
     # 6. Recalculate and update order cached payment status
     order_update_set = {
@@ -2660,6 +2793,7 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
         "payment_number": payment_num,
         "order_id": str(order["_id"]),
         "amount_le": round(raw_amount, 2),
+        "payment_method": payment_method,
         "status": "recorded",
         "finance_transaction_id": txn_id,
         "allocations": allocations,
@@ -2723,16 +2857,29 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 }},
                 **ins_kw
             )
-        # Phase 3.B.2: Reverse corresponding credit mint event if exists
+        # Phase 3.B.2 & 3.B.3: Reverse corresponding credit mint or credit applied event if exists
         cce = None
         cce_find = getattr(db.customer_credit_events, "find_one", None)
         if callable(cce_find):
-            cce_res = cce_find({"source_payment_id": str(pmt["_id"]), "event_type": "credit_minted"}, **ins_kw)
+            # Check for either credit_minted or credit_applied
+            cce_res = cce_find(
+                {"source_payment_id": str(pmt["_id"]), "event_type": {"$in": ["credit_minted", "credit_applied"]}},
+                **ins_kw
+            )
             if asyncio.iscoroutine(cce_res):
                 cce = await cce_res
 
         if cce:
             rev_cce_num = await generate_credit_event_number()
+            # If reversing credit_minted (+500), signed_amount becomes -500
+            # If reversing credit_applied (-300), signed_amount becomes +300 (restores credit)
+            original_signed = float(cce.get("signed_amount", 0.0))
+            rev_signed = -original_signed
+            rev_reason = (
+                f"Payment voided: {reason} (Restoring credit)"
+                if cce.get("event_type") == "credit_applied"
+                else f"Payment voided: {reason} (Reversing minted credit)"
+            )
             rev_cce_doc = {
                 "event_number": rev_cce_num,
                 "event_type": "credit_reversed",
@@ -2744,9 +2891,9 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 "source_order_id": str(order["_id"]),
                 "source_order_number": order.get("order_number"),
                 "currency": cce.get("currency", "EGP"),
-                "signed_amount": -float(cce.get("signed_amount", 0.0)),
+                "signed_amount": rev_signed,
                 "reverses_event_id": str(cce["_id"]),
-                "reason": f"Payment voided: {reason}",
+                "reason": rev_reason,
                 "idempotency_key": f"cce_rev_pmt_{pmt['_id']}",
                 "created_by_id": admin.get("id"),
                 "created_by_name": admin.get("name", "Admin"),
@@ -4899,7 +5046,7 @@ async def _compute_balances(as_of: Optional[str] = None):
         typ = t.get("type"); cur = t.get("currency", "EGP"); amt = _num(t.get("amount"))
         if typ in ("income", "order_revenue"):
             bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) + amt
-        elif typ == "expense":
+        elif typ in ("expense", "refund", "credit_refund"):
             bal[t.get("account", cur)] = bal.get(t.get("account", cur), 0) - amt
         elif typ == "transfer":
             bal[t.get("from_account", "IDR")] = bal.get(t.get("from_account", "IDR"), 0) - _num(t.get("from_amount"))
@@ -5658,6 +5805,232 @@ async def admin_customer_credit_balance(cid: str, currency: Optional[str] = "EGP
         "available_credit": balance,
         "events_count": len(events),
         "events": [clean(e) for e in events],
+    }
+
+@api_router.post("/admin/customers/{cid}/credit-refund")
+async def admin_customer_credit_refund(
+    cid: str,
+    payload: CustomerCreditRefundInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    # Financial write operation requires access_finance or owner role
+    role = admin.get("role")
+    perms = admin.get("permissions") or {}
+    if role != "owner" and not perms.get("access_finance"):
+        raise HTTPException(
+            status_code=403,
+            detail="Hanya admin dengan akses keuangan atau owner yang dapat memproses pengembalian saldo kredit pelanggan"
+        )
+
+    customer = await db.customers.find_one({"_id": id_query(cid)})
+    if not customer:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+
+    raw_amount = _num(payload.amount)
+    if raw_amount <= 0:
+        raise HTTPException(status_code=400, detail="Nominal pengembalian saldo harus lebih besar dari 0")
+
+    currency = (payload.currency or "EGP").strip().upper()
+    if currency not in ("EGP", "IDR"):
+        raise HTTPException(status_code=400, detail="Mata uang pengembalian saldo harus EGP atau IDR")
+
+    refund_method = (payload.refund_method or "cash").strip().lower()
+    if refund_method not in ("cash", "transfer"):
+        raise HTTPException(status_code=400, detail="Metode pengembalian harus cash atau transfer")
+
+    # Target account determination
+    if payload.account and payload.account.strip():
+        primary_account = payload.account.strip().upper()
+        if primary_account not in ("EGP", "IDR"):
+            raise HTTPException(status_code=400, detail="Akun kas/bank tidak valid (harus EGP atau IDR)")
+    else:
+        primary_account = "IDR" if refund_method == "transfer" else currency
+
+    # Idempotency check: if an event with this idempotency key already exists, validate and return cleanly
+    idem_key = (payload.idempotency_key or "").strip() or None
+    if idem_key:
+        existing_event = await db.customer_credit_events.find_one({"idempotency_key": idem_key})
+        if existing_event:
+            # Validate that the submitted request matches the existing transaction payload
+            orig_cid = str(existing_event.get("customer_id") or "").strip()
+            orig_cur = str(existing_event.get("currency") or "").strip().upper()
+            orig_signed_amt = _num(existing_event.get("signed_amount", 0.0))
+            orig_amt_dec = Decimal(str(abs(orig_signed_amt))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            req_amt_dec = Decimal(str(raw_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            if orig_cid != str(cid).strip() or orig_cur != currency or orig_amt_dec != req_amt_dec:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Kunci idempotensi telah digunakan untuk transaksi pengembalian dana dengan parameter yang berbeda."
+                )
+
+            existing_txn = None
+            if existing_event.get("source_payment_id"):
+                existing_txn = await db.finance_transactions.find_one({"_id": id_query(str(existing_event["source_payment_id"]))})
+            curr_bal = await get_customer_credit_balance(cid, currency)
+            return {
+                "ok": True,
+                "idempotent_replay": True,
+                "event": clean(existing_event),
+                "finance_transaction": clean(existing_txn) if existing_txn else None,
+                "available_credit": curr_bal,
+            }
+
+    # Initial preflight balance check
+    preflight_balance = await get_customer_credit_balance(cid, currency)
+    if preflight_balance < raw_amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Saldo kredit pelanggan tidak mencukupi untuk pengembalian dana (Tersedia: {preflight_balance:.2f} {currency}, Diminta: {raw_amount:.2f} {currency})"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    cce_event_num = await generate_credit_event_number()
+    event_idempotency_key = idem_key or f"cce_refund_{cid}_{cce_event_num}"
+
+    # Rate and counterpart computation
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    rate = settings_rate
+    conv = compute_currency_conversion(currency, raw_amount, rate)
+
+    txn_desc = f"Pengembalian saldo kredit pelanggan {customer.get('username') or customer.get('name') or cid} ({cce_event_num})"
+    if payload.notes and payload.notes.strip():
+        txn_desc += f": {payload.notes.strip()}"
+
+    async def _do_credit_refund(session):
+        ins_kw = {"session": session} if session else {}
+
+        # 1. Concurrency serialization lock on customer document
+        cust_oid = id_query(cid)
+        cust_touch_res = await db.customers.update_one(
+            {"_id": cust_oid},
+            {"$set": {"last_credit_transaction_at": now}},
+            **ins_kw
+        )
+        if cust_touch_res.matched_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Akun pelanggan tidak ditemukan untuk serialisasi transaksi kredit"
+            )
+
+        # 2. Concurrency-safe in-transaction balance verification
+        in_txn_balance = await get_customer_credit_balance(cid, currency, session=session)
+        if in_txn_balance < raw_amount:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Konflik saldo: Saldo kredit pelanggan tidak mencukupi untuk pengembalian dana (Tersedia: {in_txn_balance:.2f} {currency}, Diminta: {raw_amount:.2f} {currency})"
+            )
+
+        # 3. Insert Finance Transaction (Liability Settlement / Cash Outflow)
+        txn_doc = {
+            "date": now,
+            "type": "refund",
+            "category": "Pengembalian Dana",
+            "amount": conv["primary_amount"],
+            "currency": currency,
+            "account": primary_account,
+            "classification": "liability_settlement",
+            "exchange_rate": rate,
+            "counterpart_amount": conv["counterpart_amount"],
+            "counterpart_currency": conv["counterpart_currency"],
+            "payment_method": refund_method,
+            "description": txn_desc,
+            "related_customer_id": cid,
+            "related_credit_event_number": cce_event_num,
+            "notes": (payload.notes or "").strip(),
+            "created_by_name": admin.get("name", "Admin"),
+            "created_by_id": admin.get("id"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        txn_res = await db.finance_transactions.insert_one(txn_doc, **ins_kw)
+        txn_id = str(txn_res.inserted_id)
+
+        # 4. Insert Customer Credit Event (credit_refunded with signed_amount < 0)
+        cce_doc = {
+            "event_number": cce_event_num,
+            "event_type": "credit_refunded",
+            "customer_id": cid,
+            "customer_name": customer.get("username") or customer.get("name"),
+            "customer_phone": customer.get("phone"),
+            "currency": currency,
+            "signed_amount": -round(float(raw_amount), 2),
+            "source_type": "refund",
+            "source_payment_id": txn_id,
+            "reason": (payload.notes or "").strip() or "Pengembalian saldo kredit pelanggan",
+            "idempotency_key": event_idempotency_key,
+            "created_by_id": admin.get("id"),
+            "created_by_name": admin.get("name", "Admin"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        cce_insert = getattr(db.customer_credit_events, "insert_one", None)
+        if callable(cce_insert):
+            res_coro = cce_insert(cce_doc, **ins_kw)
+            if asyncio.iscoroutine(res_coro):
+                await res_coro
+
+        return cce_doc, txn_doc
+
+    def _is_transient_conflict(exc: Exception) -> bool:
+        if isinstance(exc, pymongo.errors.PyMongoError):
+            if hasattr(exc, "has_error_label") and exc.has_error_label("TransientTransactionError"):
+                return True
+            if isinstance(exc, pymongo.errors.OperationFailure) and getattr(exc, "code", None) == 112:
+                return True
+        return False
+
+    max_txn_retries = 3
+    final_cce = None
+    final_txn = None
+
+    for attempt in range(1, max_txn_retries + 1):
+        session = None
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+            if not is_standalone_fallback_permitted():
+                logger.error(f"Transaction capability unavailable for customer credit refund in mode {get_environment_mode()!r}: {sess_err}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                )
+            session = None
+
+        try:
+            if session is not None:
+                async with session:
+                    async with session.start_transaction():
+                        final_cce, final_txn = await _do_credit_refund(session)
+            else:
+                final_cce, final_txn = await _do_credit_refund(None)
+            break
+        except Exception as txn_exc:
+            if _is_transient_conflict(txn_exc):
+                logger.warning(
+                    f"Transient transaction conflict on attempt {attempt}/{max_txn_retries} for refund customer {cid}: {txn_exc}"
+                )
+                if attempt < max_txn_retries:
+                    await asyncio.sleep(0.05 * attempt)
+                    continue
+                logger.error(
+                    f"Exhausted transaction retry attempts ({max_txn_retries}) for refund customer {cid} due to concurrency conflict: {txn_exc}"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Terjadi konflik transaksi bersamaan pada akun pelanggan. Silakan muat ulang halaman dan coba kembali."
+                )
+            raise
+
+    remaining_bal = await get_customer_credit_balance(cid, currency)
+    return {
+        "ok": True,
+        "customer_id": cid,
+        "currency": currency,
+        "refund_amount": round(float(raw_amount), 2),
+        "available_credit": remaining_bal,
+        "event": clean(final_cce),
+        "finance_transaction": clean(final_txn),
     }
 
 @api_router.patch("/admin/customers/{cid}")

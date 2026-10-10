@@ -43,12 +43,14 @@ from server import (
     admin_void_order_payment,
     admin_update_order,
     admin_customer_credit_balance,
+    admin_customer_credit_refund,
     get_customer_credit_balance,
     compute_order_payment_summary,
     OrderStatusUpdate,
     PaymentCreateInput,
     PaymentVoidInput,
     PaymentAllocationInput,
+    CustomerCreditRefundInput,
     clean,
 )
 
@@ -615,11 +617,11 @@ class TestPhase3B2OverpaymentCredit(unittest.IsolatedAsyncioTestCase):
         mock_db.customer_credit_events.insert_one.assert_not_called()
 
     # =========================================================================
-    # TC-22 & TC-23: Scope boundary protections: no credit application or refund in 3.B.2
+    # =========================================================================
+    # TC-22 & TC-23: Scope boundary protections: credit refund remains rejected in 3.B.3
     # =========================================================================
     async def test_tc22_tc23_scope_boundaries_preserved(self):
-        # Verify that payment method customer_credit remains rejected in Phase 3.B.2
-        # (Only 'cash' and 'transfer' permitted until 3.B.3)
+        # Verify that credit-refund remains rejected or unimplemented until 3.B.4
         mock_db = MagicMock()
         self._setup_mock_db(mock_db)
         order_id = "507f1f77bcf86cd799439026"
@@ -628,9 +630,9 @@ class TestPhase3B2OverpaymentCredit(unittest.IsolatedAsyncioTestCase):
 
         with patch("server.db", mock_db):
             with self.assertRaises(HTTPException) as cm:
-                await admin_create_order_payment(order_id, PaymentCreateInput(amount=500.0, payment_method="customer_credit"), self.admin_finance)
+                await admin_create_order_payment(order_id, PaymentCreateInput(amount=500.0, payment_method="credit_refund"), self.admin_finance)
             self.assertEqual(cm.exception.status_code, 400)
-            self.assertIn("Metode pembayaran harus cash atau transfer", cm.exception.detail)
+            self.assertIn("Metode pembayaran harus cash, transfer, atau customer_credit", cm.exception.detail)
 
     # =========================================================================
     # TC-24: Payment void reverses credit event
@@ -856,6 +858,826 @@ class TestPhase3B2OverpaymentCredit(unittest.IsolatedAsyncioTestCase):
         with patch("server.db", mock_db), patch("server.client", self.mock_client):
             with self.assertRaises(pymongo.errors.DuplicateKeyError):
                 await admin_void_order_payment(order_id, pmt_id, PaymentVoidInput(reason="Void with unrelated dup"), self.admin_finance)
+
+    # =========================================================================
+    # Phase 3.B.3 Tests: Non-Cash Customer Credit Settlement
+    # =========================================================================
+
+    # TC-33: Successful customer credit payment decreases credit and records credit_applied
+    async def test_tc33_customer_credit_settlement_success(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439033"
+        cust_id = "607f1f77bcf86cd799439088"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-001",
+            "total_le": 1000.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+            "customer_name": "Ahmad",
+            "payment_status": "belum_dibayar",
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Ahmad"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439041")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439051")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        # Customer has 1,500 EGP available credit
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=1500.0)):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                res = await admin_create_order_payment(
+                    order_id,
+                    PaymentCreateInput(amount=400.0, payment_method="customer_credit"),
+                    self.admin_finance
+                )
+
+        # 1. Payment created with method customer_credit
+        self.assertEqual(res["payment_method"], "customer_credit")
+        # 2. Finance transaction is non-cash credit_settlement
+        ft_doc = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(ft_doc["type"], "credit_settlement")
+        self.assertEqual(ft_doc["account"], "CUSTOMER_CREDIT")
+        self.assertEqual(ft_doc["payment_method"], "customer_credit")
+        # 3. Credit event recorded as credit_applied with negative polarity
+        cce_doc = mock_db.customer_credit_events.insert_one.call_args[0][0]
+        self.assertEqual(cce_doc["event_type"], "credit_applied")
+        self.assertEqual(cce_doc["signed_amount"], -400.0)
+        self.assertEqual(cce_doc["currency"], "EGP")
+        self.assertEqual(cce_doc["customer_id"], cust_id)
+        # 4. Customer document touched within transaction to serialize concurrent credit usage
+        mock_db.customers.update_one.assert_called_once()
+        touch_call_args = mock_db.customers.update_one.call_args
+        self.assertEqual(touch_call_args[0][0], {"_id": {"$in": [cust_id, ObjectId(cust_id)]}})
+        self.assertIn("last_credit_transaction_at", touch_call_args[0][1]["$set"])
+
+    # TC-34: Customer credit settlement rejected for guest / order without customer_id
+    async def test_tc34_customer_credit_rejected_for_guest_order(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439034"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-002",
+            "total_le": 1000.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": None,  # Guest order
+            "name": "Guest Buyer",
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as cm:
+                await admin_create_order_payment(
+                    order_id,
+                    PaymentCreateInput(amount=300.0, payment_method="customer_credit"),
+                    self.admin_finance
+                )
+            self.assertEqual(cm.exception.status_code, 400)
+            self.assertIn("membutuhkan pesanan dengan akun pelanggan terdaftar", cm.exception.detail)
+
+    # TC-35: Customer credit settlement rejected when balance is insufficient
+    async def test_tc35_customer_credit_rejected_when_insufficient_balance(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439035"
+        cust_id = "607f1f77bcf86cd799439089"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-003",
+            "total_le": 1000.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Fatima"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+
+        # Available balance is only 150 EGP, but payment requests 500 EGP
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=150.0)):
+            with patch("server.db", mock_db):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_create_order_payment(
+                        order_id,
+                        PaymentCreateInput(amount=500.0, payment_method="customer_credit"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 400)
+                self.assertIn("Saldo kredit pelanggan tidak mencukupi", cm.exception.detail)
+
+        # Zero writes performed
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-36: Customer credit settlement concurrent conflict fails closed (HTTP 409)
+    async def test_tc36_customer_credit_concurrent_race_conflict_fails_closed(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439036"
+        cust_id = "607f1f77bcf86cd799439090"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-004",
+            "total_le": 1000.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Tariq"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        # Simulate preflight sees 500 EGP, but by the time transaction runs, a competing
+        # transaction committed and reduced balance to 100 EGP (less than 400 EGP needed)
+        balance_call_count = 0
+        async def mock_get_balance(cid, cur, session=None):
+            nonlocal balance_call_count
+            balance_call_count += 1
+            if session is not None:
+                return 100.0  # inside txn: reduced by concurrent winner
+            return 500.0  # preflight check
+
+        with patch("server.get_customer_credit_balance", side_effect=mock_get_balance):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_create_order_payment(
+                        order_id,
+                        PaymentCreateInput(amount=400.0, payment_method="customer_credit"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 409)
+                self.assertIn("Konflik saldo", cm.exception.detail)
+
+        # Transaction aborted, payment not persisted
+        mock_db.payments.insert_one.assert_not_called()
+
+    # TC-37: Voiding a customer_credit payment restores credit via credit_reversed
+    async def test_tc37_void_customer_credit_payment_restores_credit_atomically(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439037"
+        pmt_id = "607f1f77bcf86cd799439042"
+        cust_id = "607f1f77bcf86cd799439091"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-005",
+            "customer_id": cust_id,
+        }
+        pmt_doc = {
+            "_id": ObjectId(pmt_id),
+            "payment_number": "PAY-20261010-061",
+            "order_id": ObjectId(order_id),
+            "status": "recorded",
+            "amount_le": 450.0,
+            "payment_method": "customer_credit",
+            "finance_transaction_id": "707f1f77bcf86cd799439052",
+        }
+        cce_doc = {
+            "_id": ObjectId("807f1f77bcf86cd799439060"),
+            "event_number": "CCE-20261010-010",
+            "event_type": "credit_applied",
+            "customer_id": cust_id,
+            "source_payment_id": str(pmt_doc["_id"]),
+            "currency": "EGP",
+            "signed_amount": -450.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=pmt_doc)
+        mock_db.payments.update_one = AsyncMock()
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+        mock_db.customer_credit_events.find_one = AsyncMock(return_value=cce_doc)
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            await admin_void_order_payment(
+                order_id,
+                pmt_id,
+                PaymentVoidInput(reason="Void customer credit payment"),
+                self.admin_finance
+            )
+
+        # Verified compensating event restores positive credit
+        self.assertEqual(mock_db.customer_credit_events.insert_one.call_count, 1)
+        rev_cce = mock_db.customer_credit_events.insert_one.call_args[0][0]
+        self.assertEqual(rev_cce["event_type"], "credit_reversed")
+        self.assertEqual(rev_cce["signed_amount"], 450.0)  # Positive: restores credit
+        self.assertEqual(rev_cce["reverses_event_id"], str(cce_doc["_id"]))
+
+    # TC-38: Physical cash balances are NOT affected by credit_settlement
+    async def test_tc38_credit_settlement_zero_physical_cash_flow(self):
+        # Verify that _compute_balances ignores credit_settlement transactions
+        from server import _compute_balances
+        mock_db = MagicMock()
+        # Mock cursor for finance_transactions
+        txns = [
+            {"type": "order_revenue", "account": "EGP", "currency": "EGP", "amount": 1000.0},
+            {"type": "credit_settlement", "account": "CUSTOMER_CREDIT", "currency": "EGP", "amount": 500.0},
+        ]
+        async def mock_cursor_gen():
+            for t in txns:
+                yield t
+        mock_db.finance_transactions.find.return_value = mock_cursor_gen()
+
+    # TC-39: Exhausted customer touch write conflict raises controlled HTTP 409 and aborts cleanly
+    async def test_tc39_exhausted_write_conflict_raises_409(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439038"
+        cust_id = "607f1f77bcf86cd799439092"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-006",
+            "total_le": 800.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Nadia"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        import pymongo.errors
+        # Simulate MongoDB WiredTiger write-write conflict on customer serialization lock (OperationFailure code 112)
+        mock_db.customers.update_one = AsyncMock(
+            side_effect=pymongo.errors.OperationFailure("WriteConflict error: this operation conflicted with another", code=112)
+        )
+
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=1000.0)):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_create_order_payment(
+                        order_id,
+                        PaymentCreateInput(amount=400.0, payment_method="customer_credit"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 409)
+                self.assertIn("Terjadi konflik transaksi bersamaan pada akun pelanggan", cm.exception.detail)
+
+        # 3 attempts made, all aborted without inserting payment or event
+        self.assertEqual(mock_db.customers.update_one.call_count, 3)
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-40: Missing customer document during serialization raises HTTP 400
+    async def test_tc40_missing_customer_document_raises_400(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439039"
+        cust_id = "607f1f77bcf86cd799439093"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-007",
+            "total_le": 800.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Ghost"}
+        # Preflight passes, but inside transaction customer document is deleted/missing (matched_count=0)
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.customers.update_one = AsyncMock(return_value=MagicMock(matched_count=0))
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=1000.0)):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_create_order_payment(
+                        order_id,
+                        PaymentCreateInput(amount=400.0, payment_method="customer_credit"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 400)
+                self.assertIn("Akun pelanggan tidak ditemukan untuk serialisasi", cm.exception.detail)
+
+        # Payment was not inserted
+        mock_db.payments.insert_one.assert_not_called()
+
+    # TC-41: Transient transaction conflict succeeds on fresh retry attempt without duplicating records
+    async def test_tc41_transient_conflict_retries_and_succeeds_without_duplication(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439040"
+        cust_id = "607f1f77bcf86cd799439094"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-008",
+            "total_le": 800.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Layla"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439045")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439055")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        import pymongo.errors
+        # Attempt 1 fails with WriteConflict code 112, Attempt 2 succeeds
+        mock_db.customers.update_one = AsyncMock(
+            side_effect=[
+                pymongo.errors.OperationFailure("WriteConflict error: transient lock conflict", code=112),
+                MagicMock(matched_count=1),
+            ]
+        )
+
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=1000.0)):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                res = await admin_create_order_payment(
+                    order_id,
+                    PaymentCreateInput(amount=300.0, payment_method="customer_credit"),
+                    self.admin_finance
+                )
+
+        self.assertEqual(res["payment_method"], "customer_credit")
+        # Retry occurred: 2 customer touch attempts
+        self.assertEqual(mock_db.customers.update_one.call_count, 2)
+        # Exactly 1 payment, 1 finance transaction, and 1 credit event inserted (zero duplicates)
+        self.assertEqual(mock_db.payments.insert_one.call_count, 1)
+        self.assertEqual(mock_db.finance_transactions.insert_one.call_count, 1)
+        self.assertEqual(mock_db.customer_credit_events.insert_one.call_count, 1)
+
+    # TC-42: Unrelated OperationFailure is NOT retried and propagates immediately
+    async def test_tc42_unrelated_operation_failure_is_not_retried(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439041"
+        cust_id = "607f1f77bcf86cd799439095"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-009",
+            "total_le": 800.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Hassan"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        import pymongo.errors
+        # Simulate unauthorized query or syntax error (code 13 or code 50, NOT transient)
+        mock_db.customers.update_one = AsyncMock(
+            side_effect=pymongo.errors.OperationFailure("Unauthorized operation", code=13)
+        )
+
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=1000.0)):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                with self.assertRaises(pymongo.errors.OperationFailure) as cm:
+                    await admin_create_order_payment(
+                        order_id,
+                        PaymentCreateInput(amount=300.0, payment_method="customer_credit"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.code, 13)
+
+        # Only 1 attempt made, NOT retried
+        self.assertEqual(mock_db.customers.update_one.call_count, 1)
+        mock_db.payments.insert_one.assert_not_called()
+
+    # TC-43: In-transaction balance conflict (HTTP 409) is NOT retried
+    async def test_tc43_in_transaction_balance_conflict_is_not_retried(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439042"
+        cust_id = "607f1f77bcf86cd799439096"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-010",
+            "total_le": 800.0,
+            "delivery_fee_le": 0.0,
+            "customer_id": cust_id,
+        }
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Zain"}
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.customers.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        # Preflight passes (500 EGP), but inside transaction balance is 100 EGP (needed 400 EGP)
+        async def mock_balance(cid, cur, session=None):
+            if session is not None:
+                return 100.0
+            return 500.0
+
+        with patch("server.get_customer_credit_balance", side_effect=mock_balance):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_create_order_payment(
+                        order_id,
+                        PaymentCreateInput(amount=400.0, payment_method="customer_credit"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 409)
+                self.assertIn("Konflik saldo", cm.exception.detail)
+
+        # Only 1 attempt made: business validation errors are never retried
+        self.assertEqual(mock_db.customers.update_one.call_count, 1)
+        mock_db.payments.insert_one.assert_not_called()
+
+    # TC-44: Standard cash payment is unaffected by transient conflict handler
+    async def test_tc44_standard_cash_payment_unaffected(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439043"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-P3B3-011",
+            "total_le": 1000.0,
+            "delivery_fee_le": 0.0,
+            "payment_status": "belum_dibayar",
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439046")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439056")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            res = await admin_create_order_payment(
+                order_id,
+                PaymentCreateInput(amount=500.0, payment_method="cash"),
+                self.admin_finance
+            )
+
+        self.assertEqual(res["payment_method"], "cash")
+        # Customer touch was NOT called for cash payment
+        mock_db.customers.update_one.assert_not_called()
+        self.assertEqual(mock_db.payments.insert_one.call_count, 1)
+        self.assertEqual(mock_db.finance_transactions.insert_one.call_count, 1)
+
+    # =========================================================================
+    # Phase 3.B.4 Tests: Customer Credit Cash Refund (POST /admin/customers/{cid}/credit-refund)
+    # =========================================================================
+
+    # TC-45: Successful customer credit cash refund creates credit_refunded event and liability_settlement transaction
+    async def test_tc45_customer_credit_refund_success(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439097"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Siti Nurhaliza", "phone": "+201234567899"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.customers.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439057")))
+        mock_db.customer_credit_events.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("807f1f77bcf86cd799439067")))
+
+        # Customer has 1,000 EGP credit available. Refund requests 300 EGP.
+        with patch("server.get_customer_credit_balance", AsyncMock(side_effect=[1000.0, 1000.0, 700.0])):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                res = await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=300.0, currency="EGP", refund_method="cash", notes="Pengembalian deposit sisa"),
+                    self.admin_finance
+                )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["refund_amount"], 300.0)
+        self.assertEqual(res["currency"], "EGP")
+        self.assertEqual(res["available_credit"], 700.0)
+
+        # 1. Customer serialization touch was executed inside transaction
+        mock_db.customers.update_one.assert_called_once()
+        touch_args = mock_db.customers.update_one.call_args
+        self.assertEqual(touch_args[0][0], {"_id": {"$in": [cust_id, ObjectId(cust_id)]}})
+        self.assertIn("last_credit_transaction_at", touch_args[0][1]["$set"])
+
+        # 2. Finance transaction recorded as liability_settlement cash outflow
+        self.assertEqual(mock_db.finance_transactions.insert_one.call_count, 1)
+        ft_doc = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(ft_doc["type"], "refund")
+        self.assertEqual(ft_doc["classification"], "liability_settlement")
+        self.assertEqual(ft_doc["category"], "Pengembalian Dana")
+        self.assertEqual(ft_doc["amount"], 300.0)
+        self.assertEqual(ft_doc["currency"], "EGP")
+        self.assertEqual(ft_doc["account"], "EGP")
+        self.assertEqual(ft_doc["payment_method"], "cash")
+        self.assertEqual(ft_doc["related_customer_id"], cust_id)
+
+        # 3. Customer credit event recorded as credit_refunded with negative polarity
+        self.assertEqual(mock_db.customer_credit_events.insert_one.call_count, 1)
+        cce_doc = mock_db.customer_credit_events.insert_one.call_args[0][0]
+        self.assertEqual(cce_doc["event_type"], "credit_refunded")
+        self.assertEqual(cce_doc["signed_amount"], -300.0)
+        self.assertEqual(cce_doc["currency"], "EGP")
+        self.assertEqual(cce_doc["customer_id"], cust_id)
+        self.assertEqual(cce_doc["source_type"], "refund")
+
+    # TC-46: Refund rejected when customer has insufficient credit balance (Preflight HTTP 400)
+    async def test_tc46_customer_credit_refund_insufficient_balance_rejected(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439098"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Farhan"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+
+        # Available balance is only 150 EGP, refund requests 500 EGP
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=150.0)):
+            with patch("server.db", mock_db):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_customer_credit_refund(
+                        cust_id,
+                        CustomerCreditRefundInput(amount=500.0, currency="EGP"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 400)
+                self.assertIn("Saldo kredit pelanggan tidak mencukupi", cm.exception.detail)
+
+        # Zero writes performed
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-47: Refund rejected for non-existent customer (HTTP 404)
+    async def test_tc47_customer_credit_refund_customer_not_found_raises_404(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439099"
+        mock_db.customers.find_one = AsyncMock(return_value=None)
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as cm:
+                await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=100.0),
+                    self.admin_finance
+                )
+            self.assertEqual(cm.exception.status_code, 404)
+            self.assertIn("Pelanggan tidak ditemukan", cm.exception.detail)
+
+    # TC-48: Refund rejected for non-positive amount (HTTP 400)
+    async def test_tc48_customer_credit_refund_invalid_amount_raises_400(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439100"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Hani"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as cm:
+                await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=-50.0),
+                    self.admin_finance
+                )
+            self.assertEqual(cm.exception.status_code, 400)
+            self.assertIn("lebih besar dari 0", cm.exception.detail)
+
+    # TC-49: Refund rejected for unauthorized non-finance admin (HTTP 403)
+    async def test_tc49_customer_credit_refund_unauthorized_raises_403(self):
+        cust_id = "607f1f77bcf86cd799439101"
+        admin_ops_only = {"id": "ops_01", "name": "Ops Worker", "role": "admin", "permissions": {"manage_orders": True, "access_finance": False}}
+
+        with self.assertRaises(HTTPException) as cm:
+            await admin_customer_credit_refund(
+                cust_id,
+                CustomerCreditRefundInput(amount=100.0),
+                admin_ops_only
+            )
+        self.assertEqual(cm.exception.status_code, 403)
+        self.assertIn("akses keuangan atau owner", cm.exception.detail)
+
+    # TC-50: In-transaction race conflict detects reduced balance and raises HTTP 409
+    async def test_tc50_customer_credit_refund_in_transaction_conflict_raises_409(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439102"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Kamal"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.customers.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+
+        # Preflight sees 500 EGP, but inside-transaction snapshot balance sees 100 EGP (needed 300 EGP)
+        async def mock_balance(cid, cur, session=None):
+            if session is not None:
+                return 100.0
+            return 500.0
+
+        with patch("server.get_customer_credit_balance", side_effect=mock_balance):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                with self.assertRaises(HTTPException) as cm:
+                    await admin_customer_credit_refund(
+                        cust_id,
+                        CustomerCreditRefundInput(amount=300.0, currency="EGP"),
+                        self.admin_finance
+                    )
+                self.assertEqual(cm.exception.status_code, 409)
+                self.assertIn("Konflik saldo", cm.exception.detail)
+
+        # Zero writes committed
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-51: Idempotency replay on duplicate idempotency_key returns existing record without duplicate writes
+    async def test_tc51_customer_credit_refund_idempotent_replay(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439103"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Salma"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+
+        existing_cce = {
+            "_id": ObjectId("807f1f77bcf86cd799439068"),
+            "event_number": "CCE-20261010-099",
+            "event_type": "credit_refunded",
+            "customer_id": cust_id,
+            "currency": "EGP",
+            "signed_amount": -200.0,
+            "idempotency_key": "refund_idem_001",
+            "source_payment_id": "707f1f77bcf86cd799439058",
+        }
+        existing_txn = {
+            "_id": ObjectId("707f1f77bcf86cd799439058"),
+            "type": "refund",
+            "amount": 200.0,
+            "currency": "EGP",
+        }
+        mock_db.customer_credit_events.find_one = AsyncMock(return_value=existing_cce)
+        mock_db.finance_transactions.find_one = AsyncMock(return_value=existing_txn)
+
+        with patch("server.get_customer_credit_balance", AsyncMock(return_value=500.0)):
+            with patch("server.db", mock_db):
+                res = await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=200.0, currency="EGP", idempotency_key="refund_idem_001"),
+                    self.admin_finance
+                )
+
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["idempotent_replay"])
+        self.assertEqual(res["event"]["event_number"], "CCE-20261010-099")
+        # Zero new inserts executed
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-52: Physical cash balances are decreased by refund, while sales revenue and costs remain unaffected
+    async def test_tc52_refund_decreases_cash_without_affecting_revenue_or_cost(self):
+        from server import _compute_balances, _stats_for
+        mock_db = MagicMock()
+
+        # 1. Verify _compute_balances reflects cash outflow
+        txns = [
+            {"type": "order_revenue", "account": "EGP", "currency": "EGP", "amount": 1000.0},
+            {"type": "refund", "classification": "liability_settlement", "account": "EGP", "currency": "EGP", "amount": 300.0},
+        ]
+        async def mock_cursor_gen():
+            for t in txns:
+                yield t
+        mock_db.finance_transactions.find.return_value = mock_cursor_gen()
+
+        with patch("server.db", mock_db):
+            balances = await _compute_balances()
+            # Net physical cash = 1000 - 300 = 700 EGP
+            self.assertEqual(balances["EGP"], 700.0)
+
+        # 2. Verify _stats_for does not count refund as revenue or operating cost
+        mock_db.finance_transactions.find.return_value = mock_cursor_gen()
+        with patch("server.db", mock_db):
+            stats = await _stats_for(None, None)
+            # Sales revenue = 1000 EGP, Cost = 0.0 EGP (refund is liability settlement, NOT operating expense)
+            self.assertEqual(stats["EGP"]["revenue"], 1000.0)
+            self.assertEqual(stats["EGP"]["cost"], 0.0)
+
+    # TC-53: Idempotency replay with different customer ID raises HTTP 409 and zero writes
+    async def test_tc53_idempotency_replay_different_customer_raises_409(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_a = "607f1f77bcf86cd799439104"
+        cust_b = "607f1f77bcf86cd799439105"
+        cust_b_doc = {"_id": ObjectId(cust_b), "username": "Customer B"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_b_doc)
+
+        # Existing refund was for cust_a
+        existing_cce = {
+            "_id": ObjectId("807f1f77bcf86cd799439069"),
+            "event_number": "CCE-20261010-100",
+            "event_type": "credit_refunded",
+            "customer_id": cust_a,
+            "currency": "EGP",
+            "signed_amount": -150.0,
+            "idempotency_key": "refund_shared_idem_key",
+        }
+        mock_db.customer_credit_events.find_one = AsyncMock(return_value=existing_cce)
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as cm:
+                await admin_customer_credit_refund(
+                    cust_b,
+                    CustomerCreditRefundInput(amount=150.0, currency="EGP", idempotency_key="refund_shared_idem_key"),
+                    self.admin_finance
+                )
+            self.assertEqual(cm.exception.status_code, 409)
+            self.assertIn("Kunci idempotensi telah digunakan", cm.exception.detail)
+
+        # Zero writes executed
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-54: Idempotency replay with different amount raises HTTP 409 and zero writes
+    async def test_tc54_idempotency_replay_different_amount_raises_409(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439106"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Customer C"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+
+        # Existing refund was for 200.0 EGP
+        existing_cce = {
+            "_id": ObjectId("807f1f77bcf86cd799439070"),
+            "event_number": "CCE-20261010-101",
+            "event_type": "credit_refunded",
+            "customer_id": cust_id,
+            "currency": "EGP",
+            "signed_amount": -200.0,
+            "idempotency_key": "refund_amount_diff_key",
+        }
+        mock_db.customer_credit_events.find_one = AsyncMock(return_value=existing_cce)
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as cm:
+                # Replay attempts to request 250.0 EGP with same idempotency key
+                await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=250.0, currency="EGP", idempotency_key="refund_amount_diff_key"),
+                    self.admin_finance
+                )
+            self.assertEqual(cm.exception.status_code, 409)
+            self.assertIn("Kunci idempotensi telah digunakan", cm.exception.detail)
+
+        # Zero writes executed
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-55: Idempotency replay with different currency raises HTTP 409 and zero writes
+    async def test_tc55_idempotency_replay_different_currency_raises_409(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439107"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Customer D"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+
+        # Existing refund was in EGP
+        existing_cce = {
+            "_id": ObjectId("807f1f77bcf86cd799439071"),
+            "event_number": "CCE-20261010-102",
+            "event_type": "credit_refunded",
+            "customer_id": cust_id,
+            "currency": "EGP",
+            "signed_amount": -100.0,
+            "idempotency_key": "refund_currency_diff_key",
+        }
+        mock_db.customer_credit_events.find_one = AsyncMock(return_value=existing_cce)
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as cm:
+                # Replay attempts to request IDR with same idempotency key
+                await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=100.0, currency="IDR", idempotency_key="refund_currency_diff_key"),
+                    self.admin_finance
+                )
+            self.assertEqual(cm.exception.status_code, 409)
+            self.assertIn("Kunci idempotensi telah digunakan", cm.exception.detail)
+
+        # Zero writes executed
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.customer_credit_events.insert_one.assert_not_called()
+
+    # TC-56: Fresh idempotency key still permits a valid refund when sufficient credit exists
+    async def test_tc56_fresh_idempotency_key_succeeds(self):
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        cust_id = "607f1f77bcf86cd799439108"
+        cust_doc = {"_id": ObjectId(cust_id), "username": "Customer E"}
+        mock_db.customers.find_one = AsyncMock(return_value=cust_doc)
+        mock_db.customers.update_one = AsyncMock(return_value=MagicMock(matched_count=1))
+        # No existing event for fresh key
+        mock_db.customer_credit_events.find_one = AsyncMock(return_value=None)
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439060")))
+        mock_db.customer_credit_events.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("807f1f77bcf86cd799439072")))
+
+        with patch("server.get_customer_credit_balance", AsyncMock(side_effect=[800.0, 800.0, 450.0])):
+            with patch("server.db", mock_db), patch("server.client", self.mock_client):
+                res = await admin_customer_credit_refund(
+                    cust_id,
+                    CustomerCreditRefundInput(amount=350.0, currency="EGP", idempotency_key="fresh_refund_key_999"),
+                    self.admin_finance
+                )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["refund_amount"], 350.0)
+        self.assertEqual(mock_db.finance_transactions.insert_one.call_count, 1)
+        self.assertEqual(mock_db.customer_credit_events.insert_one.call_count, 1)
+        saved_cce = mock_db.customer_credit_events.insert_one.call_args[0][0]
+        self.assertEqual(saved_cce["idempotency_key"], "fresh_refund_key_999")
 
 
 if __name__ == "__main__":
