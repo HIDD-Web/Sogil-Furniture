@@ -294,6 +294,9 @@ class OrderStatusUpdate(BaseModel):
     discount_le: Optional[float] = None
     total_le: Optional[float] = None
     items: Optional[List[dict]] = None
+    # Phase 3 Handover Cancellation Safeguards (Owner Decisions & Phase 3.B.1)
+    confirm_handover_cancellation: Optional[bool] = False
+    cancellation_reason: Optional[str] = None
 
 class PaymentAllocationInput(BaseModel):
     target_type: str  # "product" | "shipping" | "unallocated_credit"
@@ -473,6 +476,37 @@ async def generate_obligation_number() -> str:
     )
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
+
+async def generate_credit_event_number() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    counter_id = f"cce_{today}"
+    prefix = f"CCE-{today}-"
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
+async def get_customer_credit_balance(customer_id: str, currency: str = "EGP") -> float:
+    """
+    Computes available customer credit balance from signed ledger events in db.customer_credit_events.
+    Currencies (EGP, IDR) are tracked independently and never summed across currencies.
+    """
+    if not customer_id:
+        return 0.0
+    cur = (currency or "EGP").strip().upper()
+    pipeline = [
+        {"$match": {"customer_id": str(customer_id), "currency": cur}},
+        {"$group": {"_id": None, "total": {"$sum": "$signed_amount"}}}
+    ]
+    cursor = db.customer_credit_events.aggregate(pipeline)
+    res = await cursor.to_list(1) if hasattr(cursor, "to_list") else []
+    if res and len(res) > 0:
+        return round(float(res[0].get("total", 0.0)), 2)
+    return 0.0
 
 class CustomRequestInput(BaseModel):
     customer_name: str
@@ -2015,10 +2049,38 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             detail="Status pembayaran tidak dapat diubah secara manual. Status dikelola secara otomatis melalui pencatatan pembayaran riil."
         )
 
+    # Phase 3.B.1 — Handover Recognition & Status Transition Checks
+    existing_status = existing_order.get("order_status")
+    has_immutable_snapshot = (
+        bool(existing_order.get("completed_at")) or
+        existing_order.get("recognized_revenue_le") is not None or
+        existing_status == "selesai"
+    )
+
     if data.order_status is not None:
         if data.order_status not in valid_status:
             raise HTTPException(status_code=400, detail="Status tidak valid")
+        # Safeguard on cancellation after handover (selesai -> dibatalkan or any order with established handover snapshot)
+        if (existing_status == "selesai" or has_immutable_snapshot) and data.order_status == "dibatalkan":
+            if not data.confirm_handover_cancellation:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Pembatalan pesanan yang telah selesai memerlukan konfirmasi eksplisit (confirm_handover_cancellation=True)."
+                )
+            reason_str = (data.cancellation_reason or "").strip()
+            if len(reason_str) < 5:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Alasan pembatalan pesanan yang telah selesai wajib diisi minimal 5 karakter."
+                )
+            perms = admin.get("permissions") or {}
+            if admin.get("role") != "owner" and not perms.get("access_finance"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Hanya owner atau admin dengan akses keuangan yang dapat membatalkan pesanan yang telah selesai."
+                )
         update["order_status"] = data.order_status
+
     if data.payment_method is not None:
         if data.payment_method not in valid_methods:
             raise HTTPException(status_code=400, detail="Metode pembayaran tidak valid")
@@ -2028,6 +2090,12 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
 
     has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
     if has_price_change:
+        # Phase 3.B.1 / Owner Decision B: Direct post-handover financial edits are strictly rejected (HTTP 409)
+        if has_immutable_snapshot:
+            raise HTTPException(
+                status_code=409,
+                detail="Pesanan yang telah selesai tidak dapat diubah nilainya secara langsung. Gunakan penyesuaian keuangan resmi (Finance Adjustment)."
+            )
         perms = admin.get("permissions") or {}
         if admin.get("role") != "owner" and not perms.get("access_finance"):
             raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat mengubah harga pesanan")
@@ -2037,7 +2105,6 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             existing_items = existing_order.get("items") or ([existing_order.get("item")] if existing_order.get("item") else [])
             existing_map = {it.get("item_id"): it for it in existing_items if it.get("item_id")}
 
-            # Identify protected item IDs linked to assignments or obligations
             # Identify protected item IDs linked to assignments or obligations
             order_id_str = str(existing_order.get("_id") or existing_order.get("id"))
             order_id_filter = {"$in": [order_id_str, id_query(order_id_str)]}
@@ -2118,7 +2185,59 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
         rate = existing_order.get("exchange_rate_idr_per_le") or 357
         update["estimated_total_idr"] = round(update["total_le"] * rate)
 
-    await db.orders.update_one({"_id": id_query(order_id)}, {"$set": update})
+    # Phase 3.B.1 — Immutable Handover Snapshot & Status Transition Audit History
+    now_iso = update.get("updated_at") or datetime.now(timezone.utc).isoformat()
+    mongo_ops = {"$set": update}
+
+    target_status = data.order_status
+    is_establishing_snapshot = False
+    if target_status is not None and target_status != existing_status:
+        # 1. First valid handover to 'selesai'
+        if target_status == "selesai":
+            # If order has never been completed before, stamp immutable snapshot
+            if not existing_order.get("completed_at") and existing_order.get("recognized_revenue_le") is None:
+                rev_le = float(existing_order.get("total_le", 0.0))
+                update["completed_at"] = now_iso
+                update["completed_by_id"] = admin.get("id")
+                update["completed_by_name"] = admin.get("name", "Admin")
+                update["recognized_revenue_le"] = rev_le
+                is_establishing_snapshot = True
+
+        # 2. Build status history entry
+        history_entry = {
+            "from_status": existing_status,
+            "to_status": target_status,
+            "changed_at": now_iso,
+            "changed_by_id": admin.get("id"),
+            "changed_by_name": admin.get("name", "Admin"),
+            "reason": (data.cancellation_reason or "").strip() if target_status == "dibatalkan" else None
+        }
+        mongo_ops["$push"] = {"status_history": history_entry}
+
+    if is_establishing_snapshot:
+        # Concurrency guard: Ensure atomicity at database level.
+        # If another concurrent worker already established completed_at, do not overwrite it.
+        atomic_query = {
+            "_id": id_query(order_id),
+            "completed_at": {"$in": [None, False]},
+            "recognized_revenue_le": None,
+        }
+        update_result = await db.orders.update_one(atomic_query, mongo_ops)
+        if update_result.matched_count == 0:
+            # Another concurrent request won the race to establish the snapshot.
+            # Perform fallback update preserving the existing snapshot and updating remaining fields if needed.
+            fallback_update = dict(update)
+            fallback_update.pop("completed_at", None)
+            fallback_update.pop("completed_by_id", None)
+            fallback_update.pop("completed_by_name", None)
+            fallback_update.pop("recognized_revenue_le", None)
+            fallback_ops = {"$set": fallback_update}
+            if "$push" in mongo_ops:
+                fallback_ops["$push"] = mongo_ops["$push"]
+            await db.orders.update_one({"_id": id_query(order_id)}, fallback_ops)
+    else:
+        await db.orders.update_one({"_id": id_query(order_id)}, mongo_ops)
+
     order = await db.orders.find_one({"_id": id_query(order_id)})
     return clean(order)
 
@@ -2456,6 +2575,37 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             **ins_kw
         )
 
+        # Phase 3.B.2: Customer Credit Event Creation for Qualifying Overpayment
+        unallocated_amt = sum(_num(a["amount_le"]) for a in allocations if a.get("target_type") == "unallocated_credit")
+        if unallocated_amt > 0:
+            cust_id = str(order.get("customer_id") or "").strip() or None
+            cce_event_num = await generate_credit_event_number()
+            idem_key = f"cce_pmt_{created_pmt_id}_mint"
+            cce_doc = {
+                "event_number": cce_event_num,
+                "event_type": "credit_minted",
+                "customer_id": cust_id,
+                "customer_name": order.get("customer_name") or order.get("name"),
+                "customer_phone": order.get("customer_phone") or order.get("phone"),
+                "source_payment_id": created_pmt_id,
+                "source_payment_number": payment_num,
+                "source_order_id": str(order["_id"]),
+                "source_order_number": order.get("order_number"),
+                "currency": "EGP",
+                "signed_amount": round(float(unallocated_amt), 2),
+                "reason": "Overpayment credit from order payment",
+                "idempotency_key": idem_key,
+                "created_by_id": admin.get("id"),
+                "created_by_name": admin.get("name", "Admin"),
+                "created_at": now,
+                "updated_at": now,
+            }
+            cce_insert = getattr(db.customer_credit_events, "insert_one", None)
+            if callable(cce_insert):
+                res_coro = cce_insert(cce_doc, **ins_kw)
+                if asyncio.iscoroutine(res_coro):
+                    await res_coro
+
         return created_pmt_id, txn_id
 
     session = None
@@ -2573,6 +2723,41 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 }},
                 **ins_kw
             )
+        # Phase 3.B.2: Reverse corresponding credit mint event if exists
+        cce = None
+        cce_find = getattr(db.customer_credit_events, "find_one", None)
+        if callable(cce_find):
+            cce_res = cce_find({"source_payment_id": str(pmt["_id"]), "event_type": "credit_minted"}, **ins_kw)
+            if asyncio.iscoroutine(cce_res):
+                cce = await cce_res
+
+        if cce:
+            rev_cce_num = await generate_credit_event_number()
+            rev_cce_doc = {
+                "event_number": rev_cce_num,
+                "event_type": "credit_reversed",
+                "customer_id": cce.get("customer_id"),
+                "customer_name": cce.get("customer_name"),
+                "customer_phone": cce.get("customer_phone"),
+                "source_payment_id": str(pmt["_id"]),
+                "source_payment_number": pmt.get("payment_number"),
+                "source_order_id": str(order["_id"]),
+                "source_order_number": order.get("order_number"),
+                "currency": cce.get("currency", "EGP"),
+                "signed_amount": -float(cce.get("signed_amount", 0.0)),
+                "reverses_event_id": str(cce["_id"]),
+                "reason": f"Payment voided: {reason}",
+                "idempotency_key": f"cce_rev_pmt_{pmt['_id']}",
+                "created_by_id": admin.get("id"),
+                "created_by_name": admin.get("name", "Admin"),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }
+            cce_insert = getattr(db.customer_credit_events, "insert_one", None)
+            if callable(cce_insert):
+                res_coro = cce_insert(rev_cce_doc, **ins_kw)
+                if asyncio.iscoroutine(res_coro):
+                    await res_coro
 
     session = None
     try:
@@ -2586,13 +2771,45 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
             )
         session = None
 
-    if session is not None:
-        async with session:
-            async with session.start_transaction():
-                await _do_void(session)
-    else:
-        # Explicitly permitted standalone / test fallback
-        await _do_void(None)
+    try:
+        if session is not None:
+            async with session:
+                async with session.start_transaction():
+                    await _do_void(session)
+        else:
+            # Explicitly permitted standalone / test fallback
+            await _do_void(None)
+    except pymongo.errors.DuplicateKeyError as dke:
+        err_msg = str(dke)
+        is_reversal_conflict = (
+            "uniq_credit_event_source_payment" in err_msg or
+            "uniq_credit_events_idempotency" in err_msg or
+            f"cce_rev_pmt_{pmt['_id']}" in err_msg or
+            ("source_payment_id" in err_msg and "event_type" in err_msg)
+        )
+        # Unrelated DuplicateKeyError: must be re-raised immediately without translating into HTTP 409 or success
+        if not is_reversal_conflict:
+            logger.error(f"Unrelated DuplicateKeyError during payment void transaction for payment {payment_id}: {dke}")
+            raise
+
+        # Relevant reversal conflict: inspect persisted payment state to determine appropriate response
+        current_pmt = await db.payments.find_one({"_id": pmt["_id"]})
+        if current_pmt and current_pmt.get("status") == "voided":
+            logger.warning(
+                f"Concurrent payment void conflict resolved: payment {payment_id} was already voided by winning transaction: {dke}"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Pembayaran sedang atau sudah dibatalkan oleh transaksi lain secara bersamaan (Konflik konkuren)."
+            )
+
+        logger.warning(
+            f"Credit reversal unique key conflict for payment {payment_id} without confirmed void status: {dke}"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Konflik konkuren pada pembalikan saldo kredit pelanggan."
+        )
 
     # Recalculate order status
     fresh_order = await db.orders.find_one({"_id": order["_id"]})
@@ -5427,6 +5644,22 @@ async def admin_customer_detail(cid: str, admin: dict = Depends(require_perm("ma
     txns = await db.point_transactions.find({"customer_id": cid}).sort("created_at", -1).to_list(500)
     return {"customer": clean_customer(c), "orders": [clean(o) for o in orders], "point_transactions": [clean(t) for t in txns]}
 
+@api_router.get("/admin/customers/{cid}/credit-balance")
+async def admin_customer_credit_balance(cid: str, currency: Optional[str] = "EGP", admin: dict = Depends(require_perm("manage_orders"))):
+    c = await db.customers.find_one({"_id": id_query(cid)})
+    if not c:
+        raise HTTPException(status_code=404, detail="Pelanggan tidak ditemukan")
+    cur = (currency or "EGP").strip().upper()
+    balance = await get_customer_credit_balance(cid, cur)
+    events = await db.customer_credit_events.find({"customer_id": cid, "currency": cur}).sort("created_at", -1).to_list(500)
+    return {
+        "customer_id": cid,
+        "currency": cur,
+        "available_credit": balance,
+        "events_count": len(events),
+        "events": [clean(e) for e in events],
+    }
+
 @api_router.patch("/admin/customers/{cid}")
 async def admin_update_customer(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_owner())):
     c = await db.customers.find_one({"_id": id_query(cid)})
@@ -5855,6 +6088,36 @@ async def seed():
         await db.wage_obligations.create_index(
             [("order_id", 1), ("order_item_id", 1)],
             name="idx_wage_obligations_order_item"
+        )
+    except Exception:
+        pass
+
+    # Ensure indexes for customer_credit_events (Phase 3.B.2)
+    try:
+        await db.customer_credit_events.create_index(
+            [("event_number", 1)],
+            unique=True,
+            name="uniq_credit_event_number"
+        )
+        await db.customer_credit_events.create_index(
+            [("source_payment_id", 1), ("event_type", 1)],
+            unique=True,
+            partialFilterExpression={"source_payment_id": {"$type": "string"}},
+            name="uniq_credit_event_source_payment"
+        )
+        await db.customer_credit_events.create_index(
+            [("customer_id", 1), ("currency", 1)],
+            name="idx_credit_events_customer_currency"
+        )
+        await db.customer_credit_events.create_index(
+            [("source_order_id", 1)],
+            name="idx_credit_events_source_order"
+        )
+        await db.customer_credit_events.create_index(
+            [("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+            name="uniq_credit_events_idempotency"
         )
     except Exception:
         pass
