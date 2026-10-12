@@ -667,6 +667,9 @@ class TestPhase3B2OverpaymentCredit(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.update_one = AsyncMock()
         mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
         mock_db.customer_credit_events.find_one = AsyncMock(return_value=cce_doc)
+        mock_agg = MagicMock()
+        mock_agg.to_list = AsyncMock(return_value=[{"total": 500.0}])
+        mock_db.customer_credit_events.aggregate = MagicMock(return_value=mock_agg)
 
         with patch("server.db", mock_db), patch("server.client", self.mock_client):
             await admin_void_order_payment(order_id, pmt_id, PaymentVoidInput(reason="Customer requested cancel"), self.admin_finance)
@@ -746,6 +749,9 @@ class TestPhase3B2OverpaymentCredit(unittest.IsolatedAsyncioTestCase):
         mock_db.orders.find_one = AsyncMock(return_value=order_doc)
         mock_db.payments.find_one = AsyncMock(side_effect=find_one_calls)
         mock_db.customer_credit_events.find_one = AsyncMock(return_value=cce_doc)
+        mock_agg = MagicMock()
+        mock_agg.to_list = AsyncMock(return_value=[{"total": 200.0}])
+        mock_db.customer_credit_events.aggregate = MagicMock(return_value=mock_agg)
 
         import pymongo.errors
         # Simulate loser transaction hitting DuplicateKeyError on uniq_credit_event_source_payment

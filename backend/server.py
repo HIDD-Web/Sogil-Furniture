@@ -537,7 +537,13 @@ async def get_customer_credit_balance(customer_id: str, currency: str = "EGP", s
     ]
     agg_kw = {"session": session} if session else {}
     cursor = db.customer_credit_events.aggregate(pipeline, **agg_kw)
-    res = await cursor.to_list(1) if hasattr(cursor, "to_list") else []
+    res = []
+    if hasattr(cursor, "to_list"):
+        tl = cursor.to_list(1)
+        if asyncio.iscoroutine(tl) or hasattr(tl, "__await__"):
+            res = await tl
+        elif isinstance(tl, list):
+            res = tl
     if res and len(res) > 0:
         return round(float(res[0].get("total", 0.0)), 2)
     return 0.0
@@ -2854,7 +2860,97 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
 
     async def _do_void(session):
         ins_kw = {"session": session} if session else {}
-        # Mark payment voided
+        # Phase 3.B.2, 3.B.3, and Phase 3.C.2:
+        # Pre-check for associated credit events before modifying payment or finance transaction records.
+        # If reversing a credit_minted event, enforce that the customer currently has sufficient available credit.
+        cce = None
+        cce_find = getattr(db.customer_credit_events, "find_one", None)
+        if callable(cce_find):
+            cce_res = cce_find(
+                {"source_payment_id": str(pmt["_id"]), "event_type": {"$in": ["credit_minted", "credit_applied"]}},
+                **ins_kw
+            )
+            if asyncio.iscoroutine(cce_res):
+                cce = await cce_res
+
+        rev_cce_doc = None
+        if cce:
+            event_type = cce.get("event_type")
+            original_signed = float(cce.get("signed_amount", 0.0))
+            event_currency = (
+                cce.get("currency")
+                or pmt.get("currency")
+                or order.get("currency")
+                or "EGP"
+            ).strip().upper()
+
+            if event_type == "credit_minted":
+                # Phase 3.C.2: Reversing credit_minted (+X) reduces customer balance (-X).
+                # Fungible credit guard: check that the customer currently holds sufficient credit in this currency.
+                cust_id_str = str(cce.get("customer_id") or order.get("customer_id") or "").strip()
+                if cust_id_str:
+                    # Acquire exclusive customer document touch serialization lock inside the transaction
+                    cust_oid = id_query(cust_id_str)
+                    cust_touch_res = await db.customers.update_one(
+                        {"_id": cust_oid},
+                        {"$set": {"last_credit_transaction_at": now_iso}},
+                        **ins_kw
+                    )
+                    if cust_touch_res.matched_count == 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Akun pelanggan tidak ditemukan untuk serialisasi transaksi kredit"
+                        )
+
+                    # Query real-time credit balance in the active transaction session
+                    in_txn_balance = await get_customer_credit_balance(
+                        cust_id_str,
+                        event_currency,
+                        session=session
+                    )
+                    required_reversal_amt = abs(original_signed)
+                    if in_txn_balance < required_reversal_amt:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Konflik saldo: Pembayaran ini menghasilkan saldo kredit sebesar {required_reversal_amt:.2f} {event_currency}, "
+                                f"namun saldo kredit pelanggan saat ini hanya tersisa {in_txn_balance:.2f} {event_currency}. "
+                                "Batalkan transaksi penggunaan kredit atau pengembalian dana kredit pelanggan terlebih dahulu "
+                                "sebelum membatalkan pembayaran ini."
+                            )
+                        )
+
+                rev_signed = -original_signed
+                rev_reason = f"Payment voided: {reason} (Reversing minted credit)"
+            else:
+                # Reversing credit_applied (-X) restores customer credit (+X)
+                rev_signed = -original_signed
+                rev_reason = f"Payment voided: {reason} (Restoring credit)"
+
+            rev_cce_num = await generate_credit_event_number()
+            rev_cce_doc = {
+                "event_number": rev_cce_num,
+                "event_type": "credit_reversed",
+                "customer_id": cce.get("customer_id"),
+                "customer_name": cce.get("customer_name"),
+                "customer_phone": cce.get("customer_phone"),
+                "source_payment_id": str(pmt["_id"]),
+                "source_payment_number": pmt.get("payment_number"),
+                "source_order_id": str(order["_id"]),
+                "source_order_number": order.get("order_number"),
+                "currency": event_currency,
+                "signed_amount": rev_signed,
+                "reverses_event_id": str(cce["_id"]),
+                "reason": rev_reason,
+                "idempotency_key": f"cce_rev_pmt_{pmt['_id']}",
+                "created_by_id": admin.get("id"),
+                "created_by_name": admin.get("name", "Admin"),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }
+
+        # Writes proceed ONLY after all balance guards and preconditions have passed cleanly
+        # 1. Mark payment voided
         await db.payments.update_one(
             {"_id": pmt["_id"]},
             {"$set": {
@@ -2867,7 +2963,8 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
             }},
             **ins_kw
         )
-        # Mark finance transaction voided
+
+        # 2. Mark finance transaction voided
         if txn_id:
             await db.finance_transactions.update_one(
                 {"_id": id_query(txn_id)},
@@ -2882,49 +2979,9 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 }},
                 **ins_kw
             )
-        # Phase 3.B.2 & 3.B.3: Reverse corresponding credit mint or credit applied event if exists
-        cce = None
-        cce_find = getattr(db.customer_credit_events, "find_one", None)
-        if callable(cce_find):
-            # Check for either credit_minted or credit_applied
-            cce_res = cce_find(
-                {"source_payment_id": str(pmt["_id"]), "event_type": {"$in": ["credit_minted", "credit_applied"]}},
-                **ins_kw
-            )
-            if asyncio.iscoroutine(cce_res):
-                cce = await cce_res
 
-        if cce:
-            rev_cce_num = await generate_credit_event_number()
-            # If reversing credit_minted (+500), signed_amount becomes -500
-            # If reversing credit_applied (-300), signed_amount becomes +300 (restores credit)
-            original_signed = float(cce.get("signed_amount", 0.0))
-            rev_signed = -original_signed
-            rev_reason = (
-                f"Payment voided: {reason} (Restoring credit)"
-                if cce.get("event_type") == "credit_applied"
-                else f"Payment voided: {reason} (Reversing minted credit)"
-            )
-            rev_cce_doc = {
-                "event_number": rev_cce_num,
-                "event_type": "credit_reversed",
-                "customer_id": cce.get("customer_id"),
-                "customer_name": cce.get("customer_name"),
-                "customer_phone": cce.get("customer_phone"),
-                "source_payment_id": str(pmt["_id"]),
-                "source_payment_number": pmt.get("payment_number"),
-                "source_order_id": str(order["_id"]),
-                "source_order_number": order.get("order_number"),
-                "currency": cce.get("currency", "EGP"),
-                "signed_amount": rev_signed,
-                "reverses_event_id": str(cce["_id"]),
-                "reason": rev_reason,
-                "idempotency_key": f"cce_rev_pmt_{pmt['_id']}",
-                "created_by_id": admin.get("id"),
-                "created_by_name": admin.get("name", "Admin"),
-                "created_at": now_iso,
-                "updated_at": now_iso,
-            }
+        # 3. Append credit reversal event if applicable
+        if rev_cce_doc:
             cce_insert = getattr(db.customer_credit_events, "insert_one", None)
             if callable(cce_insert):
                 res_coro = cce_insert(rev_cce_doc, **ins_kw)
@@ -5238,6 +5295,74 @@ async def finance_delete(txn_id: str, admin: dict = Depends(require_perm("access
     t = await db.finance_transactions.find_one({"_id": id_query(txn_id)})
     if not t:
         raise HTTPException(status_code=404, detail="Transaksi tidak ditemukan")
+
+    # Guard 1: Already voided
+    if t.get("is_void") or t.get("status") == "void":
+        raise HTTPException(
+            status_code=400,
+            detail="Transaksi yang telah dibatalkan tidak dapat dibatalkan kembali"
+        )
+
+    # Guard 2: Order payment linkage (direct reference, reverse lookup, or structured payment number)
+    is_payment_linked = False
+    matching_pmt = None
+    if t.get("payment_id") or t.get("related_payment_number"):
+        is_payment_linked = True
+        if t.get("payment_id"):
+            matching_pmt = await db.payments.find_one({"_id": id_query(t.get("payment_id"))})
+        elif t.get("related_payment_number"):
+            matching_pmt = await db.payments.find_one({"payment_number": t.get("related_payment_number")})
+    else:
+        # Reverse lookup: check if any payment in db.payments references this transaction
+        pmt_cursor = getattr(db, "payments", None)
+        if pmt_cursor is not None and hasattr(pmt_cursor, "find_one"):
+            call_res = pmt_cursor.find_one({
+                "finance_transaction_id": str(t["_id"]),
+                "status": {"$ne": "voided"}
+            })
+            if asyncio.iscoroutine(call_res) or hasattr(call_res, "__await__"):
+                matching_pmt = await call_res
+            elif isinstance(call_res, dict):
+                matching_pmt = call_res
+            if matching_pmt:
+                is_payment_linked = True
+
+    if is_payment_linked:
+        # If the referenced payment document was already voided or missing, handle safely without guessing
+        if matching_pmt and matching_pmt.get("status") == "voided":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Transaksi ini terhubung dengan pembayaran yang sudah berstatus voided di buku besar pembayaran. "
+                    "Inkonsistensi data terdeteksi. Hubungi administrator teknis untuk rekonsiliasi manual."
+                )
+            )
+        order_ref = t.get("related_order_id") or (matching_pmt.get("order_id") if matching_pmt else None) or "terkait"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Transaksi keuangan ini terhubung langsung dengan pembayaran pesanan resmi. "
+                "Pembatalan tidak dapat dilakukan melalui modul keuangan. "
+                f"Silakan batalkan pembayaran melalui menu Detail Pesanan (Order ID: {order_ref}) "
+                "agar saldo pesanan, alokasi dana, dan pembukuan kas tetap sinkron."
+            )
+        )
+
+    # Guard 3: Customer credit settlement or refund linkage
+    is_credit_linked = (
+        t.get("classification") == "liability_settlement" or
+        t.get("type") in ("credit_settlement", "credit_refund") or
+        bool(t.get("related_credit_event_number"))
+    )
+    if is_credit_linked:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Transaksi ini terhubung dengan transaksi kredit atau pengembalian saldo kredit pelanggan. "
+                "Pembatalan langsung dari modul keuangan dilarang untuk menjaga konsistensi buku besar kredit."
+            )
+        )
+
     now_iso = datetime.now(timezone.utc).isoformat()
     await db.finance_transactions.update_one(
         {"_id": id_query(txn_id)},
