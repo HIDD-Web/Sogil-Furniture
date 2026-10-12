@@ -5304,38 +5304,301 @@ def _period_range(period, start, end):
         return s.isoformat(), now.isoformat(), None, None
     return None, None, None, None
 
-async def _stats_for(s, e):
-    q = {"is_void": {"$ne": True}, "status": {"$ne": "void"}}
+async def _stats_for(s, e, cutoff: Optional[str] = None):
+    """
+    Phase 3.B.7 Authoritative Reporting Engine.
+    Computes per-currency ('EGP', 'IDR') financial metrics for the requested period [s, e]:
+    - Physical Cash Inflows & Outflows (from db.finance_transactions only, excluding non-cash credit settlements)
+    - Pure Sales Revenue (from db.orders immutable handover snapshots completed_at + db.finance_adjustments created_at)
+    - Other Income (from db.finance_transactions type='income', classification in (None, 'revenue'))
+    - Operating Expenses (from db.finance_transactions type='expense', classification in (None, 'cost'))
+    - Customer Credit Liabilities (from db.customer_credit_events as of cutoff)
+    - Customer Advances / Deposit Liabilities (from active orders status not in ('selesai', 'dibatalkan'))
+    - Accounts Receivable (from handed-over orders: max(0, recognized_revenue_le + net_adjustments - canonical_paid_le))
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    as_of_cutoff = cutoff or (e if e else now_iso)
+
+    # Base structure for both currencies
+    res = {
+        "EGP": {
+            "real_cash_inflow": 0.0,
+            "real_cash_outflow": 0.0,
+            "cash_flow": 0.0,
+            "sales_revenue": 0.0,
+            "other_income": 0.0,
+            "total_revenue": 0.0,
+            "operating_cost": 0.0,
+            "operating_profit": 0.0,
+            "available_customer_credit": 0.0,
+            "customer_advances": 0.0,
+            "accounts_receivable": 0.0,
+            "credit_applied": 0.0,
+            "credit_refunded": 0.0,
+            # Legacy backward compatibility aliases
+            "revenue": 0.0,
+            "cost": 0.0,
+        },
+        "IDR": {
+            "real_cash_inflow": 0.0,
+            "real_cash_outflow": 0.0,
+            "cash_flow": 0.0,
+            "sales_revenue": 0.0,
+            "other_income": 0.0,
+            "total_revenue": 0.0,
+            "operating_cost": 0.0,
+            "operating_profit": 0.0,
+            "available_customer_credit": 0.0,
+            "customer_advances": 0.0,
+            "accounts_receivable": 0.0,
+            "credit_applied": 0.0,
+            "credit_refunded": 0.0,
+            # Legacy backward compatibility aliases
+            "revenue": 0.0,
+            "cost": 0.0,
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # 1. Physical Cash Movements, Other Income & Operating Costs (finance_transactions)
+    # -------------------------------------------------------------------------
+    q_txns = {"is_void": {"$ne": True}, "status": {"$ne": "void"}}
     if s or e:
-        q["date"] = {}
+        q_txns["date"] = {}
         if s:
-            q["date"]["$gte"] = s
+            q_txns["date"]["$gte"] = s
         if e:
-            q["date"]["$lte"] = e
-    res = {"IDR": {"revenue": 0.0, "cost": 0.0}, "EGP": {"revenue": 0.0, "cost": 0.0}}
-    async for t in db.finance_transactions.find(q):
-        cur = t.get("currency", "EGP"); typ = t.get("type"); amt = _num(t.get("amount")); cls = t.get("classification")
+            q_txns["date"]["$lte"] = e
+
+    legacy_order_rev = {"EGP": 0.0, "IDR": 0.0}
+
+    async for t in db.finance_transactions.find(q_txns):
+        typ = t.get("type")
+        raw_amt = _num(t.get("amount"))
+        cls = t.get("classification")
+        cur = (t.get("account") or t.get("currency") or "EGP").strip().upper()
+
+        if typ == "credit_settlement":
+            # Non-cash contra entry: strictly 0.00 cash inflow/outflow
+            continue
+
+        if typ == "transfer":
+            # Real cash moving between internal accounts
+            from_cur = (t.get("from_account") or "IDR").strip().upper()
+            to_cur = (t.get("to_account") or "EGP").strip().upper()
+            from_amt = _num(t.get("from_amount"))
+            to_amt = _num(t.get("to_amount"))
+            if from_cur in res:
+                res[from_cur]["real_cash_outflow"] += from_amt
+            if to_cur in res:
+                res[to_cur]["real_cash_inflow"] += to_amt
+            continue
+
         if cur not in res:
             continue
-        if typ == "order_revenue":
-            res[cur]["revenue"] += amt
-        elif typ == "income" and cls in (None, "revenue"):
-            res[cur]["revenue"] += amt
-        elif typ == "expense" and cls in (None, "cost"):
-            res[cur]["cost"] += amt
-    for cur in res:
+
+        if typ == "balance_adjustment":
+            if raw_amt > 0:
+                res[cur]["real_cash_inflow"] += raw_amt
+            elif raw_amt < 0:
+                res[cur]["real_cash_outflow"] += abs(raw_amt)
+            continue
+
+        # Physical Cash Inflow
+        if typ in ("order_payment", "order_revenue"):
+            res[cur]["real_cash_inflow"] += raw_amt
+            if typ == "order_revenue":
+                legacy_order_rev[cur] = legacy_order_rev.get(cur, 0.0) + raw_amt
+        elif typ == "income":
+            res[cur]["real_cash_inflow"] += raw_amt
+            if cls in (None, "revenue"):
+                res[cur]["other_income"] += raw_amt
+
+        # Physical Cash Outflow & Operating Costs
+        elif typ in ("refund", "credit_refund"):
+            res[cur]["real_cash_outflow"] += raw_amt
+            # Liability settlement refunds are NOT operating costs
+        elif typ == "expense":
+            res[cur]["real_cash_outflow"] += raw_amt
+            if cls in (None, "cost"):
+                res[cur]["operating_cost"] += raw_amt
+
+    # -------------------------------------------------------------------------
+    # 2. Handover-Recognized Furniture Sales Revenue (db.orders)
+    # -------------------------------------------------------------------------
+    # Query orders handed over within the period [s, e] with valid immutable snapshot
+    q_orders_rev = {
+        "completed_at": {"$ne": None},
+        "recognized_revenue_le": {"$ne": None, "$gte": 0.0},
+        "order_status": {"$in": ["selesai", "dibatalkan"]}
+    }
+    if s or e:
+        q_orders_rev["completed_at"] = {}
+        if s:
+            q_orders_rev["completed_at"]["$gte"] = s
+        if e:
+            q_orders_rev["completed_at"]["$lte"] = e
+
+    orders_cursor = getattr(db, "orders", None)
+    if orders_cursor is not None and hasattr(orders_cursor, "find"):
+        ord_finder = orders_cursor.find(q_orders_rev)
+        if hasattr(ord_finder, "__aiter__"):
+            async for ord_doc in ord_finder:
+                rec_le = _num(ord_doc.get("recognized_revenue_le", 0.0))
+                # Furniture sales are priced and recognized in EGP (LE)
+                res["EGP"]["sales_revenue"] += rec_le
+
+    # -------------------------------------------------------------------------
+    # 3. Explicit Finance Adjustments (db.finance_adjustments)
+    # -------------------------------------------------------------------------
+    # Period of creation attribution (OD-B7-01: no restatement of prior periods)
+    q_adjs = {"is_void": {"$ne": True}}
+    if s or e:
+        q_adjs["created_at"] = {}
+        if s:
+            q_adjs["created_at"]["$gte"] = s
+        if e:
+            q_adjs["created_at"]["$lte"] = e
+
+    adjs_cursor = getattr(db, "finance_adjustments", None)
+    if adjs_cursor is not None and hasattr(adjs_cursor, "find"):
+        adj_finder = adjs_cursor.find(q_adjs)
+        if hasattr(adj_finder, "__aiter__"):
+            async for adj in adj_finder:
+                adj_cur = (adj.get("currency") or "EGP").strip().upper()
+                adj_amt = _num(adj.get("amount", 0.0))
+                if adj_cur in res:
+                    res[adj_cur]["sales_revenue"] += adj_amt
+
+    # -------------------------------------------------------------------------
+    # 4. Customer Credit Liability & Flows (db.customer_credit_events)
+    # -------------------------------------------------------------------------
+    cce_coll = getattr(db, "customer_credit_events", None)
+    if cce_coll is not None and hasattr(cce_coll, "aggregate"):
+        for cur_key in ("EGP", "IDR"):
+            pipeline_cce = [
+                {"$match": {"currency": cur_key, "created_at": {"$lte": as_of_cutoff}}},
+                {"$group": {"_id": None, "total": {"$sum": "$signed_amount"}}}
+            ]
+            cce_cursor = cce_coll.aggregate(pipeline_cce)
+            to_list_fn = getattr(cce_cursor, "to_list", None)
+            if callable(to_list_fn):
+                res_coro = to_list_fn(1)
+                if asyncio.iscoroutine(res_coro):
+                    cce_res = await res_coro
+                    if cce_res and len(cce_res) > 0:
+                        res[cur_key]["available_customer_credit"] = max(0.0, round(float(cce_res[0].get("total", 0.0)), 2))
+
+    # Period flow metrics for credit consumption and credit refunds
+    if cce_coll is not None and hasattr(cce_coll, "find"):
+        q_cce_flow = {}
+        if s or e:
+            q_cce_flow["created_at"] = {}
+            if s:
+                q_cce_flow["created_at"]["$gte"] = s
+            if e:
+                q_cce_flow["created_at"]["$lte"] = e
+
+        cce_finder = cce_coll.find(q_cce_flow)
+        if hasattr(cce_finder, "__aiter__"):
+            async for evt in cce_finder:
+                evt_cur = (evt.get("currency") or "EGP").strip().upper()
+                evt_type = evt.get("event_type")
+                signed_amt = _num(evt.get("signed_amount", 0.0))
+                if evt_cur in res:
+                    if evt_type == "credit_applied":
+                        res[evt_cur]["credit_applied"] += abs(signed_amt)
+                    elif evt_type == "credit_refunded":
+                        res[evt_cur]["credit_refunded"] += abs(signed_amt)
+
+    # -------------------------------------------------------------------------
+    # 5. Customer Advances & Accounts Receivable (Working Capital Balance Sheet)
+    # -------------------------------------------------------------------------
+    # Pre-fetch recorded payments grouped by order_id
+    pmt_by_order = {}
+    pmts_coll = getattr(db, "payments", None)
+    if pmts_coll is not None and hasattr(pmts_coll, "find"):
+        p_finder = pmts_coll.find({"status": "recorded"})
+        if hasattr(p_finder, "__aiter__"):
+            async for p in p_finder:
+                oid_str = str(p.get("order_id") or "")
+                amt = _num(p.get("amount_le", 0.0))
+                pmt_by_order[oid_str] = pmt_by_order.get(oid_str, 0.0) + amt
+
+    # Pre-fetch active finance adjustments grouped by order_id
+    adjs_by_order = {}
+    if adjs_cursor is not None and hasattr(adjs_cursor, "find"):
+        a_finder = adjs_cursor.find({"is_void": {"$ne": True}})
+        if hasattr(a_finder, "__aiter__"):
+            async for a in a_finder:
+                oid_str = str(a.get("order_id") or "")
+                amt = _num(a.get("amount", 0.0))
+                adjs_by_order[oid_str] = adjs_by_order.get(oid_str, 0.0) + amt
+
+    # Iterate active and handed-over orders
+    if orders_cursor is not None and hasattr(orders_cursor, "find"):
+        all_orders_finder = orders_cursor.find({})
+        if hasattr(all_orders_finder, "__aiter__"):
+            async for ord_doc in all_orders_finder:
+                oid_str = str(ord_doc.get("_id") or ord_doc.get("id") or "")
+                status = ord_doc.get("order_status")
+                paid_le = pmt_by_order.get(oid_str, 0.0)
+
+                # A. Customer Advances: Active orders (status not in 'selesai', 'dibatalkan')
+                if status not in ("selesai", "dibatalkan"):
+                    if paid_le > 0:
+                        res["EGP"]["customer_advances"] += paid_le
+
+                # B. Accounts Receivable: Handed-over orders (snapshot established)
+                has_snapshot = bool(ord_doc.get("completed_at")) and ord_doc.get("recognized_revenue_le") is not None
+                if has_snapshot:
+                    rec_rev_d = Decimal(str(_num(ord_doc.get("recognized_revenue_le", 0.0)))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    net_adjs_d = Decimal(str(adjs_by_order.get(oid_str, 0.0))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    paid_d = Decimal(str(paid_le)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                    net_rev_d = rec_rev_d + net_adjs_d
+                    ar_d = max(Decimal("0.00"), net_rev_d - paid_d)
+                    res["EGP"]["accounts_receivable"] += float(ar_d)
+
+    # -------------------------------------------------------------------------
+    # 6. Final Metric Assembly, Mathematical Reconciliation & Rounding
+    # -------------------------------------------------------------------------
+    for cur in ("IDR", "EGP"):
         r = res[cur]
-        r["operating_profit"] = r["revenue"] - r["cost"]
-        r["cash_flow"] = r["revenue"] - r["cost"]
+        r["real_cash_inflow"] = round(r["real_cash_inflow"], 2)
+        r["real_cash_outflow"] = round(r["real_cash_outflow"], 2)
+        r["cash_flow"] = round(r["real_cash_inflow"] - r["real_cash_outflow"], 2)
+
+        r["sales_revenue"] = round(r["sales_revenue"], 2)
+        r["other_income"] = round(r["other_income"], 2)
+        r["total_revenue"] = round(r["sales_revenue"] + r["other_income"], 2)
+
+        r["operating_cost"] = round(r["operating_cost"], 2)
+        r["operating_profit"] = round(r["total_revenue"] - r["operating_cost"], 2)
+
+        r["available_customer_credit"] = round(r["available_customer_credit"], 2)
+        r["customer_advances"] = round(r["customer_advances"], 2)
+        r["accounts_receivable"] = round(r["accounts_receivable"], 2)
+
+        r["credit_applied"] = round(r["credit_applied"], 2)
+        r["credit_refunded"] = round(r["credit_refunded"], 2)
+
+        # Backward compatibility for existing UI and legacy tests:
+        # If no handover sales revenue was established, preserve legacy order_revenue
+        # in the legacy .revenue alias so historical order_revenue tests and unmigrated callers function.
+        if r["sales_revenue"] > 0:
+            r["revenue"] = r["total_revenue"]
+        else:
+            legacy_rev = round(r["sales_revenue"] + r["other_income"] + legacy_order_rev.get(cur, 0.0), 2)
+            r["revenue"] = legacy_rev
+
     return res
 
 @api_router.get("/admin/finance/stats")
 async def finance_stats(period: str = "this_month", start: Optional[str] = None, end: Optional[str] = None,
                         admin: dict = Depends(require_perm("access_finance"))):
     s, e, ps, pe = _period_range(period, start, end)
-    current = await _stats_for(s, e)
-
-    # Generalized Cumulative Ending Balance:
+    # Generalized Cumulative Ending Balance & As-Of Cutoff:
     # Cumulative valid real-currency transactions from the beginning of financial history
     # through the END/CUTOFF of the selected period.
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -5346,16 +5609,17 @@ async def finance_stats(period: str = "this_month", start: Optional[str] = None,
     else:
         cutoff = now_iso
 
+    current = await _stats_for(s, e, cutoff=cutoff)
     balances = await _compute_balances(as_of=cutoff)
 
     comparison = None
     if ps and pe:
-        prev = await _stats_for(ps, pe)
+        prev = await _stats_for(ps, pe, cutoff=pe)
         comparison = {}
         for cur in ("IDR", "EGP"):
             comparison[cur] = {}
-            for metric in ("revenue", "cost", "operating_profit"):
-                cv = current[cur][metric]; pv = prev[cur][metric]
+            for metric in ("revenue", "cost", "operating_profit", "sales_revenue", "real_cash_inflow", "cash_flow"):
+                cv = current[cur].get(metric, 0.0); pv = prev[cur].get(metric, 0.0)
                 if pv == 0:
                     if cv == 0:
                         pct = 0.0
