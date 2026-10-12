@@ -325,6 +325,31 @@ class CustomerCreditRefundInput(BaseModel):
     notes: Optional[str] = ""
     idempotency_key: Optional[str] = None
 
+class FinanceAdjustmentInput(BaseModel):
+    order_id: str
+    type: str  # "revenue_reversal" | "price_correction" | "return_allowance"
+    currency: str  # "EGP" | "IDR"
+    amount: float
+    reason: str
+    idempotency_key: str
+    evidence_reference: Optional[str] = None
+    notes: Optional[str] = None
+
+async def generate_adjustment_number(session=None) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    counter_id = f"adj_{today}"
+    prefix = f"ADJ-{today}-"
+    kw = {"session": session} if session else {}
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+        **kw
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
 async def compute_order_payment_summary(order_doc: dict) -> dict:
     order_oid = id_query(str(order_doc.get("_id") or order_doc.get("id")))
     recorded_payments = await db.payments.find({
@@ -6033,6 +6058,365 @@ async def admin_customer_credit_refund(
         "finance_transaction": clean(final_txn),
     }
 
+# --------------------------------------------------------------------------
+# Phase 3.B.6: Explicit Finance Adjustments
+# --------------------------------------------------------------------------
+
+@api_router.post("/admin/finance/adjustments", status_code=201)
+async def admin_create_finance_adjustment(
+    payload: FinanceAdjustmentInput,
+    response: Response,
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    # Role check: strictly owner or permissions.access_finance == True
+    role = admin.get("role")
+    perms = admin.get("permissions") or {}
+    if role != "owner" and not perms.get("access_finance"):
+        raise HTTPException(
+            status_code=403,
+            detail="Hanya admin dengan akses keuangan atau owner yang dapat membuat penyesuaian keuangan (Finance Adjustment)"
+        )
+
+    # 1. Input validation: type
+    adj_type = (payload.type or "").strip().lower()
+    allowed_types = {"revenue_reversal", "price_correction", "return_allowance"}
+    if adj_type not in allowed_types:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Tipe penyesuaian keuangan tidak valid: {payload.type!r}. Harus salah satu dari {list(allowed_types)}."
+        )
+
+    # 2. Input validation: currency
+    currency = (payload.currency or "").strip().upper()
+    if currency not in ("EGP", "IDR"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Mata uang penyesuaian tidak didukung: {payload.currency!r}. Hanya EGP atau IDR yang diperbolehkan."
+        )
+
+    # 3. Input validation: amount precision and non-zero
+    raw_amount = payload.amount
+    if raw_amount is None or raw_amount == 0.0:
+        raise HTTPException(
+            status_code=422,
+            detail="Nominal penyesuaian keuangan tidak boleh nol"
+        )
+
+    s_amount = str(raw_amount).strip()
+    if "." in s_amount:
+        dec_part = s_amount.split(".")[1]
+        if len(dec_part) > 2:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Nominal penyesuaian tidak boleh memiliki lebih dari 2 tempat desimal: {raw_amount}"
+            )
+
+    d_amount = Decimal(str(raw_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if d_amount == Decimal("0.00"):
+        raise HTTPException(
+            status_code=422,
+            detail="Nominal penyesuaian keuangan tidak boleh nol"
+        )
+    float_amount = float(d_amount)
+
+    # 4. Sign validation
+    if adj_type in ("revenue_reversal", "return_allowance"):
+        if float_amount >= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Penyesuaian bertipe {adj_type} harus bernilai negatif (< 0)"
+            )
+    # price_correction: can be positive or negative (B6-OD-02, B6-OD-05), zero is already rejected
+
+    # 5. Reason validation
+    reason = (payload.reason or "").strip()
+    if len(reason) < 5 or len(reason) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail="Alasan penyesuaian keuangan wajib diisi (minimal 5 karakter, maksimal 500 karakter)"
+        )
+
+    # 6. Idempotency key validation
+    idem_key = (payload.idempotency_key or "").strip()
+    if len(idem_key) < 8 or len(idem_key) > 128:
+        raise HTTPException(
+            status_code=422,
+            detail="Kunci idempotensi (idempotency_key) wajib diisi (minimal 8 karakter, maksimal 128 karakter)"
+        )
+
+    order_id_raw = (payload.order_id or "").strip()
+    if not order_id_raw:
+        raise HTTPException(status_code=422, detail="order_id wajib diisi")
+
+    # Helper function to compute order impact
+    async def _compute_order_impact(order_doc, added_adjustment=None, session=None):
+        rec_rev = _num(order_doc.get("recognized_revenue_le", 0.0))
+        d_rec_rev = Decimal(str(rec_rev)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        q_adjs = {"order_id": str(order_doc["_id"]), "is_void": {"$ne": True}}
+        kw = {"session": session} if session else {}
+        cursor = db.finance_adjustments.find(q_adjs, **kw)
+        existing_adjs = await cursor.to_list(1000) if hasattr(cursor, "to_list") else []
+
+        cum_adj_d = Decimal("0.00")
+        for a in existing_adjs:
+            amt = _num(a.get("amount", 0.0))
+            cum_adj_d += Decimal(str(amt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        if added_adjustment:
+            add_amt = _num(added_adjustment.get("amount", 0.0))
+            cum_adj_d += Decimal(str(add_amt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        net_rev_d = d_rec_rev + cum_adj_d
+
+        order_oid = id_query(str(order_doc["_id"]))
+        payments_cursor = db.payments.find({"order_id": order_oid, "status": "recorded"}, **kw)
+        recs = await payments_cursor.to_list(1000) if hasattr(payments_cursor, "to_list") else []
+        paid_d = Decimal(str(sum(_num(p.get("amount_le", 0.0)) for p in recs))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        piutang_d = max(Decimal("0.00"), net_rev_d - paid_d)
+        excess_d = max(Decimal("0.00"), paid_d - net_rev_d)
+
+        return {
+            "original_recognized_revenue_le": float(d_rec_rev),
+            "cumulative_net_adjustments_le": float(cum_adj_d),
+            "net_adjusted_revenue_le": float(net_rev_d),
+            "canonical_paid_le": float(paid_d),
+            "piutang_usaha_le": float(piutang_d),
+            "unallocated_excess_le": float(excess_d),
+        }
+
+    # Helper to check if an existing adjustment matches the incoming request payload deterministically
+    def _is_matching_idempotent_payload(existing_doc: dict) -> bool:
+        orig_order_id = str(existing_doc.get("order_id") or "").strip()
+        orig_type = str(existing_doc.get("type") or "").strip().lower()
+        orig_cur = str(existing_doc.get("currency") or "").strip().upper()
+        orig_amt = _num(existing_doc.get("amount", 0.0))
+        orig_amt_d = Decimal(str(orig_amt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        orig_reason = str(existing_doc.get("reason") or "").strip()
+        orig_evidence = str(existing_doc.get("evidence_reference") or "").strip() or None
+        orig_notes = str(existing_doc.get("notes") or "").strip() or None
+
+        norm_evidence = (payload.evidence_reference or "").strip() or None
+        norm_notes = (payload.notes or "").strip() or None
+
+        return (
+            orig_order_id == order_id_raw
+            and orig_type == adj_type
+            and orig_cur == currency
+            and orig_amt_d == d_amount
+            and orig_reason == reason
+            and orig_evidence == norm_evidence
+            and orig_notes == norm_notes
+        )
+
+    # 7. Pre-transaction Idempotency Replay Check
+    existing_adj = await db.finance_adjustments.find_one({"idempotency_key": idem_key})
+    if existing_adj:
+        if not _is_matching_idempotent_payload(existing_adj):
+            raise HTTPException(
+                status_code=409,
+                detail="Kunci idempotensi telah digunakan untuk penyesuaian keuangan dengan parameter yang berbeda."
+            )
+
+        order_doc = await db.orders.find_one({"_id": id_query(order_id_raw)})
+        impact = await _compute_order_impact(order_doc, added_adjustment=None) if order_doc else {}
+        response.status_code = 200
+        res = clean(existing_adj)
+        res["order_impact"] = impact
+        return res
+
+    # 8. Transaction Execution
+    async def _do_create_adjustment(session):
+        ins_kw = {"session": session} if session else {}
+
+        # 8.1 Read and serialize order
+        order_doc = await db.orders.find_one({"_id": id_query(order_id_raw)}, **ins_kw)
+        if not order_doc:
+            raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+        # 8.2 Touch serialization guard on order document
+        now_touch = datetime.now(timezone.utc).isoformat()
+        touch_res = await db.orders.update_one(
+            {"_id": order_doc["_id"]},
+            {"$set": {"last_finance_adjustment_at": now_touch}},
+            **ins_kw
+        )
+        if touch_res.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan untuk serialisasi penyesuaian")
+
+        # 8.3 Handover Eligibility Verification (ALL THREE CONDITIONS MANDATORY)
+        completed_at = order_doc.get("completed_at")
+        has_valid_completed_at = bool(completed_at) and isinstance(completed_at, str) and len(completed_at.strip()) > 0
+        rec_rev_val = order_doc.get("recognized_revenue_le")
+        has_valid_rec_rev = (rec_rev_val is not None) and isinstance(rec_rev_val, (int, float, Decimal)) and rec_rev_val >= 0
+        order_status = order_doc.get("order_status")
+
+        # In-flight active orders fail closed with HTTP 409
+        if order_status in ("pesanan_masuk", "dikonfirmasi", "diproses", "siap"):
+            raise HTTPException(
+                status_code=409,
+                detail="Penyesuaian keuangan hanya berlaku untuk pesanan yang telah serah terima (selesai). Untuk pesanan aktif, perbarui nilai pesanan secara langsung."
+            )
+
+        # Status must be selesai or dibatalkan
+        if order_status not in ("selesai", "dibatalkan"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Status pesanan tidak memenuhi syarat untuk penyesuaian keuangan: {order_status!r}."
+            )
+
+        # Missing or invalid snapshot on selesai / dibatalkan fails closed with HTTP 409
+        if not has_valid_completed_at or not has_valid_rec_rev:
+            raise HTTPException(
+                status_code=409,
+                detail="Data serah terima pesanan tidak lengkap atau tidak valid (completed_at atau recognized_revenue_le tidak valid)."
+            )
+
+        # 8.4 Currency Matching Verification
+        order_cur = (order_doc.get("currency") or "EGP").strip().upper()
+        if currency != order_cur:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Mata uang penyesuaian ({currency}) harus sesuai dengan mata uang pesanan ({order_cur})."
+            )
+
+        # 8.5 Cumulative Downward Limit Evaluation
+        d_orig_rev = Decimal(str(rec_rev_val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        adjs_cursor = db.finance_adjustments.find(
+            {"order_id": str(order_doc["_id"]), "is_void": {"$ne": True}},
+            **ins_kw
+        )
+        existing_list = await adjs_cursor.to_list(1000) if hasattr(adjs_cursor, "to_list") else []
+
+        prior_adj_d = Decimal("0.00")
+        for a in existing_list:
+            amt = _num(a.get("amount", 0.0))
+            prior_adj_d += Decimal(str(amt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        current_net_rev_d = d_orig_rev + prior_adj_d
+
+        if float_amount < 0:
+            if current_net_rev_d <= Decimal("0.00"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Pendapatan pesanan ini telah sepenuhnya dibalikkan (net revenue 0 LE). Penyesuaian negatif lebih lanjut ditolak."
+                )
+            if abs(d_amount) > current_net_rev_d:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Total penyesuaian negatif melebihi sisa pendapatan yang diakui pada pesanan ini (Tersedia: {current_net_rev_d:.2f} {currency}, Diminta: {abs(d_amount):.2f} {currency})."
+                )
+
+        # 8.6 Generate Daily Sequential Identifier (inside transaction)
+        adj_id = await generate_adjustment_number(session=session)
+
+        # 8.7 Prepare Document
+        now_iso = datetime.now(timezone.utc).isoformat()
+        adj_doc = {
+            "adjustment_id": adj_id,
+            "order_id": str(order_doc["_id"]),
+            "order_number": order_doc.get("order_number"),
+            "customer_id": str(order_doc.get("customer_id") or "").strip() or None,
+            "customer_name": order_doc.get("customer_name") or order_doc.get("name"),
+            "type": adj_type,
+            "currency": currency,
+            "amount": float_amount,
+            "reason": reason,
+            "evidence_reference": (payload.evidence_reference or "").strip() or None,
+            "notes": (payload.notes or "").strip() or None,
+            "idempotency_key": idem_key,
+            "is_void": False,
+            "order_completed_at": completed_at,
+            "created_by_id": admin.get("id"),
+            "created_by_name": admin.get("name", "Admin"),
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+
+        # 8.8 Insert Document
+        ins_func = getattr(db.finance_adjustments, "insert_one", None)
+        if callable(ins_func):
+            coro = ins_func(adj_doc, **ins_kw)
+            if asyncio.iscoroutine(coro):
+                await coro
+
+        return adj_doc, order_doc
+
+    def _is_transient_conflict(exc: Exception) -> bool:
+        if isinstance(exc, pymongo.errors.PyMongoError):
+            if hasattr(exc, "has_error_label") and exc.has_error_label("TransientTransactionError"):
+                return True
+            if isinstance(exc, pymongo.errors.OperationFailure) and getattr(exc, "code", None) == 112:
+                return True
+        return False
+
+    max_retries = 3
+    final_adj_doc = None
+    final_order_doc = None
+
+    for attempt in range(1, max_retries + 1):
+        session = None
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+            if not is_standalone_fallback_permitted():
+                logger.error(f"Transaction capability unavailable for finance adjustment in mode {get_environment_mode()!r}: {sess_err}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                )
+            session = None
+
+        try:
+            if session is not None:
+                async with session:
+                    async with session.start_transaction():
+                        final_adj_doc, final_order_doc = await _do_create_adjustment(session)
+            else:
+                final_adj_doc, final_order_doc = await _do_create_adjustment(None)
+            break
+        except pymongo.errors.DuplicateKeyError as dke:
+            err_msg = str(dke)
+            if "uniq_adjustments_idempotency" in err_msg or idem_key in err_msg:
+                # Concurrent race won by another request with the same idempotency key
+                winning_adj = await db.finance_adjustments.find_one({"idempotency_key": idem_key})
+                if winning_adj:
+                    if not _is_matching_idempotent_payload(winning_adj):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Kunci idempotensi telah digunakan untuk penyesuaian keuangan dengan parameter yang berbeda."
+                        )
+                    order_doc = await db.orders.find_one({"_id": id_query(order_id_raw)})
+                    impact = await _compute_order_impact(order_doc, added_adjustment=None) if order_doc else {}
+                    response.status_code = 200
+                    res = clean(winning_adj)
+                    res["order_impact"] = impact
+                    return res
+            raise
+        except Exception as txn_exc:
+            if _is_transient_conflict(txn_exc):
+                logger.warning(
+                    f"Transient transaction conflict on attempt {attempt}/{max_retries} for adjustment order {order_id_raw}: {txn_exc}"
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(0.05 * attempt)
+                    continue
+                logger.error(
+                    f"Exhausted transaction retry attempts ({max_retries}) for adjustment order {order_id_raw} due to concurrency conflict: {txn_exc}"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="Terjadi konflik transaksi bersamaan pada pesanan. Silakan muat ulang halaman dan coba kembali."
+                )
+            raise
+
+    # 9. Compute order impact for response (including newly added adjustment)
+    order_impact = await _compute_order_impact(final_order_doc, added_adjustment=final_adj_doc)
+    res_payload = clean(final_adj_doc)
+    res_payload["order_impact"] = order_impact
+    return res_payload
+
 @api_router.patch("/admin/customers/{cid}")
 async def admin_update_customer(cid: str, payload: Dict[str, Any], admin: dict = Depends(require_owner())):
     c = await db.customers.find_one({"_id": id_query(cid)})
@@ -6491,6 +6875,30 @@ async def seed():
             unique=True,
             partialFilterExpression={"idempotency_key": {"$type": "string"}},
             name="uniq_credit_events_idempotency"
+        )
+    except Exception:
+        pass
+
+    # Ensure indexes for finance_adjustments (Phase 3.B.6)
+    try:
+        await db.finance_adjustments.create_index(
+            [("adjustment_id", 1)],
+            unique=True,
+            name="uniq_adjustment_id"
+        )
+        await db.finance_adjustments.create_index(
+            [("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+            name="uniq_adjustments_idempotency"
+        )
+        await db.finance_adjustments.create_index(
+            [("order_id", 1), ("is_void", 1), ("created_at", -1)],
+            name="idx_adjustments_order_lookup"
+        )
+        await db.finance_adjustments.create_index(
+            [("currency", 1), ("is_void", 1), ("created_at", -1)],
+            name="idx_adjustments_period_reporting"
         )
     except Exception:
         pass
