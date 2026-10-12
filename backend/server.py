@@ -6869,6 +6869,14 @@ RAK_TYPE_B_PRICES = {
     "120_2": 830, "120_3": 1180, "120_4": 1530, "120_5": 1875, "120_6": 2255, "120_7": 2570,
 }
 
+class CriticalFinanceIndexError(RuntimeError):
+    """Raised when a critical unique financial integrity index fails to be created/verified."""
+    def __init__(self, collection_name: str, index_name: str, reason: str):
+        self.collection_name = collection_name
+        self.index_name = index_name
+        self.reason = reason
+        super().__init__(f"Failed to create critical financial integrity index '{index_name}' on collection '{collection_name}': {reason}")
+
 async def seed():
     admin_email = os.environ.get("ADMIN_EMAIL", "sogil.furniture@gmail.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
@@ -7157,12 +7165,30 @@ async def seed():
         pass
 
     # Ensure indexes for payments (Phase 1)
+    # Critical unique indexes: uniq_payment_number, uniq_payments_idempotency
     try:
         await db.payments.create_index(
             [("payment_number", 1)],
             unique=True,
             name="uniq_payment_number"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: payments 'uniq_payment_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("payments", "uniq_payment_number", str(e))
+
+    try:
+        await db.payments.create_index(
+            [("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+            name="uniq_payments_idempotency"
+        )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: payments 'uniq_payments_idempotency' creation failed: {e}")
+        raise CriticalFinanceIndexError("payments", "uniq_payments_idempotency", str(e))
+
+    # Non-critical reporting/lookup indexes for payments
+    try:
         await db.payments.create_index(
             [("order_id", 1), ("status", 1)],
             name="idx_payments_order_status"
@@ -7171,14 +7197,8 @@ async def seed():
             [("finance_transaction_id", 1)],
             name="idx_payments_finance_txn"
         )
-        await db.payments.create_index(
-            [("idempotency_key", 1)],
-            unique=True,
-            partialFilterExpression={"idempotency_key": {"$type": "string"}},
-            name="uniq_payments_idempotency"
-        )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical payments index provisioning warning: {e}")
 
     # Ensure indexes for Phase 2: wage_rules, work_assignments, wage_obligations
     try:
@@ -7239,18 +7259,41 @@ async def seed():
         pass
 
     # Ensure indexes for customer_credit_events (Phase 3.B.2)
+    # Critical unique indexes: uniq_credit_event_number, uniq_credit_event_source_payment, uniq_credit_events_idempotency
     try:
         await db.customer_credit_events.create_index(
             [("event_number", 1)],
             unique=True,
             name="uniq_credit_event_number"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: customer_credit_events 'uniq_credit_event_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("customer_credit_events", "uniq_credit_event_number", str(e))
+
+    try:
         await db.customer_credit_events.create_index(
             [("source_payment_id", 1), ("event_type", 1)],
             unique=True,
             partialFilterExpression={"source_payment_id": {"$type": "string"}},
             name="uniq_credit_event_source_payment"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: customer_credit_events 'uniq_credit_event_source_payment' creation failed: {e}")
+        raise CriticalFinanceIndexError("customer_credit_events", "uniq_credit_event_source_payment", str(e))
+
+    try:
+        await db.customer_credit_events.create_index(
+            [("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+            name="uniq_credit_events_idempotency"
+        )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: customer_credit_events 'uniq_credit_events_idempotency' creation failed: {e}")
+        raise CriticalFinanceIndexError("customer_credit_events", "uniq_credit_events_idempotency", str(e))
+
+    # Non-critical reporting/lookup indexes for customer_credit_events
+    try:
         await db.customer_credit_events.create_index(
             [("customer_id", 1), ("currency", 1)],
             name="idx_credit_events_customer_currency"
@@ -7259,28 +7302,34 @@ async def seed():
             [("source_order_id", 1)],
             name="idx_credit_events_source_order"
         )
-        await db.customer_credit_events.create_index(
-            [("idempotency_key", 1)],
-            unique=True,
-            partialFilterExpression={"idempotency_key": {"$type": "string"}},
-            name="uniq_credit_events_idempotency"
-        )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical customer_credit_events index provisioning warning: {e}")
 
     # Ensure indexes for finance_adjustments (Phase 3.B.6)
+    # Critical unique indexes: uniq_adjustment_id, uniq_adjustments_idempotency
     try:
         await db.finance_adjustments.create_index(
             [("adjustment_id", 1)],
             unique=True,
             name="uniq_adjustment_id"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: finance_adjustments 'uniq_adjustment_id' creation failed: {e}")
+        raise CriticalFinanceIndexError("finance_adjustments", "uniq_adjustment_id", str(e))
+
+    try:
         await db.finance_adjustments.create_index(
             [("idempotency_key", 1)],
             unique=True,
             partialFilterExpression={"idempotency_key": {"$type": "string"}},
             name="uniq_adjustments_idempotency"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: finance_adjustments 'uniq_adjustments_idempotency' creation failed: {e}")
+        raise CriticalFinanceIndexError("finance_adjustments", "uniq_adjustments_idempotency", str(e))
+
+    # Non-critical reporting/lookup indexes for finance_adjustments
+    try:
         await db.finance_adjustments.create_index(
             [("order_id", 1), ("is_void", 1), ("created_at", -1)],
             name="idx_adjustments_order_lookup"
@@ -7289,8 +7338,8 @@ async def seed():
             [("currency", 1), ("is_void", 1), ("created_at", -1)],
             name="idx_adjustments_period_reporting"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical finance_adjustments index provisioning warning: {e}")
 
     # Provision probe infrastructure
     await ensure_probe_infrastructure(db)
