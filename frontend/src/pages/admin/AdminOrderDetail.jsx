@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import api from "../../lib/api";
-import { fmtLE, fmtIDR, copyToClipboard } from "../../lib/format";
+import { fmtLE, fmtIDR, copyToClipboard, formatApiError } from "../../lib/format";
 import { config_summary_client } from "../../lib/summary";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../../lib/constants";
 import { Button } from "../../components/ui/button";
@@ -310,7 +310,8 @@ export default function AdminOrderDetail() {
       toast.success("Pembayaran berhasil dibatalkan");
       load();
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Gagal membatalkan pembayaran");
+      const errMsg = formatApiError(err.response?.data?.detail) || "Gagal membatalkan pembayaran";
+      toast.error(errMsg);
     }
   };
 

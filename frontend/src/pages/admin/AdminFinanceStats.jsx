@@ -4,7 +4,7 @@ import api from "../../lib/api";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
 import { Input } from "../../components/ui/input";
 import { Button } from "../../components/ui/button";
-import { X, ChevronRight, ChevronLeft } from "lucide-react";
+import { X, ChevronRight, ChevronLeft, Wallet, CircleDollarSign, Coins } from "lucide-react";
 
 const money = (v, cur) => {
   const n = Number(v) || 0;
@@ -44,6 +44,7 @@ export default function AdminFinanceStats() {
   const [range, setRange] = useState({ start: "", end: "" });
   const [currency, setCurrency] = useState(initialCur);
   const [data, setData] = useState(null);
+  const [canonicalStats, setCanonicalStats] = useState(null);
   const [selectedMember, setSelectedMember] = useState(null);
 
   // Sync if URL query param changes directly
@@ -66,7 +67,12 @@ export default function AdminFinanceStats() {
   useEffect(() => {
     const p = { period, currency };
     if (period === "custom") { p.start = range.start; p.end = range.end; }
+    // 1. Fetch detailed category and team wage records
     api.get("/admin/finance/statistics", { params: p }).then((r) => setData(r.data)).catch(() => setData(null));
+    // 2. Fetch canonical financial metrics from Phase 3.B.7 reporting engine
+    const statParams = { period };
+    if (period === "custom") { statParams.start = range.start; statParams.end = range.end; }
+    api.get("/admin/finance/stats", { params: statParams }).then((r) => setCanonicalStats(r.data)).catch(() => setCanonicalStats(null));
   }, [period, currency, range.start, range.end]);
 
   const Table = ({ title, rows, cur }) => (
@@ -134,6 +140,45 @@ export default function AdminFinanceStats() {
         </div>
       </div>
 
+      {/* Metrik Utama Kanonis Phase 3.D */}
+      {canonicalStats?.current?.[currency] && (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 sm:gap-3" data-testid="stat-canonical-cards">
+          <div className="rounded-xl sm:rounded-2xl border border-emerald-200 bg-emerald-50/60 p-3.5 sm:p-4 shadow-xs">
+            <div className="flex items-center justify-between text-xs font-semibold text-emerald-800">
+              <span>Penerimaan Kas Riil</span>
+              <Wallet size={15} className="text-emerald-700" />
+            </div>
+            <div className="mt-1 font-heading text-lg sm:text-xl font-bold text-emerald-950 truncate">
+              {money(canonicalStats.current[currency].real_cash_inflow || 0, currency)}
+            </div>
+            <div className="mt-0.5 text-[11px] text-emerald-700">Total kas masuk aktual</div>
+          </div>
+
+          <div className="rounded-xl sm:rounded-2xl border border-amber-200 bg-amber-50/60 p-3.5 sm:p-4 shadow-xs">
+            <div className="flex items-center justify-between text-xs font-semibold text-amber-800">
+              <span>Pendapatan Penjualan</span>
+              <CircleDollarSign size={15} className="text-amber-700" />
+            </div>
+            <div className="mt-1 font-heading text-lg sm:text-xl font-bold text-amber-950 truncate">
+              {money(canonicalStats.current[currency].sales_revenue || 0, currency)}
+            </div>
+            <div className="mt-0.5 text-[11px] text-amber-700">Diakui saat serah terima (handover)</div>
+          </div>
+
+          <div className="rounded-xl sm:rounded-2xl border border-blue-200 bg-blue-50/60 p-3.5 sm:p-4 shadow-xs">
+            <div className="flex items-center justify-between text-xs font-semibold text-blue-800">
+              <span>Kredit Pelanggan Tersedia</span>
+              <Coins size={15} className="text-blue-700" />
+            </div>
+            <div className="mt-1 font-heading text-lg sm:text-xl font-bold text-blue-950 truncate">
+              {money(canonicalStats.current[currency].available_customer_credit || 0, currency)}
+            </div>
+            <div className="mt-0.5 text-[11px] text-blue-700">Saldo kredit aktif pelanggan</div>
+          </div>
+        </div>
+      )}
+
+      {/* Ringkasan Transaksi Finansial */}
       <div className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-5" data-testid="stat-totals">
         {[["Revenue", t.revenue], ["Transfer Masuk", t.transfer_income], ["Cost", t.cost], ["Transfer Keluar", t.transfer_expense], ["Laba Operasi", t.operating_profit]].map(([l, v], idx) => (
           <div key={l} className={`rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-4 shadow-xs ${idx === 4 ? "col-span-2 lg:col-span-1" : ""}`}>

@@ -7,7 +7,8 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { Trash2, ArrowRightLeft, TrendingUp, TrendingDown, Pencil, X, ChevronRight, ArrowRight } from "lucide-react";
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "../../components/ui/accordion";
+import { Trash2, ArrowRightLeft, TrendingUp, TrendingDown, Pencil, X, ChevronRight, ArrowRight, Wallet, CircleDollarSign, Coins, CreditCard, ChevronDown, Info } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { toast } from "sonner";
 
@@ -344,36 +345,134 @@ export default function AdminFinance() {
       </div>
 
       {/* Stats per currency */}
-      <div className="grid gap-3 sm:gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-2">
         {["EGP", "IDR"].map((cur) => {
-          const c = stats?.current?.[cur]; const cmp = stats?.comparison?.[cur];
+          const c = stats?.current?.[cur];
+          const cmp = stats?.comparison?.[cur];
           return (
             <div
               key={cur}
-              role="button"
-              tabIndex={0}
-              onClick={() => navigate(`/admin/finance/statistik?currency=${cur}`)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  navigate(`/admin/finance/statistik?currency=${cur}`);
-                }
-              }}
               data-testid={`stat-card-${cur.toLowerCase()}`}
-              className="group cursor-pointer rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-3.5 sm:p-5 shadow-xs transition-all hover:border-[#8B5A2B]/50 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-[#8B5A2B]/40"
+              className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 shadow-xs transition-all"
             >
-              <div className="flex items-center justify-between">
-                <div className="font-heading text-sm sm:text-base font-bold text-[#2C1E16]">Statistik {cur}</div>
-                <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#8B5A2B] group-hover:underline">
-                  Lihat Detail Statistik <ArrowRight size={13} className="transition-transform group-hover:translate-x-0.5" />
-                </span>
+              <div className="flex items-center justify-between pb-3 border-b border-[#F1EBE0]">
+                <div>
+                  <div className="font-heading text-base sm:text-lg font-bold text-[#2C1E16]">
+                    Ringkasan Keuangan {cur}
+                  </div>
+                  <p className="text-xs text-[#8B7355] mt-0.5">
+                    Data kanonis per periode {PERIODS.find(([k]) => k === period)?.[1] || period}.
+                  </p>
+                </div>
+                <button
+                  onClick={() => navigate(`/admin/finance/statistik?currency=${cur}`)}
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-[#8B5A2B] hover:underline"
+                >
+                  Detail Statistik <ArrowRight size={13} />
+                </button>
               </div>
-              <div className="mt-2.5 sm:mt-3 space-y-1.5 sm:space-y-2 text-xs sm:text-sm">
-                <div className="flex justify-between"><span className="text-[#5C4A3D]">Pendapatan</span><span className="font-medium">{money(c?.revenue || 0, cur)}<Cmp v={cmp?.revenue} /></span></div>
-                <div className="flex justify-between"><span className="text-[#5C4A3D]">Biaya</span><span className="font-medium">{money(c?.cost || 0, cur)}<Cmp v={cmp?.cost} reverseColor={true} /></span></div>
-                <div className="flex justify-between border-t border-dashed border-[#E5DCC5] pt-1.5 sm:pt-2"><span className="text-[#5C4A3D]">Laba Operasi</span><span className="font-bold text-[#8B5A2B]">{money(c?.operating_profit || 0, cur)}<Cmp v={cmp?.operating_profit} /></span></div>
-                <div className="flex justify-between"><span className="text-[#5C4A3D]">Arus Kas</span><span className="font-medium">{money(c?.cash_flow || 0, cur)}</span></div>
+
+              {/* Tiga Metrik Utama Phase 3.D */}
+              <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                {/* 1. Penerimaan Kas Riil */}
+                <div className="rounded-xl border border-emerald-100 bg-emerald-50/50 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium text-emerald-800">Penerimaan Kas Riil</span>
+                    <Wallet size={14} className="text-emerald-700" />
+                  </div>
+                  <div className="mt-1 text-base sm:text-lg font-bold text-emerald-950 truncate">
+                    {money(c?.real_cash_inflow || 0, cur)}
+                  </div>
+                  <div className="mt-1 flex items-center text-[10px] text-emerald-700">
+                    Kas Masuk Riil <Cmp v={cmp?.real_cash_inflow} />
+                  </div>
+                </div>
+
+                {/* 2. Pendapatan Penjualan (Handover) */}
+                <div className="rounded-xl border border-amber-100 bg-amber-50/50 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium text-amber-800">Pendapatan Penjualan</span>
+                    <CircleDollarSign size={14} className="text-amber-700" />
+                  </div>
+                  <div className="mt-1 text-base sm:text-lg font-bold text-amber-950 truncate">
+                    {money(c?.sales_revenue || 0, cur)}
+                  </div>
+                  <div className="mt-1 flex items-center text-[10px] text-amber-700">
+                    Serah Terima Selesai <Cmp v={cmp?.sales_revenue} />
+                  </div>
+                </div>
+
+                {/* 3. Kredit Pelanggan Tersedia */}
+                <div className="rounded-xl border border-blue-100 bg-blue-50/50 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium text-blue-800">Kredit Pelanggan</span>
+                    <Coins size={14} className="text-blue-700" />
+                  </div>
+                  <div className="mt-1 text-base sm:text-lg font-bold text-blue-950 truncate">
+                    {money(c?.available_customer_credit || 0, cur)}
+                  </div>
+                  <div className="mt-1 text-[10px] text-blue-700">
+                    Liabilitas Saldo Deposit
+                  </div>
+                </div>
               </div>
+
+              {/* Ringkasan Arus Kas & Biaya Operasional */}
+              <div className="mt-4 pt-3 border-t border-[#F1EBE0] space-y-2 text-xs sm:text-sm">
+                <div className="flex justify-between items-center">
+                  <span className="text-[#5C4A3D]">Total Biaya Operasional</span>
+                  <span className="font-medium text-red-700">
+                    {money(c?.operating_cost != null ? c.operating_cost : (c?.cost || 0), cur)}
+                    <Cmp v={cmp?.cost} reverseColor={true} />
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-[#5C4A3D]">Laba Operasi</span>
+                  <span className="font-bold text-[#8B5A2B]">
+                    {money(c?.operating_profit || 0, cur)}
+                    <Cmp v={cmp?.operating_profit} />
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-[#5C4A3D]">Net Arus Kas (Inflow - Outflow)</span>
+                  <span className="font-semibold text-[#2C1E16]">
+                    {money(c?.cash_flow || 0, cur)}
+                  </span>
+                </div>
+              </div>
+
+              {/* Lima Metrik Sekunder (Option A: Accordion) */}
+              <Accordion type="single" collapsible className="mt-3 border-t border-[#F1EBE0]">
+                <AccordionItem value="secondary-metrics" className="border-none">
+                  <AccordionTrigger className="py-2.5 text-xs text-[#8B5A2B] font-semibold hover:no-underline">
+                    Lihat Metrik Posisi Keuangan & Kredit Lainnya ({cur})
+                  </AccordionTrigger>
+                  <AccordionContent className="pt-1 pb-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs bg-[#FAF5EE] p-3 rounded-xl border border-[#E5DCC5]">
+                      <div className="flex justify-between items-center py-1 border-b border-[#EFE6D5]">
+                        <span className="text-[#5C4A3D]">Uang Muka Pelanggan (DP):</span>
+                        <span className="font-semibold text-[#2C1E16]">{money(c?.customer_advances || 0, cur)}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1 border-b border-[#EFE6D5]">
+                        <span className="text-[#5C4A3D]">Piutang Usaha:</span>
+                        <span className="font-semibold text-[#2C1E16]">{money(c?.accounts_receivable || 0, cur)}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1 border-b sm:border-b-0 border-[#EFE6D5]">
+                        <span className="text-[#5C4A3D]">Kredit Digunakan (Belanja):</span>
+                        <span className="font-semibold text-[#2C1E16]">{money(c?.credit_applied || 0, cur)}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1">
+                        <span className="text-[#5C4A3D]">Kredit Dikembalikan (Refund):</span>
+                        <span className="font-semibold text-[#2C1E16]">{money(c?.credit_refunded || 0, cur)}</span>
+                      </div>
+                      <div className="col-span-1 sm:col-span-2 flex justify-between items-center pt-1 border-t border-[#EFE6D5]">
+                        <span className="text-[#5C4A3D]">Pendapatan Lain-lain:</span>
+                        <span className="font-semibold text-[#2C1E16]">{money(c?.other_income || 0, cur)}</span>
+                      </div>
+                    </div>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
             </div>
           );
         })}
