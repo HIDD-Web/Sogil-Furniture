@@ -15,12 +15,28 @@ import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
 import PermanentDeleteModal from "../../components/admin/PermanentDeleteModal";
 
+import { generateUUID } from "../../lib/utils";
+export { generateUUID };
+
+const INITIAL_PAYMENT_FORM = {
+  amount: "",
+  payment_method: "cash",
+  reference: "",
+  notes: "",
+  alloc_product: "",
+  alloc_shipping: "",
+  alloc_credit: "",
+  use_custom_alloc: false,
+  idempotency_key: "",
+};
+
 export default function AdminOrderDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
   const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
   const canEditPrice = user?.role === "owner" || user?.permissions?.access_finance;
+  const canAdjustPrice = canEditPrice && order?.order_status !== "selesai";
   const canModifyProducts = user?.role === "owner" || user?.permissions?.modify_products;
   const [order, setOrder] = useState(null);
   const [note, setNote] = useState("");
@@ -32,16 +48,7 @@ export default function AdminOrderDetail() {
   const [payments, setPayments] = useState([]);
   const [paymentModalOpen, setPaymentModalOpen] = useState(false);
   const [paymentLoading, setPaymentLoading] = useState(false);
-  const [paymentForm, setPaymentForm] = useState({
-    amount: "",
-    payment_method: "cash",
-    reference: "",
-    notes: "",
-    alloc_product: "",
-    alloc_shipping: "",
-    alloc_credit: "",
-    use_custom_alloc: false,
-  });
+  const [paymentForm, setPaymentForm] = useState(INITIAL_PAYMENT_FORM);
   const [priceForm, setPriceForm] = useState({
     subtotal_le: 0,
     delivery_fee_le: 0,
@@ -248,10 +255,17 @@ export default function AdminOrderDetail() {
 
   const handleRecordPayment = async (e) => {
     e.preventDefault();
+    if (paymentLoading) return;
+
     const amt = parseFloat(paymentForm.amount);
     if (!amt || amt <= 0) {
       toast.error("Nominal pembayaran harus lebih besar dari 0");
       return;
+    }
+
+    const currentIdemKey = paymentForm.idempotency_key || generateUUID();
+    if (!paymentForm.idempotency_key) {
+      setPaymentForm((prev) => ({ ...prev, idempotency_key: currentIdemKey }));
     }
 
     const payload = {
@@ -260,6 +274,7 @@ export default function AdminOrderDetail() {
       payment_method: paymentForm.payment_method,
       reference: paymentForm.reference || undefined,
       notes: paymentForm.notes || undefined,
+      idempotency_key: currentIdemKey,
     };
 
     if (paymentForm.use_custom_alloc) {
@@ -283,16 +298,7 @@ export default function AdminOrderDetail() {
       await api.post(`/admin/orders/${id}/payments`, payload);
       toast.success("Pembayaran berhasil dicatat & masuk kas keuangan");
       setPaymentModalOpen(false);
-      setPaymentForm({
-        amount: "",
-        payment_method: "cash",
-        reference: "",
-        notes: "",
-        alloc_product: "",
-        alloc_shipping: "",
-        alloc_credit: "",
-        use_custom_alloc: false,
-      });
+      setPaymentForm(INITIAL_PAYMENT_FORM);
       load();
     } catch (err) {
       toast.error(err.response?.data?.detail || "Gagal mencatat pembayaran");
@@ -627,7 +633,7 @@ export default function AdminOrderDetail() {
             <span className="font-heading text-sm font-bold uppercase tracking-wide text-[#8B5A2B]">
               Rincian Harga
             </span>
-            {canEditPrice && (
+            {canAdjustPrice && (
               <button
                 type="button"
                 onClick={openPriceModal}
@@ -759,6 +765,7 @@ export default function AdminOrderDetail() {
                         alloc_shipping: "",
                         alloc_credit: "",
                         use_custom_alloc: false,
+                        idempotency_key: generateUUID(),
                       });
                       setPaymentModalOpen(true);
                     }}
@@ -769,7 +776,14 @@ export default function AdminOrderDetail() {
                   </Button>
                 )}
                 <Button
-                  onClick={() => setPaymentModalOpen(true)}
+                  onClick={() => {
+                    setPaymentForm({
+                      ...INITIAL_PAYMENT_FORM,
+                      payment_method: order.payment_method || "cash",
+                      idempotency_key: generateUUID(),
+                    });
+                    setPaymentModalOpen(true);
+                  }}
                   data-testid="btn-record-payment"
                   className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
                 >

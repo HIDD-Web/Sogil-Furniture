@@ -2467,13 +2467,7 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
     if not order:
         raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
 
-    # 1. Idempotency Check
-    if payload.idempotency_key and payload.idempotency_key.strip():
-        existing_pmt = await db.payments.find_one({"idempotency_key": payload.idempotency_key.strip()})
-        if existing_pmt:
-            return clean(existing_pmt)
-
-    # 2. Validation
+    # 1. Validation & Normalization
     raw_amount = _num(payload.amount)
     if raw_amount <= 0:
         raise HTTPException(status_code=400, detail="Nominal pembayaran harus lebih besar dari 0")
@@ -2485,6 +2479,45 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
     payment_method = (payload.payment_method or "cash").strip().lower()
     if payment_method not in ("cash", "transfer", "customer_credit"):
         raise HTTPException(status_code=400, detail="Metode pembayaran harus cash, transfer, atau customer_credit")
+
+    idem_key = (payload.idempotency_key or "").strip() or None
+
+    def _is_matching_payment_payload(existing_doc: dict) -> bool:
+        orig_order_id = str(existing_doc.get("order_id") or "").strip()
+        req_order_id = str(order["_id"]).strip()
+
+        orig_amt = _num(existing_doc.get("amount_le", existing_doc.get("amount", 0.0)))
+        orig_amt_d = Decimal(str(orig_amt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        req_amt_d = Decimal(str(raw_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        orig_method = str(existing_doc.get("payment_method") or "").strip().lower()
+
+        if orig_order_id and orig_order_id != req_order_id:
+            return False
+        if orig_method and orig_method != payment_method:
+            return False
+        if orig_amt_d != req_amt_d:
+            return False
+
+        return True
+
+    # 2. Idempotency Check
+    if idem_key:
+        existing_pmt = await db.payments.find_one({"idempotency_key": idem_key})
+        if existing_pmt:
+            if not _is_matching_payment_payload(existing_pmt):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Kunci idempotensi telah digunakan untuk pembayaran dengan parameter yang berbeda."
+                )
+            res = clean(existing_pmt)
+            try:
+                new_summary = await compute_order_payment_summary(order)
+                if new_summary:
+                    res["order_summary"] = new_summary
+            except Exception:
+                pass
+            return res
 
     # Phase 3.B.3 Validation: Customer Credit requires a registered customer and positive EGP balance
     customer_doc = None
@@ -2705,7 +2738,7 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             cce_insert = getattr(db.customer_credit_events, "insert_one", None)
             if callable(cce_insert):
                 res_coro = cce_insert(apply_cce_doc, **ins_kw)
-                if asyncio.iscoroutine(res_coro):
+                if inspect.isawaitable(res_coro):
                     await res_coro
 
         # Phase 3.B.2: Customer Credit Event Creation for Qualifying Overpayment
@@ -2736,7 +2769,7 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             cce_insert = getattr(db.customer_credit_events, "insert_one", None)
             if callable(cce_insert):
                 res_coro = cce_insert(cce_doc, **ins_kw)
-                if asyncio.iscoroutine(res_coro):
+                if inspect.isawaitable(res_coro):
                     await res_coro
 
         return created_pmt_id, txn_id
@@ -2775,6 +2808,26 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
                 # Explicitly permitted standalone / test fallback
                 pmt_id, txn_id = await _do_create_payment(None)
             break
+        except pymongo.errors.DuplicateKeyError as dke:
+            err_msg = str(dke)
+            if idem_key and ("uniq_payments_idempotency" in err_msg or idem_key in err_msg):
+                winning_pmt = await db.payments.find_one({"idempotency_key": idem_key})
+                if winning_pmt:
+                    if not _is_matching_payment_payload(winning_pmt):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Kunci idempotensi telah digunakan untuk pembayaran dengan parameter yang berbeda."
+                        )
+                    res = clean(winning_pmt)
+                    try:
+                        fresh_order = await db.orders.find_one({"_id": order["_id"]})
+                        new_summary = await compute_order_payment_summary(fresh_order) if fresh_order else None
+                        if new_summary:
+                            res["order_summary"] = new_summary
+                    except Exception:
+                        pass
+                    return res
+            raise
         except Exception as txn_exc:
             if _is_transient_conflict(txn_exc):
                 logger.warning(
@@ -2870,7 +2923,7 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 {"source_payment_id": str(pmt["_id"]), "event_type": {"$in": ["credit_minted", "credit_applied"]}},
                 **ins_kw
             )
-            if asyncio.iscoroutine(cce_res):
+            if inspect.isawaitable(cce_res):
                 cce = await cce_res
 
         rev_cce_doc = None
@@ -2985,7 +3038,7 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
             cce_insert = getattr(db.customer_credit_events, "insert_one", None)
             if callable(cce_insert):
                 res_coro = cce_insert(rev_cce_doc, **ins_kw)
-                if asyncio.iscoroutine(res_coro):
+                if inspect.isawaitable(res_coro):
                     await res_coro
 
     session = None
