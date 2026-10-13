@@ -36,9 +36,9 @@ export default function AdminOrderDetail() {
   const { user } = useAuth();
   const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
   const canEditPrice = user?.role === "owner" || user?.permissions?.access_finance;
-  const canAdjustPrice = canEditPrice && order?.order_status !== "selesai";
   const canModifyProducts = user?.role === "owner" || user?.permissions?.modify_products;
   const [order, setOrder] = useState(null);
+  const canAdjustPrice = canEditPrice && order?.order_status !== "selesai";
   const [note, setNote] = useState("");
   const [loadError, setLoadError] = useState(null);
   const [priceModalOpen, setPriceModalOpen] = useState(false);

@@ -1,4 +1,117 @@
+import React, { act } from "react";
+import { createRoot } from "react-dom/client";
 import { generateUUID } from "../lib/utils";
+import AdminOrderDetail from "../pages/admin/AdminOrderDetail";
+
+jest.mock(
+  "@/lib/utils",
+  () => jest.requireActual("../lib/utils"),
+  { virtual: true }
+);
+
+jest.mock(
+  "react-router-dom",
+  () => ({
+    useParams: () => ({ id: "order-test-123" }),
+    useNavigate: () => jest.fn(),
+    Link: ({ children, to }) => <a href={to}>{children}</a>,
+  }),
+  { virtual: true }
+);
+
+jest.mock("../context/AuthContext", () => ({
+  useAuth: () => ({
+    user: {
+      role: "owner",
+      permissions: { access_finance: true, delete_data: true, modify_products: true },
+    },
+  }),
+}));
+
+global.IS_REACT_ACT_ENVIRONMENT = true;
+
+jest.mock("sonner", () => ({
+  toast: {
+    success: jest.fn(),
+    error: jest.fn(),
+    info: jest.fn(),
+  },
+}));
+
+import api from "../lib/api";
+jest.mock("../lib/api");
+
+describe("AdminOrderDetail - Component Mount & Regression Suite", () => {
+  let container = null;
+  let root = null;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const dummyOrder = {
+      _id: "order-test-123",
+      order_number: "SGF-2026-001",
+      order_status: "menunggu_pembayaran",
+      payment_status: "belum_dibayar",
+      payment_method: "cash",
+      total_le: 1500,
+      subtotal_le: 1300,
+      delivery_fee_le: 200,
+      items: [],
+      payments: [],
+    };
+    api.get.mockImplementation((url) => {
+      if (typeof url === "string" && url.includes("/payments")) {
+        return Promise.resolve({ data: { payments: [] } });
+      }
+      return Promise.resolve({ data: dummyOrder });
+    });
+    if (api.post) api.post.mockResolvedValue({ data: {} });
+    if (api.patch) api.patch.mockResolvedValue({ data: {} });
+    if (api.delete) api.delete.mockResolvedValue({ data: {} });
+  });
+
+  afterEach(() => {
+    act(() => {
+      if (root) root.unmount();
+    });
+    if (container && container.parentNode) {
+      container.parentNode.removeChild(container);
+    }
+    container = null;
+    root = null;
+    jest.clearAllMocks();
+  });
+
+  test("confirms TDZ ReferenceError is triggered if order is accessed before declaration", () => {
+    expect(() => {
+      const canEditPrice = true;
+      const canAdjustPrice = canEditPrice && testOrder?.order_status !== "selesai";
+      const [testOrder] = [null];
+      return canAdjustPrice;
+    }).toThrow(ReferenceError);
+  });
+
+  test("mounts AdminOrderDetail without Temporal Dead Zone ReferenceError", async () => {
+    await act(async () => {
+      root.render(<AdminOrderDetail />);
+    });
+    expect(container).toBeDefined();
+    expect(container.innerHTML).not.toBe("");
+  });
+
+  test("handles initial empty/loading state and renders order view without crashing", async () => {
+    await act(async () => {
+      root.render(<AdminOrderDetail />);
+    });
+    // Wait for async load()
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("SGF-2026-001");
+  });
+});
 
 describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => {
   describe("UUID v4 Generator (generateUUID)", () => {
