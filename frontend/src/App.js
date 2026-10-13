@@ -40,6 +40,7 @@ import AdminSettings from "./pages/admin/AdminSettings";
 import AdminAnalytics from "./pages/admin/AdminAnalytics";
 import AdminFinance from "./pages/admin/AdminFinance";
 import AdminFinanceStats from "./pages/admin/AdminFinanceStats";
+import AdminWorkerPendingWages from "./pages/admin/AdminWorkerPendingWages";
 import AdminExport from "./pages/admin/AdminExport";
 import AdminAdmins from "./pages/admin/AdminAdmins";
 import AdminDiscounts from "./pages/admin/AdminDiscounts";
@@ -129,6 +130,8 @@ function Layout() {
           <Route path="finance/statistik" element={<AdminFinanceStats />} />
           <Route path="finance/statistics" element={<QueryRedirect to="/admin/finance/statistik" />} />
           <Route path="statistik" element={<QueryRedirect to="/admin/finance/statistik" />} />
+          <Route path="wages/pending" element={<AdminWorkerPendingWages />} />
+          <Route path="wages" element={<Navigate to="/admin/wages/pending" replace />} />
           <Route path="export" element={<AdminExport />} />
           <Route path="discounts" element={<AdminDiscounts />} />
           <Route path="referrals" element={<AdminReferrals />} />

@@ -523,6 +523,19 @@ async def generate_credit_event_number() -> str:
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
 
+async def generate_wage_settlement_number() -> str:
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    counter_id = f"wst_{today}"
+    prefix = f"WST-{today}-"
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
 async def get_customer_credit_balance(customer_id: str, currency: str = "EGP", session=None) -> float:
     """
     Computes available customer credit balance from signed ledger events in db.customer_credit_events.
@@ -829,6 +842,23 @@ class WorkAssignmentRejectInput(BaseModel):
     rejection_reason: str
 
 class WorkAssignmentCancelInput(BaseModel):
+    reason: str
+
+class WageSettlementAllocationItem(BaseModel):
+    wage_obligation_id: str
+    amount_le: float
+
+class WageSettlementCreateInput(BaseModel):
+    worker_id: str
+    amount_le: float
+    payment_method: str = "cash"
+    payment_date: Optional[str] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = ""
+    allocations: Optional[List[WageSettlementAllocationItem]] = None
+    idempotency_key: Optional[str] = None
+
+class WageSettlementVoidInput(BaseModel):
     reason: str
 
 async def record_audit_log(
@@ -2158,7 +2188,7 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             # Query wage obligations
             linked_obligations = await db.wage_obligations.find({
                 "order_id": order_id_str,
-                "status": {"$in": ["accrued", "paid", "voided"]}
+                "status": {"$in": ["accrued", "partially_paid", "paid", "voided"]}
             }).to_list(1000)
 
             protected_item_ids = {a.get("order_item_id") for a in linked_assignments if a.get("order_item_id")}
@@ -2317,7 +2347,7 @@ async def admin_permanent_delete_order(
     try:
         wob_cursor = db.wage_obligations.find({
             "order_id": order_id_str,
-            "status": "accrued"
+            "status": {"$in": ["accrued", "partially_paid"]}
         })
         unpaid_obligations = await wob_cursor.to_list(100) if hasattr(wob_cursor, "to_list") else []
     except Exception:
@@ -3721,43 +3751,605 @@ async def admin_get_worker_pending_wages(
 
     obligations = await db.wage_obligations.find({
         "worker_id": worker_id,
-        "status": "accrued"
+        "status": {"$in": ["accrued", "partially_paid"]}
     }).to_list(1000)
 
+    total_accrued_le = round(sum(_num(o.get("total_amount_le")) for o in obligations), 2)
+    total_paid_le = round(sum(_num(o.get("paid_amount_le")) for o in obligations), 2)
     total_pending_le = round(sum(_num(o.get("total_amount_le")) - _num(o.get("paid_amount_le")) for o in obligations), 2)
+
+    cleaned_obligations = []
+    for o in obligations:
+        c_ob = clean(o)
+        c_ob["remaining_amount_le"] = max(0.0, round(_num(o.get("total_amount_le")) - _num(o.get("paid_amount_le")), 2))
+        cleaned_obligations.append(c_ob)
+
     return {
         "worker_id": worker_id,
         "worker_name": worker.get("name", "Worker"),
         "pending_obligations_count": len(obligations),
+        "total_accrued_le": total_accrued_le,
+        "total_paid_le": total_paid_le,
         "total_pending_wages_le": total_pending_le,
         "currency": "EGP",
-        "obligations": [clean(o) for o in obligations],
+        "obligations": cleaned_obligations,
     }
 
 @api_router.get("/admin/wages/pending-summary")
 async def admin_get_wages_pending_summary(
     admin: dict = Depends(require_finance_or_owner())
 ):
-    obligations = await db.wage_obligations.find({"status": "accrued"}).to_list(2000)
+    obligations = await db.wage_obligations.find({
+        "status": {"$in": ["accrued", "partially_paid"]}
+    }).to_list(2000)
 
+    total_accrued_le = 0.0
+    total_paid_le = 0.0
     total_pending_le = 0.0
     by_worker = {}
     for o in obligations:
         wid = o.get("worker_id")
         wname = o.get("worker_name", "Worker")
-        amt = _num(o.get("total_amount_le")) - _num(o.get("paid_amount_le"))
+        tot = _num(o.get("total_amount_le"))
+        paid = _num(o.get("paid_amount_le"))
+        amt = max(0.0, tot - paid)
+        total_accrued_le += tot
+        total_paid_le += paid
         total_pending_le += amt
         if wid not in by_worker:
-            by_worker[wid] = {"worker_id": wid, "worker_name": wname, "total_le": 0.0, "count": 0}
+            by_worker[wid] = {
+                "worker_id": wid,
+                "worker_name": wname,
+                "total_accrued_le": 0.0,
+                "total_paid_le": 0.0,
+                "total_le": 0.0,
+                "count": 0
+            }
+        by_worker[wid]["total_accrued_le"] = round(by_worker[wid]["total_accrued_le"] + tot, 2)
+        by_worker[wid]["total_paid_le"] = round(by_worker[wid]["total_paid_le"] + paid, 2)
         by_worker[wid]["total_le"] = round(by_worker[wid]["total_le"] + amt, 2)
         by_worker[wid]["count"] += 1
 
     return {
+        "total_accrued_le": round(total_accrued_le, 2),
+        "total_paid_le": round(total_paid_le, 2),
         "total_pending_wages_le": round(total_pending_le, 2),
         "currency": "EGP",
         "pending_obligations_count": len(obligations),
         "workers_summary": list(by_worker.values()),
     }
+
+@api_router.get("/admin/wage-obligations")
+async def admin_get_wage_obligations(
+    worker_id: Optional[str] = None,
+    status: Optional[str] = None,
+    order_id: Optional[str] = None,
+    limit: int = 500,
+    skip: int = 0,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    query = {}
+    if worker_id:
+        query["worker_id"] = worker_id
+    if order_id:
+        query["order_id"] = order_id
+    if status and status != "all":
+        if status == "pending":
+            query["status"] = {"$in": ["accrued", "partially_paid"]}
+        else:
+            query["status"] = status
+
+    docs = await db.wage_obligations.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    total_count = await db.wage_obligations.count_documents(query)
+
+    results = []
+    for d in docs:
+        cd = clean(d)
+        cd["remaining_amount_le"] = max(0.0, round(_num(d.get("total_amount_le")) - _num(d.get("paid_amount_le")), 2))
+        results.append(cd)
+
+    return {
+        "total": total_count,
+        "limit": limit,
+        "skip": skip,
+        "obligations": results
+    }
+
+@api_router.post("/admin/wages/settlements")
+async def admin_create_wage_settlement(
+    payload: WageSettlementCreateInput,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    worker_id = str(payload.worker_id or "").strip()
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id wajib diisi")
+
+    worker = await db.admins.find_one({"_id": id_query(worker_id)})
+    if not worker:
+        raise HTTPException(status_code=404, detail="Pekerja tidak ditemukan")
+    worker_name = worker.get("name", "Worker")
+
+    disbursed_amount = round(float(payload.amount_le), 2)
+    if disbursed_amount <= 0:
+        raise HTTPException(status_code=422, detail="Nominal pembayaran harus lebih besar dari 0")
+
+    payment_method = (payload.payment_method or "cash").strip().lower()
+    if payment_method not in ("cash", "bank_transfer", "other"):
+        payment_method = "cash"
+
+    idem_key = (payload.idempotency_key or "").strip() or None
+    if idem_key:
+        winning = await db.wage_settlements.find_one({"idempotency_key": idem_key})
+        if winning:
+            if str(winning.get("worker_id")) != worker_id or round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or winning.get("payment_method") != payment_method:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
+                )
+            return clean(winning)
+
+    # Fetch eligible pending obligations for this worker
+    worker_obligations = await db.wage_obligations.find({
+        "worker_id": worker_id,
+        "status": {"$in": ["accrued", "partially_paid"]}
+    }).sort("created_at", 1).to_list(1000)
+
+    if not worker_obligations:
+        raise HTTPException(status_code=400, detail="Tidak ada kewajiban upah terutang untuk pekerja ini")
+
+    total_pending_all = round(sum(_num(o.get("total_amount_le")) - _num(o.get("paid_amount_le")) for o in worker_obligations), 2)
+    if disbursed_amount > total_pending_all:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Nominal pembayaran ({disbursed_amount} LE) melebihi total kewajiban terutang ({total_pending_all} LE)"
+        )
+
+    resolved_allocations = []
+    if payload.allocations and len(payload.allocations) > 0:
+        alloc_map = {}
+        for item in payload.allocations:
+            item_ob_id = str(item.wage_obligation_id).strip()
+            item_amt = round(float(item.amount_le), 2)
+            if item_amt <= 0:
+                raise HTTPException(status_code=422, detail="Nominal alokasi harus lebih besar dari 0")
+            if item_ob_id in alloc_map:
+                raise HTTPException(status_code=422, detail="Duplikasi alokasi untuk kewajiban yang sama")
+            alloc_map[item_ob_id] = item_amt
+
+        if round(sum(alloc_map.values()), 2) != disbursed_amount:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Total alokasi ({round(sum(alloc_map.values()), 2)} LE) harus sama persis dengan nominal pembayaran ({disbursed_amount} LE)"
+            )
+
+        ob_by_id = {str(o.get("_id")): o for o in worker_obligations}
+        for o in worker_obligations:
+            if o.get("id"):
+                ob_by_id[str(o["id"])] = o
+
+        for ob_id, alloc_amt in alloc_map.items():
+            ob = ob_by_id.get(ob_id)
+            if not ob:
+                raise HTTPException(status_code=404, detail=f"Kewajiban upah {ob_id} tidak ditemukan atau bukan milik pekerja ini")
+            rem = round(_num(ob.get("total_amount_le")) - _num(ob.get("paid_amount_le")), 2)
+            if alloc_amt > rem:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Nominal alokasi ({alloc_amt} LE) melebihi sisa kewajiban ({rem} LE) untuk {ob.get('obligation_number')}"
+                )
+            prev_paid = _num(ob.get("paid_amount_le"))
+            new_paid = round(prev_paid + alloc_amt, 2)
+            tot_amt = _num(ob.get("total_amount_le"))
+            status_after = "paid" if new_paid >= tot_amt else "partially_paid"
+            resolved_allocations.append({
+                "wage_obligation_id": str(ob["_id"]),
+                "obligation_number": ob.get("obligation_number"),
+                "amount_le": alloc_amt,
+                "previous_paid_amount_le": prev_paid,
+                "new_paid_amount_le": new_paid,
+                "obligation_total_amount_le": tot_amt,
+                "obligation_status_after": status_after,
+            })
+    else:
+        # Automatic FIFO allocation
+        remaining_to_allocate = disbursed_amount
+        for ob in worker_obligations:
+            if remaining_to_allocate <= 0:
+                break
+            ob_rem = round(_num(ob.get("total_amount_le")) - _num(ob.get("paid_amount_le")), 2)
+            if ob_rem <= 0:
+                continue
+            alloc_amt = min(remaining_to_allocate, ob_rem)
+            remaining_to_allocate = round(remaining_to_allocate - alloc_amt, 2)
+            prev_paid = _num(ob.get("paid_amount_le"))
+            new_paid = round(prev_paid + alloc_amt, 2)
+            tot_amt = _num(ob.get("total_amount_le"))
+            status_after = "paid" if new_paid >= tot_amt else "partially_paid"
+            resolved_allocations.append({
+                "wage_obligation_id": str(ob["_id"]),
+                "obligation_number": ob.get("obligation_number"),
+                "amount_le": alloc_amt,
+                "previous_paid_amount_le": prev_paid,
+                "new_paid_amount_le": new_paid,
+                "obligation_total_amount_le": tot_amt,
+                "obligation_status_after": status_after,
+            })
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    settlement_date = (payload.payment_date or now_iso[:10]).strip()
+    settlement_num = await generate_wage_settlement_number()
+
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    counterpart_idr = round(disbursed_amount * settings_rate)
+
+    txn_doc = {
+        "date": settlement_date,
+        "type": "expense",
+        "category": "Pekerja",
+        "amount": disbursed_amount,
+        "currency": "EGP",
+        "account": "EGP",
+        "exchange_rate": settings_rate,
+        "counterpart_amount": counterpart_idr,
+        "counterpart_currency": "IDR",
+        "classification": "cost",
+        "description": f"Pembayaran upah pekerja {worker_name} ({settlement_num})",
+        "recipient_employee_id": worker_id,
+        "recipient_employee_name": worker_name,
+        "related_settlement_number": settlement_num,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+        "updated_by_name": admin.get("name", "Admin"),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    settlement_doc = {
+        "settlement_number": settlement_num,
+        "worker_id": worker_id,
+        "worker_name": worker_name,
+        "settlement_date": settlement_date,
+        "amount_le": disbursed_amount,
+        "currency": "EGP",
+        "payment_method": payment_method,
+        "reference": (payload.reference or "").strip(),
+        "notes": (payload.notes or "").strip(),
+        "allocations": resolved_allocations,
+        "finance_transaction_id": None,
+        "status": "recorded",
+        "idempotency_key": idem_key,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name", "Admin"),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    async def _do_settle(session):
+        ins_kw = {"session": session} if session else {}
+
+        # 1. Insert finance transaction
+        res_txn = await db.finance_transactions.insert_one(txn_doc, **ins_kw)
+        txn_id = str(res_txn.inserted_id)
+        settlement_doc["finance_transaction_id"] = txn_id
+
+        # 2. Insert employee_wages mirror
+        await db.employee_wages.insert_one({
+            "employee_id": worker_id,
+            "employee_name": worker_name,
+            "amount": disbursed_amount,
+            "currency": "EGP",
+            "date": settlement_date,
+            "category": "Pekerja",
+            "description": txn_doc["description"],
+            "transaction_id": txn_id,
+            "recorded_by_name": admin.get("name", "Admin"),
+            "created_at": now_iso
+        }, **ins_kw)
+
+        # 3. Insert wage settlement
+        res_wst = await db.wage_settlements.insert_one(settlement_doc, **ins_kw)
+        settlement_id = str(res_wst.inserted_id)
+        settlement_doc["_id"] = res_wst.inserted_id
+
+        # 4. Link settlement on finance transaction
+        await db.finance_transactions.update_one(
+            {"_id": res_txn.inserted_id},
+            {"$set": {"wage_settlement_id": settlement_id}},
+            **ins_kw
+        )
+
+        # 5. Mutate each wage obligation with optimistic concurrency check
+        for a in resolved_allocations:
+            ob_id = a["wage_obligation_id"]
+            alloc_amt = a["amount_le"]
+            prev_paid = a["previous_paid_amount_le"]
+            new_paid = a["new_paid_amount_le"]
+            new_status = a["obligation_status_after"]
+            alloc_record = {
+                "settlement_id": settlement_id,
+                "settlement_number": settlement_num,
+                "amount_le": alloc_amt,
+                "date": settlement_date,
+                "created_at": now_iso
+            }
+            res_ob = await db.wage_obligations.update_one(
+                {
+                    "_id": id_query(ob_id),
+                    "paid_amount_le": prev_paid,
+                    "status": {"$in": ["accrued", "partially_paid"]}
+                },
+                {
+                    "$set": {
+                        "paid_amount_le": new_paid,
+                        "status": new_status,
+                        "updated_at": now_iso
+                    },
+                    "$push": {
+                        "settlement_allocations": alloc_record
+                    }
+                },
+                **ins_kw
+            )
+            if res_ob.modified_count == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Saldo kewajiban upah ({a['obligation_number']}) telah berubah oleh proses lain. Harap muat ulang."
+                )
+        return settlement_id
+
+    created_id = None
+    session = None
+    try:
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+            if not is_standalone_fallback_permitted():
+                logger.error(f"Transaction capability unavailable for wage settlement in mode {get_environment_mode()!r}: {sess_err}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                )
+            session = None
+
+        if session is not None:
+            async with session:
+                async with session.start_transaction():
+                    created_id = await _do_settle(session)
+        else:
+            # Standalone fallback with compensating rollback
+            try:
+                created_id = await _do_settle(None)
+            except Exception as se:
+                if settlement_doc.get("finance_transaction_id"):
+                    tid = settlement_doc["finance_transaction_id"]
+                    try:
+                        await db.finance_transactions.delete_one({"_id": id_query(tid)})
+                        await db.employee_wages.delete_many({"transaction_id": tid})
+                    except Exception:
+                        pass
+                if settlement_doc.get("_id"):
+                    try:
+                        await db.wage_settlements.delete_one({"_id": settlement_doc["_id"]})
+                    except Exception:
+                        pass
+                if settlement_num:
+                    try:
+                        await db.wage_obligations.update_many(
+                            {"settlement_allocations.settlement_number": settlement_num},
+                            {"$pull": {"settlement_allocations": {"settlement_number": settlement_num}}}
+                        )
+                        for a in resolved_allocations:
+                            ob_id = a.get("wage_obligation_id")
+                            if ob_id:
+                                ob_cur = await db.wage_obligations.find_one({"_id": id_query(ob_id)})
+                                if ob_cur:
+                                    recomputed_paid = round(sum(_num(alloc.get("amount_le")) for alloc in ob_cur.get("settlement_allocations", [])), 2)
+                                    recomputed_status = "accrued" if recomputed_paid <= 0 else ("paid" if recomputed_paid >= _num(ob_cur.get("total_amount_le")) else "partially_paid")
+                                    await db.wage_obligations.update_one(
+                                        {"_id": ob_cur["_id"]},
+                                        {"$set": {"paid_amount_le": recomputed_paid, "status": recomputed_status}}
+                                    )
+                    except Exception:
+                        pass
+                raise se
+    except pymongo.errors.DuplicateKeyError as dke:
+        err_msg = str(dke)
+        if idem_key and ("uniq_wage_settlements_idempotency" in err_msg or idem_key in err_msg):
+            winning = await db.wage_settlements.find_one({"idempotency_key": idem_key})
+            if winning:
+                if str(winning.get("worker_id")) != worker_id or round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or winning.get("payment_method") != payment_method:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
+                    )
+                return clean(winning)
+        raise HTTPException(status_code=409, detail=f"Konflik data terdeteksi: {dke}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during wage settlement: {e}")
+        raise HTTPException(status_code=500, detail=f"Kesalahan sistem saat mencatat pembayaran upah: {e}")
+
+    await record_audit_log(
+        action="WAGE_SETTLEMENT_RECORDED",
+        entity_type="wage_settlement",
+        entity_id=created_id,
+        entity_identifier=f"{worker_name}:{settlement_num}",
+        admin=admin,
+        metadata={
+            "settlement_number": settlement_num,
+            "worker_id": worker_id,
+            "amount_le": disbursed_amount,
+            "payment_method": payment_method,
+            "allocations_count": len(resolved_allocations),
+        }
+    )
+
+    clean_settlement = clean(settlement_doc)
+    return clean_settlement
+
+@api_router.get("/admin/wages/settlements")
+async def admin_get_wage_settlements(
+    worker_id: Optional[str] = None,
+    status: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 200,
+    skip: int = 0,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    query = {}
+    if worker_id:
+        query["worker_id"] = worker_id
+    if status and status != "all":
+        query["status"] = status
+    if start_date or end_date:
+        query["settlement_date"] = {}
+        if start_date:
+            query["settlement_date"]["$gte"] = start_date
+        if end_date:
+            query["settlement_date"]["$lte"] = end_date
+
+    docs = await db.wage_settlements.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    total_count = await db.wage_settlements.count_documents(query)
+    return {
+        "total": total_count,
+        "limit": limit,
+        "skip": skip,
+        "settlements": [clean(d) for d in docs]
+    }
+
+@api_router.get("/admin/wages/settlements/{settlement_id}")
+async def admin_get_wage_settlement_detail(
+    settlement_id: str,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    st = await db.wage_settlements.find_one({"_id": id_query(settlement_id)})
+    if not st:
+        raise HTTPException(status_code=404, detail="Pembayaran upah (settlement) tidak ditemukan")
+    return clean(st)
+
+@api_router.post("/admin/wages/settlements/{settlement_id}/void")
+async def admin_void_wage_settlement(
+    settlement_id: str,
+    payload: WageSettlementVoidInput,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    st = await db.wage_settlements.find_one({"_id": id_query(settlement_id)})
+    if not st:
+        raise HTTPException(status_code=404, detail="Pembayaran upah (settlement) tidak ditemukan")
+
+    if st.get("status") == "voided":
+        raise HTTPException(status_code=400, detail="Pembayaran upah telah dibatalkan sebelumnya")
+
+    reason = (payload.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Alasan pembatalan wajib diisi")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    allocations = st.get("allocations") or []
+    sid_str = str(st.get("_id") or settlement_id)
+    txn_id = st.get("finance_transaction_id")
+
+    async def _do_void(session):
+        ins_kw = {"session": session} if session else {}
+
+        # 1. Void wage settlement document
+        await db.wage_settlements.update_one(
+            {"_id": st["_id"]},
+            {"$set": {
+                "status": "voided",
+                "void_reason": reason,
+                "voided_by_id": admin.get("id"),
+                "voided_by_name": admin.get("name", "Admin"),
+                "voided_at": now_iso,
+                "updated_at": now_iso
+            }},
+            **ins_kw
+        )
+
+        # 2. Reverse allocations on wage_obligations
+        for a in allocations:
+            ob_id = a.get("wage_obligation_id")
+            alloc_amt = _num(a.get("amount_le"))
+            ob = await db.wage_obligations.find_one({"_id": id_query(ob_id)}, **ins_kw)
+            if ob:
+                cur_paid = _num(ob.get("paid_amount_le"))
+                new_paid = max(0.0, round(cur_paid - alloc_amt, 2))
+                new_status = "accrued" if new_paid <= 0 else "partially_paid"
+                await db.wage_obligations.update_one(
+                    {"_id": ob["_id"]},
+                    {
+                        "$set": {
+                            "paid_amount_le": new_paid,
+                            "status": new_status,
+                            "updated_at": now_iso
+                        },
+                        "$pull": {
+                            "settlement_allocations": {"settlement_id": sid_str}
+                        }
+                    },
+                    **ins_kw
+                )
+
+        # 3. Void linked finance_transaction
+        if txn_id:
+            await db.finance_transactions.update_one(
+                {"_id": id_query(txn_id)},
+                {"$set": {
+                    "is_void": True,
+                    "status": "void",
+                    "void_source": "wage_settlement_void",
+                    "void_reason": reason,
+                    "voided_by_id": admin.get("id"),
+                    "voided_by_name": admin.get("name", "Admin"),
+                    "voided_at": now_iso,
+                    "updated_at": now_iso
+                }},
+                **ins_kw
+            )
+            # 4. Remove from employee_wages mirror
+            await db.employee_wages.delete_many({"transaction_id": txn_id}, **ins_kw)
+
+    session = None
+    try:
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+            if not is_standalone_fallback_permitted():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                )
+            session = None
+
+        if session is not None:
+            async with session:
+                async with session.start_transaction():
+                    await _do_void(session)
+        else:
+            await _do_void(None)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error voiding wage settlement: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal membatalkan pembayaran upah: {e}")
+
+    await record_audit_log(
+        action="WAGE_SETTLEMENT_VOIDED",
+        entity_type="wage_settlement",
+        entity_id=sid_str,
+        entity_identifier=f"{st.get('worker_name')}:{st.get('settlement_number')}",
+        admin=admin,
+        metadata={
+            "settlement_number": st.get("settlement_number"),
+            "amount_le": st.get("amount_le"),
+            "reason": reason
+        }
+    )
+
+    updated_st = await db.wage_settlements.find_one({"_id": st["_id"]})
+    return clean(updated_st)
 
 
 # --------------------------------------------------------------------------
@@ -5290,6 +5882,18 @@ async def finance_update(txn_id: str, data: FinanceTxnInput, admin: dict = Depen
     if t.get("is_void") or t.get("status") == "void":
         raise HTTPException(status_code=400, detail="Transaksi yang telah dibatalkan tidak dapat diedit")
 
+    # Guard: Wage obligation settlement linkage
+    if t.get("wage_settlement_id") or t.get("related_settlement_number"):
+        st_ref = t.get("related_settlement_number") or t.get("wage_settlement_id")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Transaksi keuangan ini terhubung langsung dengan pelunasan upah pekerja ({st_ref}). "
+                "Pengeditan langsung melalui modul keuangan dilarang untuk menjaga integritas saldo kewajiban upah. "
+                "Gunakan pembatalan pelunasan resmi melalui menu Upah Pekerja jika diperlukan."
+            )
+        )
+
     is_order_rev = (t.get("type") == "order_revenue")
     existing_rate = _num(t.get("exchange_rate"))
     settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
@@ -5413,6 +6017,19 @@ async def finance_delete(txn_id: str, admin: dict = Depends(require_perm("access
             detail=(
                 "Transaksi ini terhubung dengan transaksi kredit atau pengembalian saldo kredit pelanggan. "
                 "Pembatalan langsung dari modul keuangan dilarang untuk menjaga konsistensi buku besar kredit."
+            )
+        )
+
+    # Guard 4: Wage obligation settlement linkage
+    is_settlement_linked = bool(t.get("wage_settlement_id") or t.get("related_settlement_number"))
+    if is_settlement_linked:
+        st_ref = t.get("related_settlement_number") or t.get("wage_settlement_id")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Transaksi keuangan ini terhubung langsung dengan pelunasan upah pekerja ({st_ref}). "
+                "Pembatalan langsung melalui modul keuangan dilarang untuk menjaga integritas saldo kewajiban upah. "
+                "Silakan batalkan melalui menu Upah Pekerja."
             )
         )
 
@@ -7291,11 +7908,21 @@ async def seed():
             unique=True,
             name="uniq_wage_obligation_accrual_event"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: wage_obligations 'uniq_wage_obligation_accrual_event' creation failed: {e}")
+        raise CriticalFinanceIndexError("wage_obligations", "uniq_wage_obligation_accrual_event", str(e))
+
+    try:
         await db.wage_obligations.create_index(
             [("obligation_number", 1)],
             unique=True,
             name="uniq_obligation_number"
         )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: wage_obligations 'uniq_obligation_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("wage_obligations", "uniq_obligation_number", str(e))
+
+    try:
         await db.wage_obligations.create_index(
             [("work_assignment_id", 1)],
             name="idx_wage_obligations_assignment"
@@ -7307,6 +7934,39 @@ async def seed():
         await db.wage_obligations.create_index(
             [("order_id", 1), ("order_item_id", 1)],
             name="idx_wage_obligations_order_item"
+        )
+    except Exception:
+        pass
+
+    try:
+        await db.wage_settlements.create_index(
+            [("settlement_number", 1)],
+            unique=True,
+            name="uniq_settlement_number"
+        )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: wage_settlements 'uniq_settlement_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("wage_settlements", "uniq_settlement_number", str(e))
+
+    try:
+        await db.wage_settlements.create_index(
+            [("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$type": "string"}},
+            name="uniq_wage_settlements_idempotency"
+        )
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: wage_settlements 'uniq_wage_settlements_idempotency' creation failed: {e}")
+        raise CriticalFinanceIndexError("wage_settlements", "uniq_wage_settlements_idempotency", str(e))
+
+    try:
+        await db.wage_settlements.create_index(
+            [("worker_id", 1), ("settlement_date", -1)],
+            name="idx_wage_settlements_worker_date"
+        )
+        await db.wage_settlements.create_index(
+            [("finance_transaction_id", 1)],
+            name="idx_wage_settlements_finance_txn"
         )
     except Exception:
         pass

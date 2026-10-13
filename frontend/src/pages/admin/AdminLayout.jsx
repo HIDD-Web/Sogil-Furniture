@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import api from "../../lib/api";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone, CircleDollarSign } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import PwaInstallModal from "../../components/PwaInstallModal";
 
@@ -33,6 +33,7 @@ export default function AdminLayout() {
     { to: "/admin/products", label: "Produk", icon: Package, show: perms.modify_products || isOwner },
     { to: "/admin/materials", label: "Bahan", icon: Layers, show: perms.modify_products || perms.access_finance || isOwner },
     { to: "/admin/finance", label: "Keuangan", icon: Wallet, show: perms.access_finance || isOwner },
+    { to: "/admin/wages/pending", label: "Upah Pekerja", icon: CircleDollarSign, show: perms.access_finance || isOwner },
     { to: "/admin/export", label: "Export Data", icon: Wallet, show: perms.access_finance || perms.manage_orders || isOwner },
     { to: "/admin/discounts", label: "Diskon", icon: Ticket, show: perms.manage_settings || isOwner },
     { to: "/admin/referrals", label: "Referral", icon: Gift, show: perms.manage_settings || isOwner },

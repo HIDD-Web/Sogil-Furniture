@@ -1479,6 +1479,8 @@ class TestPhase3B6FinanceAdjustments(unittest.IsolatedAsyncioTestCase):
         mock_db.work_assignments.create_index = AsyncMock()
         mock_db.wage_obligations = MagicMock()
         mock_db.wage_obligations.create_index = AsyncMock()
+        mock_db.wage_settlements = MagicMock()
+        mock_db.wage_settlements.create_index = AsyncMock()
         mock_db.customer_credit_events = MagicMock()
         mock_db.customer_credit_events.create_index = AsyncMock()
         mock_db.categories = MagicMock()
