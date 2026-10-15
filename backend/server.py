@@ -11,9 +11,10 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response as StarletteResponse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 import logging
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
+from enum import Enum
 import secrets
 import inspect
 import json
@@ -62,6 +63,17 @@ def id_query(v) -> dict:
             pass
 
     return {"$in": values}
+
+def multi_id_query(id_list) -> list:
+    res = []
+    for val in id_list:
+        val_str = str(val)
+        res.append(val_str)
+        try:
+            res.append(ObjectId(val_str))
+        except (InvalidId, TypeError):
+            pass
+    return res
 
 # --------------------------------------------------------------------------
 # Object storage
@@ -456,6 +468,7 @@ CONTROLLED_TASK_CATEGORIES = {
     "finishing",
     "cutting",
     "custom",
+    "delivery",
 }
 
 def normalize_cash_balance(val, currency: str) -> Decimal:
@@ -497,15 +510,17 @@ def calculate_wage_obligation_amount(agreed_rate_le: float, accepted_qty: int, p
         d_total = d_rate
     return float(d_total)
 
-async def generate_obligation_number() -> str:
+async def generate_obligation_number(session=None) -> str:
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     counter_id = f"wob_{today}"
     prefix = f"WOB-{today}-"
+    kw = {"session": session} if session else {}
     res = await db.counters.find_one_and_update(
         {"_id": counter_id},
         {"$inc": {"seq": 1}},
         upsert=True,
-        return_document=ReturnDocument.AFTER
+        return_document=ReturnDocument.AFTER,
+        **kw
     )
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
@@ -535,6 +550,28 @@ async def generate_wage_settlement_number() -> str:
     )
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
+
+async def generate_trip_number(session=None) -> str:
+    """Generates sequential, concurrency-safe trip numbers formatted as TRP-YYYYMMDD-XXXX."""
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    counter_id = f"trp_{today}"
+    prefix = f"TRP-{today}-"
+    kw = {"session": session} if session else {}
+    res = await db.counters.find_one_and_update(
+        {"_id": counter_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+        **kw
+    )
+    seq = res["seq"]
+    return f"{prefix}{seq:04d}"
+
+def build_delivery_accrual_event_key(order_id: str, worker_id: str) -> str:
+    """Builds the authoritative, deterministic wage accrual event key for delivery tasks.
+    Isolated by (order_id, worker_id) without trip dependency to guarantee cross-trip idempotency.
+    """
+    return f"acc_del_{str(order_id).strip()}_{str(worker_id).strip()}"
 
 async def get_customer_credit_balance(customer_id: str, currency: str = "EGP", session=None) -> float:
     """
@@ -867,7 +904,8 @@ async def record_audit_log(
     entity_id: str,
     entity_identifier: str,
     admin: dict,
-    metadata: Optional[dict] = None
+    metadata: Optional[dict] = None,
+    session: Optional[Any] = None
 ):
     doc = {
         "action": action,
@@ -879,7 +917,8 @@ async def record_audit_log(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "metadata": metadata or {},
     }
-    await db.audit_logs.insert_one(doc)
+    kw = {"session": session} if session else {}
+    await db.audit_logs.insert_one(doc, **kw)
 
 # --------------------------------------------------------------------------
 # Pricing engine
@@ -2119,6 +2158,22 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             detail="Status pembayaran tidak dapat diubah secara manual. Status dikelola secara otomatis melalui pencatatan pembayaran riil."
         )
 
+    # Phase 3.F.4.3 Package 8.1 — Active Delivery Trip Order Guard
+    active_trip_id = existing_order.get("active_delivery_trip_id")
+    if active_trip_id:
+        has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
+        has_conflicting_mutation = (
+            data.order_status is not None or
+            data.payment_method is not None or
+            has_price_change
+        )
+        if has_conflicting_mutation:
+            trip_ref = existing_order.get("active_delivery_trip_number") or active_trip_id
+            raise HTTPException(
+                status_code=409,
+                detail=f"Pesanan sedang terikat pada trip pengiriman aktif ({trip_ref}). Lepaskan penugasan dari trip sebelum memodifikasi status atau rincian pesanan."
+            )
+
     # Phase 3.B.1 — Handover Recognition & Status Transition Checks
     existing_status = existing_order.get("order_status")
     has_immutable_snapshot = (
@@ -2357,6 +2412,14 @@ async def admin_permanent_delete_order(
         raise HTTPException(
             status_code=409,
             detail="Tidak dapat menghapus permanen pesanan yang masih memiliki kewajiban upah terutang (unpaid wage obligations)."
+        )
+
+    # Phase 3.F.4.3 Package 8.1 — Active Delivery Trip Permanent Delete Guard
+    if order.get("active_delivery_trip_id"):
+        trip_ref = order.get("active_delivery_trip_number") or order.get("active_delivery_trip_id")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tidak dapat menghapus permanen pesanan yang sedang terikat pada trip pengiriman aktif ({trip_ref}). Selesaikan atau lepaskan pesanan dari trip terlebih dahulu."
         )
 
     # Isolated delete: ONLY remove this order document.
@@ -4865,6 +4928,1527 @@ async def admin_update_zone(zone_id: str, data: DeliveryZoneInput, admin: dict =
 async def admin_delete_zone(zone_id: str, admin: dict = Depends(require_perm("manage_settings"))):
     await db.delivery_zones.delete_one({"_id": id_query(zone_id)})
     return {"ok": True}
+
+# --------------------------------------------------------------------------
+# Phase 3.F.4.1: Logistics & Delivery Trip Core Engine
+# --------------------------------------------------------------------------
+
+class DeliveryTripStatus(str, Enum):
+    DRAFT = "draft"
+    SCHEDULED = "scheduled"
+    IN_TRANSIT = "in_transit"
+    PARTIALLY_COMPLETED = "partially_completed"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+class StopOutcome(str, Enum):
+    PENDING = "pending"
+    OUT_FOR_DELIVERY = "out_for_delivery"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    FAILED_CLOSED = "failed_closed"
+    CANCELLED = "cancelled"
+
+VALID_TRIP_TRANSITIONS = {
+    DeliveryTripStatus.DRAFT.value: {DeliveryTripStatus.SCHEDULED.value, DeliveryTripStatus.CANCELLED.value},
+    DeliveryTripStatus.SCHEDULED.value: {DeliveryTripStatus.DRAFT.value, DeliveryTripStatus.IN_TRANSIT.value, DeliveryTripStatus.CANCELLED.value},
+    DeliveryTripStatus.IN_TRANSIT.value: {DeliveryTripStatus.PARTIALLY_COMPLETED.value, DeliveryTripStatus.COMPLETED.value, DeliveryTripStatus.CANCELLED.value},
+    DeliveryTripStatus.PARTIALLY_COMPLETED.value: {DeliveryTripStatus.COMPLETED.value},
+    DeliveryTripStatus.COMPLETED.value: set(),
+    DeliveryTripStatus.CANCELLED.value: set(),
+}
+
+VALID_STOP_TRANSITIONS = {
+    StopOutcome.PENDING.value: {StopOutcome.OUT_FOR_DELIVERY.value, StopOutcome.CANCELLED.value},
+    StopOutcome.OUT_FOR_DELIVERY.value: {StopOutcome.DELIVERED.value, StopOutcome.FAILED.value},
+    StopOutcome.FAILED.value: {StopOutcome.OUT_FOR_DELIVERY.value, StopOutcome.FAILED_CLOSED.value, StopOutcome.CANCELLED.value},
+    StopOutcome.DELIVERED.value: set(),
+    StopOutcome.FAILED_CLOSED.value: set(),
+    StopOutcome.CANCELLED.value: set(),
+}
+
+class DeliveryTripVehicleRentalInput(BaseModel):
+    is_rented: bool = True
+    rental_provider: str = Field(..., min_length=2, description="Nama penyedia rental pick-up")
+    vehicle_plate_or_desc: str = Field(..., min_length=2, description="Plat nomor atau deskripsi armada")
+    driver_provided_by_rental: bool = True
+    rental_driver_name: str = Field(..., min_length=2, description="Nama sopir bawaan dari rental")
+    agreed_rental_cost_le: float = Field(0.0, ge=0.0, description="Biaya sewa yang disepakati (LE)")
+    agreement_reference: Optional[str] = None
+    notes: Optional[str] = None
+
+class DeliveryTripCreateInput(BaseModel):
+    scheduled_date: str = Field(..., description="Tanggal jadwal keberangkatan YYYY-MM-DD")
+    departure_time: Optional[str] = Field(None, description="Perkiraan jam keberangkatan HH:MM")
+    trip_wage_rate_le: float = Field(0.0, ge=0.0, description="Tarif upah per helper per pesanan berhasil")
+    helper_ids: List[str] = Field(default_factory=list, description="Daftar ID helper internal dari db.admins")
+    vehicle_rental: DeliveryTripVehicleRentalInput
+    notes: Optional[str] = None
+
+class DeliveryTripStatusUpdateInput(BaseModel):
+    target_status: str
+    reason: Optional[str] = None
+
+class DeliveryTripAddStopInput(BaseModel):
+    order_id: str
+    notes: Optional[str] = None
+
+class DeliveryTripStopAttemptInput(BaseModel):
+    outcome: str = Field(..., description="'failed' atau 'out_for_delivery' (untuk retry)")
+    failure_reason: Optional[str] = None
+    notes: Optional[str] = None
+
+class DeliveryTripCancelInput(BaseModel):
+    reason: str = Field(..., min_length=5, description="Alasan pembatalan trip wajib diisi")
+
+class DeliveryTripCompleteInput(BaseModel):
+    notes: Optional[str] = None
+
+class DeliveryWagePolicyInput(BaseModel):
+    base_wage_per_order_le: float = Field(..., ge=0.0, description="Tarif dasar upah per pesanan/lokasi yang berhasil diantar")
+    unusual_amount_threshold_le: float = Field(..., gt=0.0, description="Batas konfirmasi nominal tidak wajar")
+    max_helper_wage_per_order_le: Optional[float] = Field(None, ge=0.0, description="Batas atas upah (cap) per pesanan")
+    currency: Optional[str] = "EGP"
+    rounding_policy: Optional[str] = "piastre_round_half_up"
+
+class DeliveryWagePreviewInput(BaseModel):
+    total_wage_le: Optional[float] = None
+    helpers: List[Dict[str, Any]] = Field(default_factory=list, description="Daftar helper untuk kalkulasi pembagian")
+    trip_id: Optional[str] = None
+    order_id: Optional[str] = None
+
+class DeliveryStopHandoverInput(BaseModel):
+    recipient_name: Optional[str] = None
+    handover_notes: Optional[str] = None
+    helper_confirmed: Optional[bool] = False
+    custom_wage_le: Optional[float] = None
+    confirmed_unusual_amount: Optional[bool] = False
+    override_reason: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+def validate_trip_state_transition(current_status: str, target_status: str, trip_doc: Optional[dict] = None) -> None:
+    valid_targets = VALID_TRIP_TRANSITIONS.get(current_status, set())
+    if target_status not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transisi status trip tidak valid dari '{current_status}' ke '{target_status}'. Target yang diizinkan: {sorted(list(valid_targets))}"
+        )
+    if target_status == DeliveryTripStatus.CANCELLED.value and trip_doc:
+        check_trip_can_be_cancelled(trip_doc)
+
+def validate_stop_state_transition(current_outcome: str, target_outcome: str) -> None:
+    valid_targets = VALID_STOP_TRANSITIONS.get(current_outcome, set())
+    if target_outcome not in valid_targets:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Transisi status stop tidak valid dari '{current_outcome}' ke '{target_outcome}'. Target yang diizinkan: {sorted(list(valid_targets))}"
+        )
+
+def check_trip_can_be_cancelled(trip: dict) -> None:
+    for stop in trip.get("stops", []):
+        if stop.get("outcome") == StopOutcome.DELIVERED.value:
+            raise HTTPException(
+                status_code=409,
+                detail="Trip tidak dapat dibatalkan karena memuat pesanan yang telah diserahterimakan (delivered). Gunakan penutupan trip parsial."
+            )
+
+def check_trip_can_be_completed(trip: dict) -> None:
+    for stop in trip.get("stops", []):
+        if stop.get("outcome") in (StopOutcome.PENDING.value, StopOutcome.OUT_FOR_DELIVERY.value):
+            raise HTTPException(
+                status_code=409,
+                detail="Trip tidak dapat diselesaikan karena masih memuat stop yang aktif (pending atau out_for_delivery)."
+            )
+
+async def validate_delivery_trip_wage_cap(rate_le: float, session=None) -> float:
+    """
+    FAIL-CLOSED check for Authoritative Owner Wage Cap.
+    Owner has not set the cap yet.
+    If cap is missing, None, or <= 0: rejects dispatch with HTTP 422.
+    No default values, no Manager bypass.
+    """
+    policy = await get_setting("delivery_wage_policy", None)
+    if not policy or not isinstance(policy, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Batas atas upah pengiriman (cap) belum ditetapkan oleh Owner. Penetapan tarif dan dispatch trip terkunci (Fail-Closed)."
+        )
+    cap = policy.get("max_helper_wage_per_order_le")
+    if cap is None or _num(cap) <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Batas atas upah pengiriman (cap) belum ditetapkan oleh Owner. Penetapan tarif dan dispatch trip terkunci (Fail-Closed)."
+        )
+    cap_val = _num(cap)
+    if _num(rate_le) > cap_val:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Tarif upah trip ({rate_le} LE) melebihi batas atas yang ditetapkan Owner ({cap_val} LE)."
+        )
+    return cap_val
+
+async def get_active_delivery_wage_policy(db_inst=None) -> dict:
+    """
+    Returns the active delivery wage policy from db.settings.
+    If not explicitly configured, provides the approved initial business defaults:
+    - Base helper wage: 50.0 EGP per successfully delivered order/location.
+    - Unusual amount confirmation threshold: 500.0 EGP per order/location.
+    - Currency: EGP.
+    - Rounding policy: Exact integer piastres (ROUND_HALF_UP).
+    """
+    d = db_inst if db_inst is not None else db
+    doc = None
+    if hasattr(d, "settings") and hasattr(d.settings, "find_one"):
+        res = d.settings.find_one({"key": "delivery_wage_policy"})
+        doc = await res if inspect.isawaitable(res) else res
+
+    val = doc.get("value") if doc and isinstance(doc.get("value"), dict) else {}
+    return {
+        "base_wage_per_order_le": _num(val.get("base_wage_per_order_le"), 50.0),
+        "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), 500.0),
+        "max_helper_wage_per_order_le": _num(val.get("max_helper_wage_per_order_le"), val.get("unusual_amount_threshold_le", 500.0)),
+        "currency": val.get("currency", "EGP"),
+        "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
+        "updated_at": val.get("updated_at"),
+        "updated_by_id": val.get("updated_by_id"),
+        "updated_by_name": val.get("updated_by_name"),
+        "is_configured": bool(val)
+    }
+
+def calculate_delivery_helper_wage_allocations(total_wage_le: float, helpers: list) -> list:
+    """
+    Divides total_wage_le equally among helpers using smallest currency unit: one piastre (0.01 EGP).
+    Guarantees:
+    - Sum of all helper allocations always equals exactly total_wage_le (zero money lost or created).
+    - Residual piastres distributed deterministically to first r helpers.
+    - Uses exact integer arithmetic in piastres (no binary floating-point drift).
+    """
+    n = len(helpers)
+    if n == 0:
+        return []
+
+    d_wage = Decimal(str(total_wage_le)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    total_piastres = int(d_wage * 100)
+    if total_piastres < 0:
+        raise ValueError("Nominal upah tidak boleh bernilai negatif")
+
+    quotient = total_piastres // n
+    remainder = total_piastres % n
+
+    allocations = []
+    for i, h in enumerate(helpers):
+        h_piastres = quotient + 1 if i < remainder else quotient
+        h_amount_le = float(Decimal(h_piastres) / Decimal(100))
+        allocations.append({
+            "worker_id": str(h.get("helper_id") or h.get("worker_id") or h.get("id")),
+            "worker_name": h.get("helper_name") or h.get("worker_name") or h.get("name", "Helper"),
+            "amount_piastres": h_piastres,
+            "amount_le": h_amount_le,
+        })
+
+    total_allocated_piastres = sum(a["amount_piastres"] for a in allocations)
+    assert total_allocated_piastres == total_piastres, f"Rounding invariant violation: {total_allocated_piastres} != {total_piastres}"
+    return allocations
+
+async def verify_delivery_wage_indexes_pre_migration(db_inst) -> dict:
+    """
+    Performs pre-migration integrity inspection on db.wage_obligations for task_category 'delivery'.
+    Ensures no duplicate (order_id, worker_id) documents exist prior to partial unique index provisioning.
+    If duplicates are detected, raises CriticalFinanceIndexError (fail-closed).
+    """
+    pipeline = [
+        {"$match": {"task_category": "delivery"}},
+        {"$group": {
+            "_id": {"order_id": "$order_id", "worker_id": "$worker_id"},
+            "count": {"$sum": 1},
+            "ids": {"$push": "$_id"}
+        }},
+        {"$match": {"count": {"$gt": 1}}}
+    ]
+    if hasattr(db_inst, "wage_obligations") and hasattr(db_inst.wage_obligations, "aggregate"):
+        cursor = db_inst.wage_obligations.aggregate(pipeline)
+        to_list_fn = getattr(cursor, "to_list", None)
+        if callable(to_list_fn):
+            res_coro = to_list_fn(100)
+            duplicates = await res_coro if inspect.isawaitable(res_coro) else []
+        else:
+            duplicates = []
+    else:
+        duplicates = []
+    if duplicates:
+        err_msg = f"Pre-migration duplicate check failed: found {len(duplicates)} duplicate delivery wage entitlement groups"
+        logger.error(f"CRITICAL PRE-MIGRATION FAILURE: {err_msg}")
+        raise CriticalFinanceIndexError("wage_obligations", "uniq_delivery_wage_order_worker", err_msg)
+    return {"ok": True, "duplicate_count": 0}
+
+async def _execute_delivery_tx_or_fail_closed(coro_fn):
+    session = None
+    try:
+        session = await client.start_session()
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+        if not is_standalone_fallback_permitted():
+            logger.error(f"Transaction capability unavailable in mode {get_environment_mode()!r}: {sess_err}")
+            raise HTTPException(
+                status_code=503,
+                detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+            )
+        session = None
+
+    if session is not None:
+        try:
+            async with session:
+                async with session.start_transaction():
+                    return await coro_fn(session)
+        except pymongo.errors.PyMongoError as e:
+            is_transient = (hasattr(e, "has_error_label") and e.has_error_label("TransientTransactionError")) or \
+                           (isinstance(e, pymongo.errors.OperationFailure) and getattr(e, "code", None) == 112)
+            if is_transient:
+                logger.warning(f"Delivery transaction concurrency conflict: {e}")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Konflik konkurensi: Dokumen sedang dimutasi oleh transaksi lain. Silakan coba kembali."
+                )
+            raise
+    else:
+        return await coro_fn(None)
+
+async def assign_order_to_trip_core(trip_id: str, order_id: str, admin: dict, session=None) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)}, session=session)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+    if trip.get("status") not in (DeliveryTripStatus.DRAFT.value, DeliveryTripStatus.SCHEDULED.value):
+        raise HTTPException(status_code=409, detail=f"Tidak dapat menambah pesanan ke trip dengan status '{trip.get('status')}'.")
+
+    # Check if order already has an active stop on this trip
+    for s in trip.get("stops", []):
+        if str(s.get("order_id")) == str(order_id) and s.get("outcome") != StopOutcome.CANCELLED.value:
+            raise HTTPException(status_code=409, detail="Pesanan sudah terdaftar pada trip ini.")
+
+    order_doc = await db.orders.find_one({"_id": id_query(order_id)}, session=session)
+    if not order_doc:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+    if order_doc.get("order_status") != "siap":
+        raise HTTPException(status_code=409, detail=f"Pesanan tidak siap untuk pengantaran (status: '{order_doc.get('order_status')}').")
+    if order_doc.get("delivery_method") != "delivery":
+        raise HTTPException(status_code=422, detail=f"Metode pengiriman pesanan bukan 'delivery' ('{order_doc.get('delivery_method')}').")
+    if order_doc.get("active_delivery_trip_id"):
+        raise HTTPException(status_code=409, detail=f"Pesanan sudah terikat pada trip aktif {order_doc.get('active_delivery_trip_number') or order_doc.get('active_delivery_trip_id')}.")
+
+    # Conditional atomic update on db.orders
+    res_order = await db.orders.update_one(
+        {
+            "_id": id_query(order_id),
+            "order_status": "siap",
+            "delivery_method": "delivery",
+            "active_delivery_trip_id": None
+        },
+        {
+            "$set": {
+                "active_delivery_trip_id": str(trip["_id"]),
+                "active_delivery_trip_number": trip["trip_number"],
+                "delivery_logistics_status": "scheduled",
+                "updated_at": now_iso,
+                "updated_by_id": admin.get("id"),
+                "updated_by_name": admin.get("name")
+            },
+            "$push": {
+                "status_history": {
+                    "from_status": "siap",
+                    "to_status": "siap",
+                    "changed_at": now_iso,
+                    "changed_by_id": admin.get("id"),
+                    "changed_by_name": admin.get("name"),
+                    "reason": f"Ditugaskan ke Trip {trip['trip_number']}"
+                }
+            }
+        },
+        session=session
+    )
+    if res_order.matched_count == 0:
+        raise HTTPException(status_code=409, detail="Konflik penugasan: pesanan telah diklaim atau berubah status oleh proses lain.")
+
+    # Push stop to trip
+    new_seq = len(trip.get("stops", [])) + 1
+    stop_id = f"stp_{uuid.uuid4().hex[:12]}"
+    stop_doc = {
+        "stop_id": stop_id,
+        "sequence": new_seq,
+        "order_id": str(order_id),
+        "order_number": order_doc.get("order_number") or str(order_id),
+        "customer_name": order_doc.get("customer_name") or "Pelanggan",
+        "customer_phone": order_doc.get("customer_phone") or order_doc.get("phone_number") or "",
+        "customer_address": order_doc.get("customer_address") or "",
+        "customer_maps_url": order_doc.get("customer_maps_url") or "",
+        "delivery_zone": order_doc.get("delivery_zone") or order_doc.get("shipping_zone") or "",
+        "outcome": StopOutcome.PENDING.value,
+        "attempt_count": 0,
+        "attempts": [],
+        "failure_reason": None,
+        "delivered_at": None,
+        "recipient_name": None,
+        "handover_notes": None,
+        "helper_confirmed": False,
+        "created_at": now_iso,
+        "updated_at": now_iso
+    }
+
+    res_trip = await db.delivery_trips.update_one(
+        {"_id": trip["_id"], "status": {"$in": [DeliveryTripStatus.DRAFT.value, DeliveryTripStatus.SCHEDULED.value]}},
+        {
+            "$push": {"stops": stop_doc},
+            "$inc": {"stops_count": 1},
+            "$set": {
+                "updated_at": now_iso,
+                "updated_by_id": admin.get("id"),
+                "updated_by_name": admin.get("name")
+            }
+        },
+        session=session
+    )
+    if res_trip.matched_count == 0:
+        raise HTTPException(status_code=409, detail="Trip telah berubah status atau tidak dapat menerima penugasan baru.")
+
+    updated_trip = await db.delivery_trips.find_one({"_id": trip["_id"]}, session=session)
+    return clean(updated_trip)
+
+async def release_order_from_trip_core(trip_id: str, order_id: str, admin: dict, session=None) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)}, session=session)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+    if trip.get("status") not in (DeliveryTripStatus.DRAFT.value, DeliveryTripStatus.SCHEDULED.value):
+        raise HTTPException(status_code=409, detail=f"Tidak dapat melepaskan pesanan dari trip dengan status '{trip.get('status')}'.")
+
+    target_stop = None
+    for s in trip.get("stops", []):
+        if str(s.get("order_id")) == str(order_id):
+            target_stop = s
+            break
+    if not target_stop:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan dalam daftar stop trip ini")
+    if target_stop.get("outcome") == StopOutcome.DELIVERED.value:
+        raise HTTPException(status_code=409, detail="Stop yang telah diserahterimakan (delivered) tidak dapat dilepaskan dari trip.")
+
+    # 1. Pull stop from trip
+    res_trip = await db.delivery_trips.update_one(
+        {"_id": trip["_id"], "status": {"$in": [DeliveryTripStatus.DRAFT.value, DeliveryTripStatus.SCHEDULED.value]}},
+        {
+            "$pull": {"stops": {"order_id": str(order_id)}},
+            "$inc": {"stops_count": -1},
+            "$set": {
+                "updated_at": now_iso,
+                "updated_by_id": admin.get("id"),
+                "updated_by_name": admin.get("name")
+            }
+        },
+        session=session
+    )
+    if res_trip.matched_count == 0:
+        raise HTTPException(status_code=409, detail="Trip telah berubah status atau tidak dapat dimodifikasi.")
+
+    # 2. Release order lock conditionally
+    res_order = await db.orders.update_one(
+        {
+            "_id": id_query(order_id),
+            "active_delivery_trip_id": str(trip["_id"])
+        },
+        {
+            "$set": {
+                "active_delivery_trip_id": None,
+                "active_delivery_trip_number": None,
+                "delivery_logistics_status": "unassigned",
+                "updated_at": now_iso,
+                "updated_by_id": admin.get("id"),
+                "updated_by_name": admin.get("name")
+            },
+            "$push": {
+                "status_history": {
+                    "from_status": "siap",
+                    "to_status": "siap",
+                    "changed_at": now_iso,
+                    "changed_by_id": admin.get("id"),
+                    "changed_by_name": admin.get("name"),
+                    "reason": f"Dilepas dari penugasan Trip {trip.get('trip_number')}"
+                }
+            }
+        },
+        session=session
+    )
+    if res_order.matched_count == 0:
+        raise HTTPException(status_code=409, detail="Pesanan tidak terikat pada trip ini atau telah dimodifikasi proses lain.")
+
+    updated_trip = await db.delivery_trips.find_one({"_id": trip["_id"]}, session=session)
+    return clean(updated_trip)
+
+async def cancel_trip_multi_stop_core(trip_id: str, reason: str, admin: dict, session=None) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)}, session=session)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+    if trip.get("status") in (DeliveryTripStatus.CANCELLED.value, DeliveryTripStatus.COMPLETED.value):
+        raise HTTPException(status_code=409, detail=f"Trip telah berada dalam status terminal '{trip.get('status')}'.")
+
+    check_trip_can_be_cancelled(trip)
+    active_order_ids = [s["order_id"] for s in trip.get("stops", []) if s.get("outcome") != StopOutcome.DELIVERED.value]
+
+    # 1. Update trip and non-delivered stops
+    res_trip = await db.delivery_trips.update_one(
+        {
+            "_id": trip["_id"],
+            "status": {"$in": [DeliveryTripStatus.DRAFT.value, DeliveryTripStatus.SCHEDULED.value, DeliveryTripStatus.IN_TRANSIT.value]},
+            "stops.outcome": {"$ne": StopOutcome.DELIVERED.value}
+        },
+        {
+            "$set": {
+                "status": DeliveryTripStatus.CANCELLED.value,
+                "cancellation_reason": reason.strip(),
+                "cancelled_at": now_iso,
+                "cancelled_by_id": admin.get("id"),
+                "cancelled_by_name": admin.get("name"),
+                "updated_at": now_iso,
+                "updated_by_id": admin.get("id"),
+                "updated_by_name": admin.get("name"),
+                "stops.$[elem].outcome": StopOutcome.CANCELLED.value
+            }
+        },
+        array_filters=[{"elem.outcome": {"$in": [StopOutcome.PENDING.value, StopOutcome.OUT_FOR_DELIVERY.value, StopOutcome.FAILED.value]}}],
+        session=session
+    )
+    if res_trip.matched_count == 0:
+        raise HTTPException(status_code=409, detail="Trip telah berubah status, dibatalkan oleh pengguna lain, atau memuat stop yang sudah delivered.")
+
+    # 2. Bulk release orders
+    if active_order_ids:
+        res_orders = await db.orders.update_many(
+            {
+                "_id": {"$in": multi_id_query(active_order_ids)},
+                "active_delivery_trip_id": str(trip["_id"])
+            },
+            {
+                "$set": {
+                    "active_delivery_trip_id": None,
+                    "active_delivery_trip_number": None,
+                    "delivery_logistics_status": "unassigned",
+                    "updated_at": now_iso,
+                    "updated_by_id": admin.get("id"),
+                    "updated_by_name": admin.get("name")
+                },
+                "$push": {
+                    "status_history": {
+                        "from_status": "siap",
+                        "to_status": "siap",
+                        "changed_at": now_iso,
+                        "changed_by_id": admin.get("id"),
+                        "changed_by_name": admin.get("name"),
+                        "reason": f"Pelepasan penugasan logistik: Trip {trip.get('trip_number')} dibatalkan ({reason.strip()})"
+                    }
+                }
+            },
+            session=session
+        )
+        if res_orders.matched_count != len(active_order_ids):
+            raise HTTPException(status_code=409, detail="Inkonsistensi penugasan pesanan. Pembatalan trip dibatalkan total.")
+
+    updated_trip = await db.delivery_trips.find_one({"_id": trip["_id"]}, session=session)
+    return clean(updated_trip)
+
+async def complete_trip_partial_core(trip_id: str, notes: Optional[str], admin: dict, session=None) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)}, session=session)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+    if trip.get("status") == DeliveryTripStatus.COMPLETED.value:
+        return clean(trip)
+    if trip.get("status") not in (DeliveryTripStatus.IN_TRANSIT.value, DeliveryTripStatus.PARTIALLY_COMPLETED.value):
+        raise HTTPException(status_code=409, detail=f"Hanya trip dalam status 'in_transit' atau 'partially_completed' yang dapat diselesaikan (status saat ini: '{trip.get('status')}').")
+
+    stops = trip.get("stops", [])
+    delivered_stops = [s for s in stops if s.get("outcome") == StopOutcome.DELIVERED.value]
+    delivered_count = len(delivered_stops)
+    pending_count = sum(1 for s in stops if s.get("outcome") in (StopOutcome.PENDING.value, StopOutcome.OUT_FOR_DELIVERY.value))
+    failed_stops = [s for s in stops if s.get("outcome") == StopOutcome.FAILED.value]
+    all_failed_stops = [s for s in stops if s.get("outcome") in (StopOutcome.FAILED.value, StopOutcome.FAILED_CLOSED.value)]
+
+    if delivered_count == 0:
+        raise HTTPException(status_code=409, detail="Trip tidak memiliki stop yang berhasil diserahterimakan (delivered). Untuk membatalkan trip, gunakan alur pembatalan.")
+    if pending_count > 0:
+        raise HTTPException(status_code=409, detail=f"Masih terdapat {pending_count} stop aktif (pending/out_for_delivery). Selesaikan atau tandai gagal seluruh stop sebelum menutup trip.")
+
+    admin_id = str(admin.get("id") or admin.get("_id") or "")
+    admin_name = admin.get("name") or "Dispatcher"
+    is_partial = len(all_failed_stops) > 0
+    target_status = DeliveryTripStatus.COMPLETED.value
+
+    # 1. Update trip document
+    trip_update_doc = {
+        "status": target_status,
+        "is_partially_completed": is_partial,
+        "completed_at": now_iso,
+        "completion_notes": (notes or "").strip(),
+        "delivered_stops_count": delivered_count,
+        "failed_stops_count": len(all_failed_stops),
+        "updated_at": now_iso,
+        "updated_by_id": admin_id,
+        "updated_by_name": admin_name
+    }
+
+    if failed_stops:
+        await db.delivery_trips.update_one(
+            {"_id": trip["_id"]},
+            {
+                "$set": {
+                    **trip_update_doc,
+                    "stops.$[elem].outcome": StopOutcome.FAILED_CLOSED.value
+                }
+            },
+            array_filters=[{"elem.outcome": StopOutcome.FAILED.value}],
+            session=session
+        )
+        # Release locks on failed orders
+        failed_order_ids = [s["order_id"] for s in failed_stops]
+        await db.orders.update_many(
+            {
+                "_id": {"$in": multi_id_query(failed_order_ids)},
+                "active_delivery_trip_id": str(trip["_id"])
+            },
+            {
+                "$set": {
+                    "active_delivery_trip_id": None,
+                    "active_delivery_trip_number": None,
+                    "delivery_logistics_status": "delivery_failed",
+                    "updated_at": now_iso,
+                    "updated_by_id": admin_id,
+                    "updated_by_name": admin_name
+                },
+                "$push": {
+                    "status_history": {
+                        "from_status": "siap",
+                        "to_status": "siap",
+                        "changed_at": now_iso,
+                        "changed_by_id": admin_id,
+                        "changed_by_name": admin_name,
+                        "reason": f"Pengantaran gagal pada Trip {trip.get('trip_number')}. Kembali ke antrean siap kirim."
+                    }
+                }
+            },
+            session=session
+        )
+    else:
+        # All delivered
+        await db.delivery_trips.update_one(
+            {"_id": trip["_id"]},
+            {"$set": trip_update_doc},
+            session=session
+        )
+
+    # 2. Ghost lock elimination on delivered orders: unset active trip lock
+    delivered_order_ids = [s["order_id"] for s in delivered_stops]
+    if delivered_order_ids:
+        await db.orders.update_many(
+            {
+                "_id": {"$in": multi_id_query(delivered_order_ids)},
+                "active_delivery_trip_id": str(trip["_id"])
+            },
+            {
+                "$set": {
+                    "active_delivery_trip_id": None,
+                    "active_delivery_trip_number": None,
+                    "updated_at": now_iso,
+                    "updated_by_id": admin_id,
+                    "updated_by_name": admin_name
+                }
+            },
+            session=session
+        )
+
+    updated_trip = await db.delivery_trips.find_one({"_id": trip["_id"]}, session=session)
+    return clean(updated_trip)
+
+async def record_delivery_attempt_core(trip_id: str, order_id: str, payload: DeliveryTripStopAttemptInput, admin: dict, session=None) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)}, session=session)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+    if trip.get("status") != DeliveryTripStatus.IN_TRANSIT.value:
+        raise HTTPException(status_code=409, detail=f"Pencatatan percobaan pengantaran hanya dapat dilakukan pada trip dengan status 'in_transit' (status saat ini: '{trip.get('status')}').")
+
+    stop = None
+    for s in trip.get("stops", []):
+        if str(s.get("order_id")) == str(order_id):
+            stop = s
+            break
+    if not stop:
+        raise HTTPException(status_code=404, detail="Stop untuk pesanan ini tidak ditemukan pada trip")
+
+    outcome = payload.outcome.strip().lower()
+    if outcome == StopOutcome.FAILED.value:
+        validate_stop_state_transition(stop.get("outcome"), StopOutcome.FAILED.value)
+        reason_clean = (payload.failure_reason or "").strip()
+        if len(reason_clean) < 3:
+            raise HTTPException(status_code=422, detail="Alasan kegagalan pengantaran wajib diisi (minimal 3 karakter).")
+
+        attempt_doc = {
+            "attempt_number": len(stop.get("attempts", [])) + 1,
+            "attempted_at": now_iso,
+            "outcome": StopOutcome.FAILED.value,
+            "failure_reason": reason_clean,
+            "notes": (payload.notes or "").strip(),
+            "recorded_by_id": str(admin.get("id") or admin.get("_id") or ""),
+            "recorded_by_name": admin.get("name", "Dispatcher")
+        }
+
+        await db.delivery_trips.update_one(
+            {"_id": trip["_id"], "stops.order_id": str(order_id)},
+            {
+                "$set": {
+                    "stops.$.outcome": StopOutcome.FAILED.value,
+                    "stops.$.failure_reason": reason_clean,
+                    "stops.$.updated_at": now_iso,
+                    "updated_at": now_iso,
+                    "updated_by_id": str(admin.get("id") or admin.get("_id") or ""),
+                    "updated_by_name": admin.get("name", "Dispatcher")
+                },
+                "$inc": {"stops.$.attempt_count": 1},
+                "$push": {"stops.$.attempts": attempt_doc}
+            },
+            session=session
+        )
+
+        status_history_entry = {
+            "from_status": "siap",
+            "to_status": "siap",
+            "changed_at": now_iso,
+            "changed_by_id": str(admin.get("id") or admin.get("_id") or ""),
+            "changed_by_name": admin.get("name", "Dispatcher"),
+            "reason": f"Percobaan pengantaran #{attempt_doc['attempt_number']} gagal: {reason_clean}"
+        }
+
+        await db.orders.update_one(
+            {"_id": id_query(order_id), "active_delivery_trip_id": str(trip["_id"])},
+            {
+                "$set": {
+                    "delivery_logistics_status": "delivery_attempt_failed",
+                    "updated_at": now_iso
+                },
+                "$push": {"status_history": status_history_entry}
+            },
+            session=session
+        )
+
+    elif outcome == StopOutcome.OUT_FOR_DELIVERY.value:
+        validate_stop_state_transition(stop.get("outcome"), StopOutcome.OUT_FOR_DELIVERY.value)
+        await db.delivery_trips.update_one(
+            {"_id": trip["_id"], "stops.order_id": str(order_id)},
+            {
+                "$set": {
+                    "stops.$.outcome": StopOutcome.OUT_FOR_DELIVERY.value,
+                    "stops.$.updated_at": now_iso,
+                    "updated_at": now_iso,
+                    "updated_by_id": str(admin.get("id") or admin.get("_id") or ""),
+                    "updated_by_name": admin.get("name", "Dispatcher")
+                }
+            },
+            session=session
+        )
+        status_history_entry = {
+            "from_status": "siap",
+            "to_status": "siap",
+            "changed_at": now_iso,
+            "changed_by_id": str(admin.get("id") or admin.get("_id") or ""),
+            "changed_by_name": admin.get("name", "Dispatcher"),
+            "reason": f"Pengantaran dicoba kembali (Retry) pada Trip {trip.get('trip_number') or trip_id}"
+        }
+        await db.orders.update_one(
+            {"_id": id_query(order_id), "active_delivery_trip_id": str(trip["_id"])},
+            {
+                "$set": {
+                    "delivery_logistics_status": "retry_in_progress",
+                    "updated_at": now_iso
+                },
+                "$push": {"status_history": status_history_entry}
+            },
+            session=session
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Outcome '{outcome}' tidak didukung pada endpoint record-attempt. Pilihan: 'failed', 'out_for_delivery'."
+        )
+
+    updated_trip = await db.delivery_trips.find_one({"_id": trip["_id"]}, session=session)
+    return clean(updated_trip)
+
+async def execute_order_handover_completion(
+    order_id: str,
+    admin: dict,
+    now_iso: Optional[str] = None,
+    session=None,
+    delivery_context: Optional[dict] = None,
+    order_doc: Optional[dict] = None
+) -> dict:
+    """
+    Centralized canonical helper for transitioning an order to 'selesai' and recognizing revenue.
+    Preserves 100% of canonical behavior (Phase 3.F.4 Architecture Specification Section 6.1):
+    1. Validates order existence and active status.
+    2. Enforces concurrency protection and idempotent snapshot stamping:
+       - completed_at (preserves existing if already set)
+       - completed_by_id / completed_by_name
+       - recognized_revenue_le = total_le (preserves existing if already set)
+    3. Stamps delivery logistics metadata if delivery_context is provided:
+       - delivery_logistics_status = 'delivered'
+       - delivered_trip_id
+       - delivered_trip_number
+    4. Records immutable status_history entry (from_status -> 'selesai').
+    5. Atomic update under MongoDB session if provided.
+    """
+    if now_iso is None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+    if order_doc is None:
+        order_doc = await db.orders.find_one({"_id": id_query(order_id)}, session=session)
+    if not order_doc:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    if delivery_context:
+        trip_id = delivery_context.get("trip_id")
+        if order_doc.get("order_status") == "selesai":
+            if str(order_doc.get("active_delivery_trip_id")) != str(trip_id) and str(order_doc.get("delivered_trip_id")) != str(trip_id):
+                raise HTTPException(status_code=409, detail="Pesanan telah selesai di luar alur pengantaran trip ini.")
+        elif order_doc.get("order_status") != "siap":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Pesanan tidak dalam status siap antar (status: '{order_doc.get('order_status')}')."
+            )
+
+    total_le = _num(order_doc.get("total_le", 0.0))
+    admin_id = str(admin.get("id") or admin.get("_id") or "")
+    admin_name = admin.get("name", "Admin")
+
+    order_update = {
+        "order_status": "selesai",
+        "completed_at": order_doc.get("completed_at") or now_iso,
+        "completed_by_id": admin_id,
+        "completed_by_name": admin_name,
+        "recognized_revenue_le": order_doc.get("recognized_revenue_le") if order_doc.get("recognized_revenue_le") is not None else total_le,
+        "updated_at": now_iso,
+        "updated_by_id": admin_id,
+        "updated_by_name": admin_name,
+    }
+
+    if delivery_context:
+        order_update["delivery_logistics_status"] = "delivered"
+        if delivery_context.get("trip_id"):
+            order_update["delivered_trip_id"] = str(delivery_context["trip_id"])
+        if delivery_context.get("trip_number"):
+            order_update["delivered_trip_number"] = delivery_context["trip_number"]
+
+    reason = (delivery_context.get("reason") if delivery_context else None) or "Penyelesaian pesanan (serah terima fisik berhasil)"
+    status_history_entry = {
+        "from_status": order_doc.get("order_status"),
+        "to_status": "selesai",
+        "changed_at": now_iso,
+        "changed_by_id": admin_id,
+        "changed_by_name": admin_name,
+        "reason": reason
+    }
+
+    res_ord = await db.orders.update_one(
+        {"_id": order_doc["_id"]},
+        {
+            "$set": order_update,
+            "$push": {"status_history": status_history_entry}
+        },
+        session=session
+    )
+    if res_ord.modified_count == 0 and order_doc.get("order_status") != "selesai":
+        raise HTTPException(status_code=409, detail="Gagal memperbarui status pesanan. Kemungkinan sedang dimutasi proses lain.")
+
+    updated = await db.orders.find_one({"_id": order_doc["_id"]}, session=session)
+    return clean(updated)
+
+async def record_delivery_stop_handover_core(
+    trip_id: str,
+    order_id: str,
+    payload: DeliveryStopHandoverInput,
+    admin: dict,
+    session=None
+) -> dict:
+    recipient_name_clean = (payload.recipient_name or "").strip()
+    if not recipient_name_clean:
+        raise HTTPException(
+            status_code=422,
+            detail="Nama penerima di lokasi wajib diisi."
+        )
+    if payload.helper_confirmed is not True:
+        raise HTTPException(
+            status_code=422,
+            detail="Konfirmasi serah terima fisik oleh helper wajib dicentang."
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)}, session=session)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+
+    if trip.get("status") not in (DeliveryTripStatus.SCHEDULED.value, DeliveryTripStatus.IN_TRANSIT.value, DeliveryTripStatus.PARTIALLY_COMPLETED.value):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tidak dapat mencatat serah terima pada trip dengan status '{trip.get('status')}'. Trip harus berstatus scheduled atau in_transit."
+        )
+
+    matching_stop = None
+    for s in trip.get("stops", []):
+        if str(s.get("order_id")) == str(order_id):
+            matching_stop = s
+            break
+    if not matching_stop:
+        raise HTTPException(status_code=404, detail="Pesanan tidak terdaftar sebagai stop pada trip ini.")
+
+    # Idempotency replay check: if stop is already delivered, return existing state safely
+    if matching_stop.get("outcome") == StopOutcome.DELIVERED.value:
+        order_doc = await db.orders.find_one({"_id": id_query(order_id)}, session=session)
+        cursor_wob = db.wage_obligations.find({"trip_id": str(trip["_id"]), "order_id": str(order_id)}, session=session)
+        to_list_fn = getattr(cursor_wob, "to_list", None)
+        existing_wobs = await to_list_fn(100) if callable(to_list_fn) else []
+        return clean({
+            "ok": True,
+            "message": "Pesanan telah diserahterimakan sebelumnya (Idempoten)",
+            "already_delivered": True,
+            "trip": trip,
+            "order": order_doc,
+            "wage_obligations": existing_wobs
+        })
+
+    validate_stop_state_transition(matching_stop.get("outcome"), StopOutcome.DELIVERED.value)
+
+    order_doc = await db.orders.find_one({"_id": id_query(order_id)}, session=session)
+    if not order_doc:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    if order_doc.get("order_status") == "selesai":
+        if str(order_doc.get("active_delivery_trip_id")) != str(trip["_id"]) and str(order_doc.get("delivered_trip_id")) != str(trip["_id"]):
+            raise HTTPException(status_code=409, detail="Pesanan telah selesai di luar alur pengantaran trip ini.")
+    elif order_doc.get("order_status") != "siap":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Pesanan tidak dalam status siap antar (status: '{order_doc.get('order_status')}')."
+        )
+
+    # 1. Evaluate wage amount and unusual amount threshold override
+    policy = await get_active_delivery_wage_policy(db_inst=db)
+    base_wage = _num(policy.get("base_wage_per_order_le"), 50.0)
+
+    snapshot = trip.get("rate_policy_snapshot")
+    snapshot_rate = _num(snapshot.get("applied_rate_le")) if (isinstance(snapshot, dict) and snapshot.get("applied_rate_le") is not None) else None
+
+    # Threshold prioritized from immutable dispatch snapshot, falling back to active policy
+    if isinstance(snapshot, dict) and snapshot.get("unusual_amount_threshold_le") is not None:
+        threshold = _num(snapshot.get("unusual_amount_threshold_le"))
+    else:
+        threshold = _num(policy.get("unusual_amount_threshold_le"), 500.0)
+
+    is_override = False
+    override_reason = None
+
+    if payload.custom_wage_le is not None:
+        total_wage = _num(payload.custom_wage_le)
+        if total_wage < 0:
+            raise HTTPException(status_code=422, detail="Nominal upah tidak boleh bernilai negatif.")
+        if total_wage > threshold:
+            if not payload.confirmed_unusual_amount:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Nominal upah ({total_wage} LE) melebihi batas konfirmasi ({threshold} LE). Konfirmasi diperlukan."
+                )
+            if not payload.override_reason or len(payload.override_reason.strip()) < 5:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Alasan override upah di atas batas konfirmasi wajib diisi minimal 5 karakter."
+                )
+            is_override = True
+            override_reason = payload.override_reason.strip()
+        elif snapshot_rate is not None and total_wage != snapshot_rate:
+            is_override = True
+            override_reason = (payload.override_reason or "").strip() or "Penyesuaian upah oleh tim operasional"
+        elif snapshot_rate is None and total_wage != base_wage:
+            is_override = True
+            override_reason = (payload.override_reason or "").strip() or "Penyesuaian upah oleh tim operasional"
+    else:
+        # Immutable dispatch snapshot is strictly required (Fail-Closed, Requirement B.5 & B.6)
+        if not isinstance(snapshot, dict) or snapshot_rate is None or snapshot_rate <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="Trip pengiriman tidak memiliki snapshot kebijakan upah dispatch yang valid (Legacy / Unversioned Trip). "
+                       "Pencatatan upah tidak dapat menggunakan kebijakan terkini secara otomatis (Fail-Closed). "
+                       "Sediakan 'custom_wage_le' pada payload serah terima sebagai jalur pemulihan eksplisit."
+            )
+        total_wage = snapshot_rate
+
+    # 2. Multi-helper distribution with exact piastre precision
+    helpers = trip.get("helpers", [])
+    allocations = calculate_delivery_helper_wage_allocations(total_wage, helpers)
+
+    # 3. Mutate Order document via centralized helper
+    delivery_ctx = {
+        "trip_id": str(trip["_id"]),
+        "trip_number": trip.get("trip_number"),
+        "reason": f"Serah terima pengiriman berhasil pada Trip {trip.get('trip_number')}"
+    }
+    updated_order = await execute_order_handover_completion(
+        order_id=str(order_id),
+        admin=admin,
+        now_iso=now_iso,
+        session=session,
+        delivery_context=delivery_ctx,
+        order_doc=order_doc
+    )
+
+    # 4. Mutate Stop on Trip
+    res_trip = await db.delivery_trips.update_one(
+        {"_id": trip["_id"], "stops.order_id": str(order_id)},
+        {
+            "$set": {
+                "stops.$.outcome": StopOutcome.DELIVERED.value,
+                "stops.$.delivered_at": now_iso,
+                "stops.$.recipient_name": recipient_name_clean,
+                "stops.$.handover_notes": (payload.handover_notes or "").strip() or None,
+                "stops.$.helper_confirmed": True,
+                "stops.$.total_wage_recorded_le": total_wage,
+                "stops.$.wage_allocation_snapshot": allocations,
+                "stops.$.is_wage_override": is_override,
+                "stops.$.wage_override_reason": override_reason,
+                "updated_at": now_iso,
+            },
+            "$inc": {"delivered_stops_count": 1}
+        },
+        session=session
+    )
+    if res_trip.modified_count == 0:
+        raise HTTPException(status_code=409, detail="Gagal memperbarui stop trip pengiriman.")
+
+    # 5. Insert Wage Obligations
+    created_obligations = []
+    for alloc in allocations:
+        event_key = build_delivery_accrual_event_key(str(order_id), alloc["worker_id"])
+        wob_num = await generate_obligation_number(session=session)
+        wob_doc = {
+            "obligation_number": wob_num,
+            "accrual_event_key": event_key,
+            "trip_id": str(trip["_id"]),
+            "trip_number": trip.get("trip_number"),
+            "order_id": str(order_id),
+            "order_number": order_doc.get("order_number"),
+            "worker_id": alloc["worker_id"],
+            "worker_name": alloc["worker_name"],
+            "task_category": "delivery",
+            "pricing_basis": "per_order_delivery",
+            "total_amount_le": alloc["amount_le"],
+            "amount_piastres": alloc["amount_piastres"],
+            "currency": "EGP",
+            "status": "accrued",
+            "paid_amount_le": 0.0,
+            "rate_policy_snapshot": {
+                "base_wage_per_order_le": base_wage,
+                "unusual_amount_threshold_le": threshold,
+                "total_order_wage_le": total_wage,
+                "is_override": is_override,
+                "override_reason": override_reason,
+                "helpers_count": len(helpers),
+            },
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "verified_by_id": str(admin.get("id") or admin.get("_id") or ""),
+            "verified_by_name": admin.get("name", "Admin"),
+        }
+        await db.wage_obligations.insert_one(wob_doc, session=session)
+        created_obligations.append(wob_doc)
+
+    # 6. Audit Logging if threshold override occurred
+    if is_override:
+        await record_audit_log(
+            action="delivery_wage_threshold_override",
+            entity_type="order",
+            entity_id=str(order_id),
+            entity_identifier=order_doc.get("order_number", ""),
+            admin=admin,
+            metadata={
+                "trip_id": str(trip["_id"]),
+                "trip_number": trip.get("trip_number"),
+                "order_id": str(order_id),
+                "order_number": order_doc.get("order_number"),
+                "base_wage_le": base_wage,
+                "threshold_le": threshold,
+                "recorded_amount_le": total_wage,
+                "override_reason": override_reason,
+                "helpers_count": len(helpers),
+                "allocations": allocations,
+            },
+            session=session
+        )
+
+    updated_trip = await db.delivery_trips.find_one({"_id": trip["_id"]}, session=session)
+    updated_order = await db.orders.find_one({"_id": order_doc["_id"]}, session=session)
+    return clean({
+        "ok": True,
+        "trip": updated_trip,
+        "order": updated_order,
+        "wage_obligations": created_obligations
+    })
+
+# --------------------------------------------------------------------------
+# Delivery Trip Endpoints
+# --------------------------------------------------------------------------
+
+@api_router.post("/admin/delivery-trips")
+async def admin_create_delivery_trip(
+    payload: DeliveryTripCreateInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    trip_num = await generate_trip_number()
+
+    helpers = []
+    for hid in payload.helper_ids:
+        emp = await db.admins.find_one({"_id": id_query(hid)})
+        if not emp:
+            raise HTTPException(status_code=404, detail=f"Helper dengan ID {hid!r} tidak ditemukan")
+        helpers.append({
+            "helper_id": str(emp.get("_id") or emp.get("id")),
+            "helper_name": emp.get("name", "Helper")
+        })
+
+    vr = payload.vehicle_rental
+    rental_doc = {
+        "is_rented": vr.is_rented,
+        "rental_provider": vr.rental_provider.strip(),
+        "vehicle_plate_or_desc": vr.vehicle_plate_or_desc.strip(),
+        "driver_provided_by_rental": vr.driver_provided_by_rental,
+        "rental_driver_name": vr.rental_driver_name.strip(),
+        "cost_obligation": {
+            "agreed_rental_cost_le": _num(vr.agreed_rental_cost_le),
+            "additional_cost_le": 0.0,
+            "total_obligation_le": _num(vr.agreed_rental_cost_le),
+            "obligation_status": "incurred",
+            "agreement_reference": (vr.agreement_reference or "").strip() or None,
+            "settlement_outcome": "active_agreement",
+            "incurred_at": now_iso,
+            "incurred_by_id": admin.get("id"),
+            "incurred_by_name": admin.get("name")
+        },
+        "payments": [],
+        "refunds": [],
+        "gross_paid_le": 0.0,
+        "gross_refunded_le": 0.0,
+        "net_paid_le": 0.0,
+        "remaining_payable_le": _num(vr.agreed_rental_cost_le),
+        "payment_status": "unpaid",
+        "notes": (vr.notes or "").strip() or None
+    }
+
+    trip_doc = {
+        "trip_number": trip_num,
+        "status": DeliveryTripStatus.DRAFT.value,
+        "scheduled_date": payload.scheduled_date.strip(),
+        "departure_time": (payload.departure_time or "").strip() or None,
+        "trip_wage_rate_le": _num(payload.trip_wage_rate_le),
+        "helper_ids": [h["helper_id"] for h in helpers],
+        "helpers": helpers,
+        "vehicle_rental": rental_doc,
+        "rate_policy_snapshot": None,
+        "stops": [],
+        "stops_count": 0,
+        "delivered_stops_count": 0,
+        "failed_stops_count": 0,
+        "actual_departure_at": None,
+        "completed_at": None,
+        "completion_notes": None,
+        "cancelled_at": None,
+        "cancellation_reason": None,
+        "cancelled_by_id": None,
+        "cancelled_by_name": None,
+        "notes": (payload.notes or "").strip() or None,
+        "created_at": now_iso,
+        "created_by_id": admin.get("id"),
+        "created_by_name": admin.get("name"),
+        "updated_at": now_iso,
+        "updated_by_id": admin.get("id"),
+        "updated_by_name": admin.get("name"),
+    }
+
+    result = await db.delivery_trips.insert_one(trip_doc)
+    created = await db.delivery_trips.find_one({"_id": result.inserted_id})
+    return clean(created)
+
+@api_router.get("/admin/delivery-trips")
+async def admin_list_delivery_trips(
+    status: Optional[str] = None,
+    scheduled_date: Optional[str] = None,
+    limit: int = 100,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    q = {}
+    if status:
+        q["status"] = status
+    if scheduled_date:
+        q["scheduled_date"] = scheduled_date
+    cursor = db.delivery_trips.find(q).sort("created_at", -1).limit(min(limit, 500))
+    trips = await cursor.to_list(min(limit, 500)) if hasattr(cursor, "to_list") else []
+    return [clean(t) for t in trips]
+
+@api_router.get("/admin/delivery-trips/unassigned-orders")
+async def admin_get_unassigned_delivery_orders(
+    delivery_zone_id: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    """
+    Daftar antrean pesanan siap kirim yang belum ditugaskan ke trip aktif mana pun.
+    Kriteria mutlak:
+    - order_status == 'siap'
+    - delivery_method == 'delivery'
+    - active_delivery_trip_id is null / absent
+    """
+    safe_limit = min(max(1, limit), 500)
+    safe_skip = max(0, skip)
+
+    query = {
+        "order_status": "siap",
+        "delivery_method": "delivery",
+        "active_delivery_trip_id": None
+    }
+    if delivery_zone_id and delivery_zone_id.strip():
+        query["delivery_zone_id"] = delivery_zone_id.strip()
+
+    if q and q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [
+            {"order_number": rx},
+            {"customer_name": rx},
+            {"customer_phone": rx},
+            {"phone_number": rx},
+            {"customer_address": rx},
+            {"delivery_zone_name": rx}
+        ]
+
+    # Deterministic FIFO sort (oldest eligible orders first)
+    cursor = db.orders.find(query).sort([("created_at", 1), ("_id", 1)]).skip(safe_skip).limit(safe_limit)
+    orders = await cursor.to_list(safe_limit) if hasattr(cursor, "to_list") else []
+
+    res = []
+    for o in orders:
+        items = o.get("items") or ([o.get("item")] if o.get("item") else [])
+        items_summary = []
+        total_items_count = 0
+        for it in items:
+            if not it:
+                continue
+            qty = int(it.get("quantity", 1) or 1)
+            total_items_count += qty
+            name = it.get("product_name_snapshot") or it.get("product_name") or "Produk"
+            items_summary.append({
+                "name": name,
+                "quantity": qty
+            })
+
+        res.append({
+            "id": str(o.get("_id") or o.get("id")),
+            "order_number": o.get("order_number") or "",
+            "customer_name": o.get("customer_name") or "Pelanggan",
+            "customer_phone": o.get("customer_phone") or o.get("phone_number") or "",
+            "customer_address": o.get("customer_address") or "",
+            "customer_maps_url": o.get("customer_maps_url") or "",
+            "delivery_method": o.get("delivery_method") or "delivery",
+            "delivery_zone_id": o.get("delivery_zone_id"),
+            "delivery_zone_name": o.get("delivery_zone_name") or o.get("delivery_zone") or "",
+            "delivery_fee_le": _num(o.get("delivery_fee_le", 0.0)),
+            "total_le": _num(o.get("total_le", 0.0)),
+            "order_status": o.get("order_status"),
+            "delivery_logistics_status": o.get("delivery_logistics_status") or "unassigned",
+            "notes": o.get("notes") or "",
+            "total_items_count": total_items_count,
+            "items_summary": items_summary,
+            "created_at": o.get("created_at"),
+            "updated_at": o.get("updated_at"),
+        })
+
+    return res
+
+@api_router.get("/admin/delivery-trips/{trip_id}")
+async def admin_get_delivery_trip(
+    trip_id: str,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)})
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+
+    stops = trip.get("stops", [])
+    if any(not s.get("customer_address") and not s.get("customer_maps_url") for s in stops):
+        for s in stops:
+            if not s.get("customer_address") or not s.get("customer_maps_url") or not s.get("customer_phone"):
+                oid = s.get("order_id")
+                if oid:
+                    ord_doc = await db.orders.find_one({"_id": id_query(oid)})
+                    if ord_doc:
+                        if not s.get("customer_address"):
+                            s["customer_address"] = ord_doc.get("customer_address") or ""
+                        if not s.get("customer_maps_url"):
+                            s["customer_maps_url"] = ord_doc.get("customer_maps_url") or ""
+                        if not s.get("customer_phone"):
+                            s["customer_phone"] = ord_doc.get("customer_phone") or ord_doc.get("phone_number") or ""
+
+    return clean(trip)
+
+@api_router.patch("/admin/delivery-trips/{trip_id}/status")
+async def admin_update_delivery_trip_status(
+    trip_id: str,
+    payload: DeliveryTripStatusUpdateInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    target_status = payload.target_status.strip().lower()
+    trip = await db.delivery_trips.find_one({"_id": id_query(trip_id)})
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip pengiriman tidak ditemukan")
+
+    current_status = trip.get("status")
+    validate_trip_state_transition(current_status, target_status, trip)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_doc = {
+        "status": target_status,
+        "updated_at": now_iso,
+        "updated_by_id": admin.get("id"),
+        "updated_by_name": admin.get("name")
+    }
+
+    if target_status == DeliveryTripStatus.IN_TRANSIT.value:
+        active_policy = await get_active_delivery_wage_policy(db_inst=db)
+        trip_rate = _num(trip.get("trip_wage_rate_le", 0.0))
+        if trip_rate > 0:
+            applied_rate = trip_rate
+            is_custom_rate = True
+        else:
+            applied_rate = _num(active_policy.get("base_wage_per_order_le"), 50.0)
+            is_custom_rate = False
+
+        cap_val = await validate_delivery_trip_wage_cap(applied_rate)
+        update_doc["rate_policy_snapshot"] = {
+            "applied_rate_le": applied_rate,
+            "is_custom_rate": is_custom_rate,
+            "max_cap_at_dispatch_le": cap_val,
+            "unusual_amount_threshold_le": _num(active_policy.get("unusual_amount_threshold_le"), 500.0),
+            "currency": active_policy.get("currency", "EGP"),
+            "rounding_policy": active_policy.get("rounding_policy", "piastre_round_half_up"),
+            "policy_updated_at": active_policy.get("updated_at"),
+            "locked_at": now_iso,
+            "locked_by_id": admin.get("id"),
+            "locked_by_name": admin.get("name")
+        }
+        update_doc["actual_departure_at"] = now_iso
+        update_doc["stops.$[elem].outcome"] = StopOutcome.OUT_FOR_DELIVERY.value
+
+        async def _do_dispatch(sess):
+            await db.delivery_trips.update_one(
+                {"_id": trip["_id"], "status": current_status},
+                {"$set": update_doc},
+                array_filters=[{"elem.outcome": StopOutcome.PENDING.value}],
+                session=sess
+            )
+            stop_order_ids = [s["order_id"] for s in trip.get("stops", []) if s.get("outcome") == StopOutcome.PENDING.value]
+            if stop_order_ids:
+                await db.orders.update_many(
+                    {"_id": {"$in": multi_id_query(stop_order_ids)}, "active_delivery_trip_id": str(trip["_id"])},
+                    {"$set": {"delivery_logistics_status": "in_transit", "updated_at": now_iso}},
+                    session=sess
+                )
+            return await db.delivery_trips.find_one({"_id": trip["_id"]}, session=sess)
+
+        res = await _execute_delivery_tx_or_fail_closed(_do_dispatch)
+        return clean(res)
+
+    elif target_status == DeliveryTripStatus.CANCELLED.value:
+        return await _execute_delivery_tx_or_fail_closed(
+            lambda sess: cancel_trip_multi_stop_core(trip_id, payload.reason or "Dibatalkan oleh Admin", admin, session=sess)
+        )
+    else:
+        await db.delivery_trips.update_one(
+            {"_id": trip["_id"], "status": current_status},
+            {"$set": update_doc}
+        )
+        return clean(await db.delivery_trips.find_one({"_id": trip["_id"]}))
+
+@api_router.post("/admin/delivery-trips/{trip_id}/stops")
+async def admin_add_trip_stop(
+    trip_id: str,
+    payload: DeliveryTripAddStopInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    return await _execute_delivery_tx_or_fail_closed(
+        lambda sess: assign_order_to_trip_core(trip_id, payload.order_id, admin, session=sess)
+    )
+
+@api_router.delete("/admin/delivery-trips/{trip_id}/stops/{order_id}")
+async def admin_remove_trip_stop(
+    trip_id: str,
+    order_id: str,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    return await _execute_delivery_tx_or_fail_closed(
+        lambda sess: release_order_from_trip_core(trip_id, order_id, admin, session=sess)
+    )
+
+@api_router.post("/admin/delivery-trips/{trip_id}/stops/{order_id}/record-attempt")
+async def admin_record_trip_stop_attempt(
+    trip_id: str,
+    order_id: str,
+    payload: DeliveryTripStopAttemptInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    return await _execute_delivery_tx_or_fail_closed(
+        lambda sess: record_delivery_attempt_core(trip_id, order_id, payload, admin, session=sess)
+    )
+
+@api_router.post("/admin/delivery-trips/{trip_id}/cancel")
+async def admin_cancel_delivery_trip(
+    trip_id: str,
+    payload: DeliveryTripCancelInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    return await _execute_delivery_tx_or_fail_closed(
+        lambda sess: cancel_trip_multi_stop_core(trip_id, payload.reason, admin, session=sess)
+    )
+
+@api_router.post("/admin/delivery-trips/{trip_id}/complete")
+async def admin_complete_delivery_trip(
+    trip_id: str,
+    payload: DeliveryTripCompleteInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    return await _execute_delivery_tx_or_fail_closed(
+        lambda sess: complete_trip_partial_core(trip_id, payload.notes, admin, session=sess)
+    )
+
+@api_router.post("/admin/delivery-trips/{trip_id}/stops/{order_id}/deliver")
+async def admin_deliver_trip_stop(
+    trip_id: str,
+    order_id: str,
+    payload: DeliveryStopHandoverInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    return await _execute_delivery_tx_or_fail_closed(
+        lambda sess: record_delivery_stop_handover_core(trip_id, order_id, payload, admin, session=sess)
+    )
+
+@api_router.get("/admin/delivery-wage-policy")
+async def admin_get_delivery_wage_policy(
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    policy = await get_active_delivery_wage_policy(db_inst=db)
+    return clean(policy)
+
+@api_router.put("/admin/delivery-wage-policy")
+async def admin_update_delivery_wage_policy(
+    payload: DeliveryWagePolicyInput,
+    admin: dict = Depends(require_owner())
+):
+    if admin.get("role") != "owner":
+        raise HTTPException(status_code=403, detail="Hanya Owner/CEO yang dapat melakukan ini")
+    if payload.base_wage_per_order_le < 0:
+        raise HTTPException(status_code=422, detail="Tarif dasar upah tidak boleh negatif")
+    if payload.unusual_amount_threshold_le <= 0:
+        raise HTTPException(status_code=422, detail="Batas konfirmasi nominal tidak wajar harus lebih besar dari 0")
+    if payload.unusual_amount_threshold_le < payload.base_wage_per_order_le:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) tidak boleh lebih kecil dari tarif dasar ({payload.base_wage_per_order_le} LE)"
+        )
+
+    old_policy = await get_active_delivery_wage_policy(db_inst=db)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    cap_val = payload.max_helper_wage_per_order_le
+    if cap_val is None or cap_val <= 0:
+        cap_val = payload.unusual_amount_threshold_le
+
+    new_policy_val = {
+        "base_wage_per_order_le": float(payload.base_wage_per_order_le),
+        "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
+        "max_helper_wage_per_order_le": float(cap_val),
+        "currency": "EGP",
+        "rounding_policy": "piastre_round_half_up",
+        "updated_at": now_iso,
+        "updated_by_id": str(admin.get("id") or admin.get("_id") or ""),
+        "updated_by_name": admin.get("name", "Owner")
+    }
+
+    changed_keys = []
+    for k in ["base_wage_per_order_le", "unusual_amount_threshold_le", "max_helper_wage_per_order_le"]:
+        if old_policy.get(k) != new_policy_val.get(k):
+            changed_keys.append(k)
+
+    await db.settings.update_one(
+        {"key": "delivery_wage_policy"},
+        {"$set": {"key": "delivery_wage_policy", "value": new_policy_val, "updated_at": now_iso}},
+        upsert=True
+    )
+
+    await record_audit_log(
+        action="update_delivery_wage_policy",
+        entity_type="delivery_wage_policy",
+        entity_id="delivery_wage_policy",
+        entity_identifier="delivery_wage_policy",
+        admin=admin,
+        metadata={
+            "previous": old_policy,
+            "new": new_policy_val,
+            "changed_fields": changed_keys
+        }
+    )
+
+    return clean(new_policy_val)
+
+@api_router.get("/admin/delivery-wage-policy/history")
+async def admin_get_delivery_wage_policy_history(
+    limit: int = 50,
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    query = {"entity_type": "delivery_wage_policy"}
+    cursor = db.audit_logs.find(query).sort("timestamp", -1)
+    to_list_fn = getattr(cursor, "to_list", None)
+    if callable(to_list_fn):
+        res = to_list_fn(min(limit, 100))
+        logs = await res if inspect.isawaitable(res) else []
+    else:
+        logs = []
+    return [clean(l) for l in logs]
+
+@api_router.post("/admin/delivery-wages/preview")
+async def admin_preview_delivery_wage_allocation(
+    payload: DeliveryWagePreviewInput,
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    policy = await get_active_delivery_wage_policy(db_inst=db)
+    threshold = _num(policy.get("unusual_amount_threshold_le"), 500.0)
+    base_wage = _num(policy.get("base_wage_per_order_le"), 50.0)
+
+    total_wage = _num(payload.total_wage_le) if payload.total_wage_le is not None else base_wage
+    if total_wage < 0:
+        raise HTTPException(status_code=422, detail="Nominal upah tidak boleh negatif")
+
+    requires_confirmation = total_wage > threshold
+    allocations = calculate_delivery_helper_wage_allocations(total_wage, payload.helpers)
+
+    return {
+        "total_wage_le": total_wage,
+        "base_wage_le": base_wage,
+        "threshold_le": threshold,
+        "requires_confirmation": requires_confirmation,
+        "helpers_count": len(payload.helpers),
+        "allocations": allocations
+    }
 
 # --------------------------------------------------------------------------
 # Admin: Invoices Management
@@ -8053,6 +9637,62 @@ async def seed():
         )
     except Exception as e:
         logger.warning(f"Non-critical finance_adjustments index provisioning warning: {e}")
+
+    # Phase 3.F.4.1: Delivery Trips and Delivery Wage Indexes
+    try:
+        dt_idx = db.delivery_trips.create_index(
+            [("trip_number", 1)],
+            unique=True,
+            name="uniq_delivery_trip_number"
+        )
+        if inspect.isawaitable(dt_idx):
+            await dt_idx
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: delivery_trips 'uniq_delivery_trip_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("delivery_trips", "uniq_delivery_trip_number", str(e))
+
+    try:
+        res1 = db.delivery_trips.create_index(
+            [("scheduled_date", 1), ("status", 1)],
+            name="idx_delivery_trips_date_status"
+        )
+        if inspect.isawaitable(res1):
+            await res1
+        res2 = db.delivery_trips.create_index(
+            [("stops.order_id", 1)],
+            name="idx_delivery_trips_stops_order"
+        )
+        if inspect.isawaitable(res2):
+            await res2
+        res3 = db.orders.create_index(
+            [("active_delivery_trip_id", 1)],
+            name="idx_orders_active_delivery_trip"
+        )
+        if inspect.isawaitable(res3):
+            await res3
+    except Exception as e:
+        logger.warning(f"Non-critical delivery_trips index provisioning warning: {e}")
+
+    # Phase 3.F.4.1: Partial Unique Index for delivery wage obligations with pre-migration verification
+    try:
+        mig_res = verify_delivery_wage_indexes_pre_migration(db)
+        if inspect.isawaitable(mig_res):
+            await mig_res
+        wo_idx = db.wage_obligations.create_index(
+            [("order_id", 1), ("worker_id", 1), ("task_category", 1)],
+            unique=True,
+            partialFilterExpression={"task_category": "delivery"},
+            name="uniq_delivery_wage_order_worker"
+        )
+        if inspect.isawaitable(wo_idx):
+            await wo_idx
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: wage_obligations 'uniq_delivery_wage_order_worker' creation failed: {e}")
+        raise CriticalFinanceIndexError("wage_obligations", "uniq_delivery_wage_order_worker", str(e))
 
     # Provision probe infrastructure
     await ensure_probe_infrastructure(db)

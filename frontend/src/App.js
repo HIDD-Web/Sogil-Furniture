@@ -41,6 +41,8 @@ import AdminAnalytics from "./pages/admin/AdminAnalytics";
 import AdminFinance from "./pages/admin/AdminFinance";
 import AdminFinanceStats from "./pages/admin/AdminFinanceStats";
 import AdminWorkerPendingWages from "./pages/admin/AdminWorkerPendingWages";
+import AdminDeliveryWageSettings from "./pages/admin/AdminDeliveryWageSettings";
+import AdminLogistics from "./pages/admin/AdminLogistics";
 import AdminExport from "./pages/admin/AdminExport";
 import AdminAdmins from "./pages/admin/AdminAdmins";
 import AdminDiscounts from "./pages/admin/AdminDiscounts";
@@ -116,6 +118,7 @@ function Layout() {
           <Route path="overview" element={<Navigate to="/admin/orders" replace />} />
           <Route path="orders" element={<AdminOrders />} />
           <Route path="orders/:id" element={<AdminOrderDetail />} />
+          <Route path="logistics" element={<AdminLogistics />} />
           <Route path="invoices" element={<AdminInvoices />} />
           <Route path="invoices/new" element={<AdminInvoiceForm />} />
           <Route path="invoices/:id" element={<AdminInvoiceDetail />} />
@@ -132,6 +135,7 @@ function Layout() {
           <Route path="statistik" element={<QueryRedirect to="/admin/finance/statistik" />} />
           <Route path="wages/pending" element={<AdminWorkerPendingWages />} />
           <Route path="wages" element={<Navigate to="/admin/wages/pending" replace />} />
+          <Route path="delivery-wage-settings" element={<AdminDeliveryWageSettings />} />
           <Route path="export" element={<AdminExport />} />
           <Route path="discounts" element={<AdminDiscounts />} />
           <Route path="referrals" element={<AdminReferrals />} />

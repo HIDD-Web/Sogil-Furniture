@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import api from "../../lib/api";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone, CircleDollarSign } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone, CircleDollarSign, Truck, Coins } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import PwaInstallModal from "../../components/PwaInstallModal";
 
@@ -27,6 +27,7 @@ export default function AdminLayout() {
   const isOwner = user.role === "owner";
   const LINKS = [
     { to: "/admin/orders", label: "Pesanan", icon: ShoppingBag, show: perms.manage_orders || isOwner },
+    { to: "/admin/logistics", label: "Logistik", icon: Truck, show: perms.manage_orders || isOwner },
     { to: "/admin/invoices", label: "Invoice", icon: FileText, show: perms.manage_orders || isOwner },
     { to: "/admin/custom-requests", label: "Request Custom", icon: Sparkles, show: perms.manage_orders || isOwner },
     { to: "/admin/analytics", label: "Analitik", icon: BarChart3, show: perms.manage_orders || isOwner },
@@ -34,6 +35,7 @@ export default function AdminLayout() {
     { to: "/admin/materials", label: "Bahan", icon: Layers, show: perms.modify_products || perms.access_finance || isOwner },
     { to: "/admin/finance", label: "Keuangan", icon: Wallet, show: perms.access_finance || isOwner },
     { to: "/admin/wages/pending", label: "Upah Pekerja", icon: CircleDollarSign, show: perms.access_finance || isOwner },
+    { to: "/admin/delivery-wage-settings", label: "Upah Kirim", icon: Coins, show: perms.access_finance || isOwner },
     { to: "/admin/export", label: "Export Data", icon: Wallet, show: perms.access_finance || perms.manage_orders || isOwner },
     { to: "/admin/discounts", label: "Diskon", icon: Ticket, show: perms.manage_settings || isOwner },
     { to: "/admin/referrals", label: "Referral", icon: Gift, show: perms.manage_settings || isOwner },
