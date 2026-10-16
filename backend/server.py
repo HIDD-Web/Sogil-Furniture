@@ -28,6 +28,7 @@ from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
 from decimal import Decimal, ROUND_HALF_UP
+import math
 import pymongo
 from pymongo import ReturnDocument
 
@@ -889,6 +890,11 @@ class WageSettlementCreateInput(BaseModel):
     worker_id: str
     amount_le: float
     payment_method: str = "cash"
+    payment_currency: Optional[str] = "EGP"  # "EGP" | "IDR"
+    settlement_rate: Optional[float] = None
+    is_rate_override: Optional[bool] = False
+    override_reason: Optional[str] = None
+    actual_payout_amount: Optional[float] = None
     payment_date: Optional[str] = None
     reference: Optional[str] = None
     notes: Optional[str] = ""
@@ -1540,6 +1546,27 @@ async def enforce_claim_rate_limit(request: Request, customer_id: Optional[str],
     except Exception as e:
         logger.error(f"Error checking claim rate limit: {e}")
 
+GOOGLE_MAPS_REGEX = re.compile(
+    r"^https?://(?:(?:www\.)?google\.[a-z.]+/maps(?:[/?#]|$)|maps\.google\.[a-z.]+(?:[/?#]|$)|maps\.app\.goo\.gl/|goo\.gl/maps/)",
+    re.IGNORECASE
+)
+
+def validate_and_normalize_maps_url(maps_url: Optional[str], delivery_method: str) -> str:
+    maps = (maps_url or "").strip()
+    if delivery_method == "delivery":
+        if not maps:
+            raise HTTPException(status_code=400, detail="Link Google Maps lokasi pengiriman wajib diisi untuk pesanan delivery.")
+    elif not maps:
+        return ""
+
+    if not re.match(r"^https?://", maps, re.IGNORECASE):
+        maps = f"https://{maps}"
+
+    if not GOOGLE_MAPS_REGEX.search(maps):
+        raise HTTPException(status_code=400, detail="Link Maps harus berupa link Google Maps yang valid.")
+
+    return maps
+
 def clean_customer_invoice(inv: dict) -> dict:
     d = clean(inv)
     d.pop("internal_note", None)
@@ -1589,9 +1616,7 @@ async def _create_invoice_order(request: Request, data: OrderInput):
     if data.payment_method not in ("cash", "transfer"):
         raise HTTPException(status_code=400, detail="Silakan pilih metode pembayaran.")
 
-    maps = (data.customer_maps_url or "").strip()
-    if maps and not re.match(r"^https?://", maps):
-        raise HTTPException(status_code=400, detail="Link Maps tidak valid.")
+    maps = validate_and_normalize_maps_url(data.customer_maps_url, data.delivery_method)
 
     delivery_fee = 0.0; zone_name = None; zone_id = None
     if data.delivery_method == "delivery":
@@ -1811,9 +1836,7 @@ async def create_order(request: Request, data: OrderInput):
     if not items_input:
         raise HTTPException(status_code=400, detail="Keranjang kosong.")
 
-    maps = (data.customer_maps_url or "").strip()
-    if maps and not re.match(r"^https?://", maps):
-        raise HTTPException(status_code=400, detail="Link Maps tidak valid.")
+    maps = validate_and_normalize_maps_url(data.customer_maps_url, data.delivery_method)
 
     delivery_fee = 0.0; zone_name = None; zone_id = None
     if data.delivery_method == "delivery":
@@ -3822,10 +3845,32 @@ async def admin_get_worker_pending_wages(
     total_pending_le = round(sum(_num(o.get("total_amount_le")) - _num(o.get("paid_amount_le")) for o in obligations), 2)
 
     cleaned_obligations = []
+    locked_rates = []
+    # Pre-cache linked orders to avoid repeated DB hits
+    order_ids = [o.get("order_id") for o in obligations if o.get("order_id")]
+    orders_map = {}
+    if order_ids:
+        async for ord_doc in db.orders.find({"_id": {"$in": multi_id_query(order_ids)}}):
+            orders_map[str(ord_doc["_id"])] = ord_doc
+
     for o in obligations:
         c_ob = clean(o)
         c_ob["remaining_amount_le"] = max(0.0, round(_num(o.get("total_amount_le")) - _num(o.get("paid_amount_le")), 2))
+        l_rate = None
+        if o.get("locked_exchange_rate"):
+            l_rate = _num(o.get("locked_exchange_rate"))
+        elif o.get("rate_policy_snapshot", {}).get("exchange_rate"):
+            l_rate = _num(o.get("rate_policy_snapshot", {}).get("exchange_rate"))
+        elif o.get("order_id"):
+            ord_doc = orders_map.get(str(o.get("order_id")))
+            if ord_doc and ord_doc.get("exchange_rate_idr_per_le"):
+                l_rate = _num(ord_doc.get("exchange_rate_idr_per_le"))
+        c_ob["locked_exchange_rate"] = l_rate
+        if l_rate and l_rate > 0:
+            locked_rates.append(l_rate)
         cleaned_obligations.append(c_ob)
+
+    default_locked_rate = locked_rates[0] if locked_rates else None
 
     return {
         "worker_id": worker_id,
@@ -3835,6 +3880,7 @@ async def admin_get_worker_pending_wages(
         "total_paid_le": total_paid_le,
         "total_pending_wages_le": total_pending_le,
         "currency": "EGP",
+        "default_locked_exchange_rate": default_locked_rate,
         "obligations": cleaned_obligations,
     }
 
@@ -3936,6 +3982,10 @@ async def admin_create_wage_settlement(
     if disbursed_amount <= 0:
         raise HTTPException(status_code=422, detail="Nominal pembayaran harus lebih besar dari 0")
 
+    payment_currency = (payload.payment_currency or "EGP").strip().upper()
+    if payment_currency not in ("EGP", "IDR"):
+        raise HTTPException(status_code=422, detail="Mata uang pembayaran tidak didukung (harus EGP atau IDR)")
+
     payment_method = (payload.payment_method or "cash").strip().lower()
     if payment_method not in ("cash", "bank_transfer", "other"):
         payment_method = "cash"
@@ -3944,7 +3994,12 @@ async def admin_create_wage_settlement(
     if idem_key:
         winning = await db.wage_settlements.find_one({"idempotency_key": idem_key})
         if winning:
-            if str(winning.get("worker_id")) != worker_id or round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or winning.get("payment_method") != payment_method:
+            if (
+                str(winning.get("worker_id")) != worker_id or
+                round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or
+                winning.get("payment_method") != payment_method or
+                (winning.get("payout_currency") or "EGP") != payment_currency
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
@@ -3966,6 +4021,77 @@ async def admin_create_wage_settlement(
             status_code=422,
             detail=f"Nominal pembayaran ({disbursed_amount} LE) melebihi total kewajiban terutang ({total_pending_all} LE)"
         )
+
+    # Resolve locked rate from the worker's obligations being settled
+    ob_order_ids = [o.get("order_id") for o in worker_obligations if o.get("order_id")]
+    ob_orders_map = {}
+    if ob_order_ids:
+        async for ord_doc in db.orders.find({"_id": {"$in": multi_id_query(ob_order_ids)}}):
+            ob_orders_map[str(ord_doc["_id"])] = ord_doc
+
+    locked_rates = []
+    for o in worker_obligations:
+        l_rate = None
+        if o.get("locked_exchange_rate"):
+            l_rate = _num(o.get("locked_exchange_rate"))
+        elif o.get("rate_policy_snapshot", {}).get("exchange_rate"):
+            l_rate = _num(o.get("rate_policy_snapshot", {}).get("exchange_rate"))
+        elif o.get("order_id"):
+            ord_doc = ob_orders_map.get(str(o.get("order_id")))
+            if ord_doc and ord_doc.get("exchange_rate_idr_per_le"):
+                l_rate = _num(ord_doc.get("exchange_rate_idr_per_le"))
+        if l_rate and l_rate > 0:
+            locked_rates.append(l_rate)
+
+    reference_locked_rate = locked_rates[0] if locked_rates else None
+
+    # Handle IDR vs EGP rate resolution
+    is_override = False
+    override_reason = None
+    actual_rate = None
+    actual_payout_amount = disbursed_amount
+
+    if payment_currency == "IDR":
+        primary_account = "IDR"
+        is_explicit_override = bool(payload.is_rate_override)
+        req_rate = payload.settlement_rate
+
+        if reference_locked_rate is not None:
+            # Locked rate exists from allocation/dispatch
+            if is_explicit_override or (req_rate is not None and round(req_rate, 4) != round(reference_locked_rate, 4)):
+                is_override = True
+                override_reason = (payload.override_reason or "").strip()
+                if len(override_reason) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)."
+                    )
+                if req_rate is None or not (math.isfinite(req_rate) and req_rate > 0):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Kurs override harus berupa angka positif yang valid."
+                    )
+                actual_rate = round(float(req_rate), 4)
+            else:
+                is_override = False
+                actual_rate = reference_locked_rate
+        else:
+            # Legacy obligations without locked rate
+            if req_rate is None or not (math.isfinite(req_rate) and req_rate > 0):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Kewajiban upah lama ini tidak memiliki kurs terkunci. Kurs penyelesaian IDR wajib diisi secara eksplisit."
+                )
+            actual_rate = round(float(req_rate), 4)
+            if payload.override_reason and payload.override_reason.strip():
+                override_reason = payload.override_reason.strip()
+
+        actual_payout_amount = round(disbursed_amount * actual_rate)
+    else:
+        # EGP payment
+        primary_account = "EGP"
+        actual_rate = reference_locked_rate
+        actual_payout_amount = disbursed_amount
 
     resolved_allocations = []
     if payload.allocations and len(payload.allocations) > 0:
@@ -4043,20 +4169,27 @@ async def admin_create_wage_settlement(
     settlement_num = await generate_wage_settlement_number()
 
     settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-    counterpart_idr = round(disbursed_amount * settings_rate)
+    if payment_currency == "IDR":
+        counterpart_amount = disbursed_amount
+        counterpart_currency = "EGP"
+        desc_suffix = " [IDR]"
+    else:
+        counterpart_amount = round(disbursed_amount * (actual_rate or settings_rate))
+        counterpart_currency = "IDR"
+        desc_suffix = ""
 
     txn_doc = {
         "date": settlement_date,
         "type": "expense",
         "category": "Pekerja",
-        "amount": disbursed_amount,
-        "currency": "EGP",
-        "account": "EGP",
-        "exchange_rate": settings_rate,
-        "counterpart_amount": counterpart_idr,
-        "counterpart_currency": "IDR",
+        "amount": actual_payout_amount,
+        "currency": payment_currency,
+        "account": primary_account,
+        "exchange_rate": actual_rate or settings_rate,
+        "counterpart_amount": counterpart_amount,
+        "counterpart_currency": counterpart_currency,
         "classification": "cost",
-        "description": f"Pembayaran upah pekerja {worker_name} ({settlement_num})",
+        "description": f"Pembayaran upah pekerja {worker_name} ({settlement_num}){desc_suffix}",
         "recipient_employee_id": worker_id,
         "recipient_employee_name": worker_name,
         "related_settlement_number": settlement_num,
@@ -4074,6 +4207,12 @@ async def admin_create_wage_settlement(
         "settlement_date": settlement_date,
         "amount_le": disbursed_amount,
         "currency": "EGP",
+        "payout_currency": payment_currency,
+        "payout_amount": actual_payout_amount,
+        "locked_exchange_rate": reference_locked_rate,
+        "settlement_rate": actual_rate if payment_currency == "IDR" else None,
+        "is_rate_override": is_override,
+        "override_reason": override_reason,
         "payment_method": payment_method,
         "reference": (payload.reference or "").strip(),
         "notes": (payload.notes or "").strip(),
@@ -4099,8 +4238,10 @@ async def admin_create_wage_settlement(
         await db.employee_wages.insert_one({
             "employee_id": worker_id,
             "employee_name": worker_name,
-            "amount": disbursed_amount,
-            "currency": "EGP",
+            "amount": actual_payout_amount,
+            "currency": payment_currency,
+            "amount_le": disbursed_amount,
+            "exchange_rate": actual_rate if payment_currency == "IDR" else None,
             "date": settlement_date,
             "category": "Pekerja",
             "description": txn_doc["description"],
@@ -4158,6 +4299,29 @@ async def admin_create_wage_settlement(
                     status_code=409,
                     detail=f"Saldo kewajiban upah ({a['obligation_number']}) telah berubah oleh proses lain. Harap muat ulang."
                 )
+
+        # 6. Audit logging if rate override occurred
+        if is_override:
+            await record_audit_log(
+                action="wage_settlement_rate_override",
+                entity_type="wage_settlement",
+                entity_id=settlement_id,
+                entity_identifier=settlement_num,
+                admin=admin,
+                metadata={
+                    "worker_id": worker_id,
+                    "worker_name": worker_name,
+                    "wage_obligation_ids": [a["wage_obligation_id"] for a in resolved_allocations],
+                    "original_locked_rate": reference_locked_rate,
+                    "override_rate": actual_rate,
+                    "override_reason": override_reason,
+                    "disbursed_amount_le": disbursed_amount,
+                    "actual_payout_amount": actual_payout_amount,
+                    "payout_currency": "IDR",
+                },
+                session=session
+            )
+
         return settlement_id
 
     created_id = None
@@ -7868,6 +8032,39 @@ async def _stats_for(s, e, cutoff: Optional[str] = None):
             if cls in (None, "cost"):
                 res[cur]["operating_cost"] += raw_amt
 
+    # Pre-fetch recorded payments grouped by order_id
+    pmt_by_order = {}
+    pmt_details_by_order = {}
+    pmts_coll = getattr(db, "payments", None)
+    if pmts_coll is not None and hasattr(pmts_coll, "find"):
+        p_finder = pmts_coll.find({"status": "recorded"})
+        if hasattr(p_finder, "__aiter__"):
+            async for p in p_finder:
+                oid_str = str(p.get("order_id") or "")
+                amt = _num(p.get("amount_le", 0.0))
+                pmt_by_order[oid_str] = pmt_by_order.get(oid_str, 0.0) + amt
+
+                p_cur = (p.get("primary_currency") or "").strip().upper()
+                if not p_cur:
+                    p_cur = "IDR" if p.get("payment_method") == "transfer" else "EGP"
+
+                prim_amt = _num(p.get("primary_amount", 0.0))
+                if prim_amt <= 0:
+                    if p_cur == "IDR":
+                        p_rate = _num(p.get("exchange_rate_snapshot", 0.0)) or 357.0
+                        prim_amt = round(amt * p_rate)
+                    else:
+                        prim_amt = amt
+
+                if oid_str not in pmt_details_by_order:
+                    pmt_details_by_order[oid_str] = []
+                pmt_details_by_order[oid_str].append({
+                    "currency": p_cur,
+                    "amount_le": amt,
+                    "primary_amount": prim_amt,
+                    "rate": _num(p.get("exchange_rate_snapshot", 0.0))
+                })
+
     # -------------------------------------------------------------------------
     # 2. Handover-Recognized Furniture Sales Revenue (db.orders)
     # -------------------------------------------------------------------------
@@ -7890,8 +8087,42 @@ async def _stats_for(s, e, cutoff: Optional[str] = None):
         if hasattr(ord_finder, "__aiter__"):
             async for ord_doc in ord_finder:
                 rec_le = _num(ord_doc.get("recognized_revenue_le", 0.0))
-                # Furniture sales are priced and recognized in EGP (LE)
-                res["EGP"]["sales_revenue"] += rec_le
+                if rec_le <= 0:
+                    continue
+                oid_str = str(ord_doc.get("_id") or ord_doc.get("id") or "")
+                pmts = pmt_details_by_order.get(oid_str, [])
+
+                if pmts:
+                    egp_paid_le = sum(p["amount_le"] for p in pmts if p["currency"] == "EGP")
+                    idr_paid_le = sum(p["amount_le"] for p in pmts if p["currency"] == "IDR")
+                    idr_paid_actual = sum(p["primary_amount"] for p in pmts if p["currency"] == "IDR")
+                    total_paid_le = egp_paid_le + idr_paid_le
+
+                    if total_paid_le >= rec_le and total_paid_le > 0:
+                        ratio = min(1.0, rec_le / total_paid_le)
+                        res["EGP"]["sales_revenue"] += round(egp_paid_le * ratio, 2)
+                        res["IDR"]["sales_revenue"] += round(idr_paid_actual * ratio, 2)
+                    else:
+                        res["EGP"]["sales_revenue"] += egp_paid_le
+                        res["IDR"]["sales_revenue"] += idr_paid_actual
+
+                        uncollected_le = rec_le - total_paid_le
+                        ord_pay_method = (ord_doc.get("payment_method") or "").strip().lower()
+                        ord_rate = _num(ord_doc.get("exchange_rate_idr_per_le", 0.0)) or 357.0
+
+                        if ord_pay_method == "transfer":
+                            uncollected_idr = round(uncollected_le * ord_rate)
+                            res["IDR"]["sales_revenue"] += uncollected_idr
+                        else:
+                            res["EGP"]["sales_revenue"] += uncollected_le
+                else:
+                    ord_pay_method = (ord_doc.get("payment_method") or "").strip().lower()
+                    ord_rate = _num(ord_doc.get("exchange_rate_idr_per_le", 0.0)) or 357.0
+                    if ord_pay_method == "transfer":
+                        idr_val = _num(ord_doc.get("estimated_total_idr", 0.0)) or round(rec_le * ord_rate)
+                        res["IDR"]["sales_revenue"] += idr_val
+                    else:
+                        res["EGP"]["sales_revenue"] += rec_le
 
     # -------------------------------------------------------------------------
     # 3. Explicit Finance Adjustments (db.finance_adjustments)
@@ -7959,16 +8190,7 @@ async def _stats_for(s, e, cutoff: Optional[str] = None):
     # -------------------------------------------------------------------------
     # 5. Customer Advances & Accounts Receivable (Working Capital Balance Sheet)
     # -------------------------------------------------------------------------
-    # Pre-fetch recorded payments grouped by order_id
-    pmt_by_order = {}
-    pmts_coll = getattr(db, "payments", None)
-    if pmts_coll is not None and hasattr(pmts_coll, "find"):
-        p_finder = pmts_coll.find({"status": "recorded"})
-        if hasattr(p_finder, "__aiter__"):
-            async for p in p_finder:
-                oid_str = str(p.get("order_id") or "")
-                amt = _num(p.get("amount_le", 0.0))
-                pmt_by_order[oid_str] = pmt_by_order.get(oid_str, 0.0) + amt
+    # Note: pmt_by_order was already pre-fetched above before Section 2
 
     # Pre-fetch active finance adjustments grouped by order_id
     adjs_by_order = {}

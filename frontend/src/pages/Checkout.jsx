@@ -216,15 +216,29 @@ export default function Checkout() {
     if (!cust.address.trim()) return toast.error(t("err.alamat"));
     if (!delivery.method) return toast.error(t("err.metode"));
     if (delivery.method === "delivery" && !delivery.zone_id) return toast.error(t("err.zona"));
-    if (!cust.payment) return toast.error(t("err.bayar"));
-    if (cust.maps && !/^https?:\/\//.test(cust.maps)) return toast.error(t("err.maps"));
+    const GOOGLE_MAPS_REGEX = /^https?:\/\/(?:(?:www\.)?google\.[a-z.]+\/maps(?:[/?#]|$)|maps\.google\.[a-z.]+(?:[/?#]|$)|maps\.app\.goo\.gl\/|goo\.gl\/maps\/)/i;
+    let normalizedMaps = (cust.maps || "").trim();
+    if (normalizedMaps && !/^https?:\/\//i.test(normalizedMaps)) {
+      normalizedMaps = `https://${normalizedMaps}`;
+    }
+
+    if (delivery.method === "delivery") {
+      if (!normalizedMaps) {
+        return toast.error("Link Google Maps lokasi pengiriman wajib diisi untuk pesanan delivery.");
+      }
+      if (!GOOGLE_MAPS_REGEX.test(normalizedMaps)) {
+        return toast.error("Link Maps harus berupa link Google Maps yang valid.");
+      }
+    } else if (normalizedMaps && !GOOGLE_MAPS_REGEX.test(normalizedMaps)) {
+      return toast.error("Link Maps harus berupa link Google Maps yang valid.");
+    }
 
     setSubmitting(true);
     const notes = [cust.notes, ...items.filter((i) => i.config?.custom_size && i.config?.custom_note).map((i) => `Custom (${i.product?.name || i.name}): ${i.config.custom_note}`)].filter(Boolean).join(" | ");
     try {
       const orderPayload = {
         customer_name: cust.name, customer_phone: phone, phone_number: normEgyptPhone, customer_address: cust.address,
-        customer_maps_url: cust.maps, delivery_method: delivery.method,
+        customer_maps_url: normalizedMaps, delivery_method: delivery.method,
         delivery_zone_id: delivery.method === "delivery" ? delivery.zone_id : null,
         payment_method: cust.payment, notes,
         discount_code: !ref.applied && disc.applied ? disc.code : null,
@@ -298,7 +312,7 @@ export default function Checkout() {
               <p className="mt-1 text-xs text-[#8B7355]">Nomor panggilan telepon lokal Mesir (opsional jika memiliki simcard Mesir)</p>
             </div>
             <div><Label className="mb-1.5 block text-sm">{t("chk.alamat")} *</Label><Textarea value={cust.address} onChange={(e) => setCust({ ...cust, address: e.target.value })} data-testid="input-address" className="min-h-[80px] bg-white" /></div>
-            <div><Label className="mb-1.5 block text-sm">{t("chk.link_maps")} {delivery.method === "delivery" ? t("chk.maps_saran") : t("chk.maps_opsional")}</Label><Input value={cust.maps} onChange={(e) => setCust({ ...cust, maps: e.target.value })} data-testid="input-maps" placeholder="https://maps.google.com/..." className="h-12 bg-white" /></div>
+            <div><Label className="mb-1.5 block text-sm">{t("chk.link_maps")} {delivery.method === "delivery" ? "* (Wajib untuk pengiriman kurir)" : t("chk.maps_opsional")}</Label><Input value={cust.maps} onChange={(e) => setCust({ ...cust, maps: e.target.value })} data-testid="input-maps" placeholder="https://maps.app.goo.gl/... atau https://maps.google.com/..." className="h-12 bg-white" /></div>
             <div>
               <Label className="mb-2 block font-heading text-sm font-semibold text-[#2C1E16]">{t("chk.metode_bayar")} *</Label>
               <div className="flex flex-wrap gap-2"><Chip active={cust.payment === "cash"} onClick={() => setCust({ ...cust, payment: "cash" })} testid="pay-cash">{t("chk.cash")}</Chip><Chip active={cust.payment === "transfer"} onClick={() => setCust({ ...cust, payment: "transfer" })} testid="pay-transfer">{t("chk.transfer")}</Chip></div>

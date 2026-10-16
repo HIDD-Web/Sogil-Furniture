@@ -117,7 +117,13 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
             worker_id: "w_1",
             worker_name: "Ahmed Tukang",
             total_pending_wages_le: 300.0,
-            obligations: mockObligations,
+            default_locked_exchange_rate: 357.0,
+            obligations: [
+              {
+                ...mockObligations[0],
+                locked_exchange_rate: 357.0,
+              },
+            ],
           },
         });
       }
@@ -269,6 +275,104 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
     expect(api.post).toHaveBeenCalledWith(
       "/admin/wages/settlements/st_1/void",
       { reason: "Salah input nominal" }
+    );
+  });
+
+  test("settling in IDR displays locked exchange rate and calculates payout", async () => {
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const settleBtn = container.querySelector('[data-testid="settle-btn-w_1"]');
+    await act(async () => {
+      settleBtn.click();
+    });
+
+    const idrBtn = container.querySelector('[data-testid="settle-currency-idr-btn"]');
+    expect(idrBtn).not.toBeNull();
+
+    await act(async () => {
+      idrBtn.click();
+    });
+
+    const lockedRateDisplay = container.querySelector('[data-testid="locked-rate-display"]');
+    expect(lockedRateDisplay).not.toBeNull();
+    expect(lockedRateDisplay.textContent).toContain("357");
+
+    const estimatedPayout = container.querySelector('[data-testid="estimated-idr-payout"]');
+    expect(estimatedPayout).not.toBeNull();
+    expect(estimatedPayout.textContent).toContain("107.100");
+
+    const submitBtn = container.querySelector('[data-testid="submit-settle-btn"]');
+    await act(async () => {
+      submitBtn.click();
+    });
+
+    expect(api.post).toHaveBeenCalledWith(
+      "/admin/wages/settlements",
+      expect.objectContaining({
+        worker_id: "w_1",
+        amount_le: 300,
+        payment_currency: "IDR",
+        settlement_rate: 357,
+        is_rate_override: false,
+        payment_method: "bank_transfer",
+      })
+    );
+  });
+
+  test("submitting IDR settlement with rate override sends override reason and new rate", async () => {
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const settleBtn = container.querySelector('[data-testid="settle-btn-w_1"]');
+    await act(async () => {
+      settleBtn.click();
+    });
+
+    const idrBtn = container.querySelector('[data-testid="settle-currency-idr-btn"]');
+    await act(async () => {
+      idrBtn.click();
+    });
+
+    const overrideToggle = container.querySelector('[data-testid="rate-override-toggle"]');
+    expect(overrideToggle).not.toBeNull();
+    await act(async () => {
+      overrideToggle.click();
+    });
+
+    const rateInput = container.querySelector('[data-testid="settle-override-rate-input"]');
+    const reasonInput = container.querySelector('[data-testid="settle-override-reason-input"]');
+    expect(rateInput).not.toBeNull();
+    expect(reasonInput).not.toBeNull();
+
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      nativeSetter.call(rateInput, "365");
+      rateInput.dispatchEvent(new Event("change", { bubbles: true }));
+      rateInput.dispatchEvent(new Event("input", { bubbles: true }));
+
+      nativeSetter.call(reasonInput, "Penyesuaian kurs BCA");
+      reasonInput.dispatchEvent(new Event("change", { bubbles: true }));
+      reasonInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const submitBtn = container.querySelector('[data-testid="submit-settle-btn"]');
+    await act(async () => {
+      submitBtn.click();
+    });
+
+    expect(api.post).toHaveBeenCalledWith(
+      "/admin/wages/settlements",
+      expect.objectContaining({
+        worker_id: "w_1",
+        amount_le: 300,
+        payment_currency: "IDR",
+        settlement_rate: 365,
+        is_rate_override: true,
+        override_reason: "Penyesuaian kurs BCA",
+      })
     );
   });
 });
