@@ -5,6 +5,7 @@ Uses synthetic mocks and isolated in-memory fixtures. No external database or ne
 """
 
 import asyncio
+import json
 import math
 import unittest
 from decimal import Decimal
@@ -17,6 +18,8 @@ from server import (
     _stats_for,
     admin_create_wage_settlement,
     admin_get_worker_pending_wages,
+    app,
+    get_current_admin,
     validate_and_normalize_maps_url,
     WageSettlementCreateInput,
 )
@@ -870,6 +873,76 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(variance_logs), 1)
         self.assertEqual(variance_logs[0][0][0]["metadata"]["variance_idr"], 300.0)
 
+    async def test_customized_actual_idr_payout_with_negative_variance(self):
+        """Customized IDR nominal with negative variance (e.g. transfer fee deduction) validates negative variance, logs audit, and preserves exact LE liability."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef20"),
+            "worker_id": "w_10",
+            "obligation_number": "WOB-008",
+            "total_amount_le": 100.0,
+            "paid_amount_le": 0.0,
+            "currency": "EGP",
+            "status": "accrued",
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.employee_wages.insert_one = AsyncMock()
+        mock_db.wage_settlements.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.wage_obligations.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
+
+        # Standard is 100 * 357 = 35700. Admin disburses 35500 (-200 variance due to bank transfer deduction)
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="IDR",
+            payment_method="bank_transfer",
+            actual_payout_amount=35500.0,
+            notes="Potongan biaya administrasi transfer bank",
+        )
+
+        with patch("server.db", mock_db), \
+             patch("server.client.start_session", AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))), \
+             patch("server.is_standalone_fallback_permitted", return_value=True):
+            res = await admin_create_wage_settlement(payload, self.admin)
+
+        self.assertIsNotNone(res)
+        # Finance transaction deducted actual payout: 35500 IDR
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["amount"], 35500.0)
+        self.assertEqual(txn_call["currency"], "IDR")
+        self.assertEqual(txn_call["account"], "IDR")
+        self.assertEqual(txn_call["category"], "Pekerja")
+
+        # Settlement document records both standard and actual payout and variance
+        st_call = mock_db.wage_settlements.insert_one.call_args[0][0]
+        self.assertEqual(st_call["payout_amount"], 35500.0)
+        self.assertEqual(st_call["standard_payout_amount"], 35700.0)
+        self.assertEqual(st_call["variance_idr"], -200.0)
+        self.assertEqual(st_call["amount_le"], 100.0)
+
+        # Obligation liability reduction remains strictly 100 LE
+        ob_call = mock_db.wage_obligations.update_one.call_args[0][1]
+        self.assertEqual(ob_call["$set"]["paid_amount_le"], 100.0)
+        self.assertEqual(ob_call["$set"]["status"], "paid")
+
+        # Audit log was created for payout variance
+        variance_logs = [c for c in mock_db.audit_logs.insert_one.call_args_list if c[0][0].get("action") == "wage_settlement_payout_variance"]
+        self.assertEqual(len(variance_logs), 1)
+        self.assertEqual(variance_logs[0][0][0]["metadata"]["variance_idr"], -200.0)
+        self.assertEqual(variance_logs[0][0][0]["metadata"]["override_reason"], "Potongan biaya administrasi transfer bank")
+
     async def test_customized_actual_idr_payout_rejection_without_reason(self):
         """Customized IDR nominal with variance requires explanation (notes or override_reason)."""
         mock_db = MagicMock()
@@ -1017,6 +1090,115 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         # Confirm compensating deletion was invoked
         mock_db.finance_transactions.delete_one.assert_called()
         mock_db.employee_wages.delete_many.assert_called()
+
+    async def _call_settlement_asgi(self, payload_dict):
+        """Dispatches an ASGI HTTP POST request to /api/admin/wages/settlements through FastAPI app."""
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/admin/wages/settlements",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 80),
+        }
+        body_bytes = json.dumps(payload_dict).encode("utf-8")
+        messages = []
+
+        async def receive():
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+        async def send(msg):
+            messages.append(msg)
+
+        await app(scope, receive, send)
+
+        status = None
+        body_chunks = []
+        for m in messages:
+            if m["type"] == "http.response.start":
+                status = m["status"]
+            elif m["type"] == "http.response.body":
+                body_chunks.append(m.get("body", b""))
+        body_str = b"".join(body_chunks).decode("utf-8")
+        return status, body_str
+
+    async def test_unauthorized_user_without_finance_role_rejected_at_endpoint(self):
+        """Endpoint-level authorization test: Authenticated user without Finance or Owner permission is rejected with HTTP 403."""
+        mock_db = MagicMock()
+        unauthorized_admin = {
+            "id": "emp_carpenter_1",
+            "name": "Carpenter Non-Finance",
+            "role": "employee",
+            "permissions": {"access_finance": False, "manage_settings": False},
+        }
+
+        # Snapshot prior dependency overrides to maintain test isolation
+        saved_overrides = dict(app.dependency_overrides)
+        dummy_dep = lambda: "unrelated_dependency"
+        app.dependency_overrides[dummy_dep] = lambda: "unrelated_value"
+
+        try:
+            app.dependency_overrides[get_current_admin] = lambda: unauthorized_admin
+            with patch("server.db", mock_db):
+                payload = {
+                    "worker_id": "w_10",
+                    "amount_le": 100.0,
+                    "payment_currency": "IDR",
+                    "settlement_rate": 357.0,
+                }
+                status, body_str = await self._call_settlement_asgi(payload)
+
+            self.assertEqual(status, 403)
+            self.assertIn("Akses ditolak: Membutuhkan akses keuangan atau owner", body_str)
+            # Ensure zero persistence writes occurred
+            mock_db.finance_transactions.insert_one.assert_not_called()
+            mock_db.wage_settlements.insert_one.assert_not_called()
+            mock_db.wage_obligations.update_one.assert_not_called()
+            mock_db.employee_wages.insert_one.assert_not_called()
+
+            # Isolation regression assertion: unrelated pre-existing overrides remain intact
+            self.assertIn(dummy_dep, app.dependency_overrides)
+            self.assertEqual(app.dependency_overrides[dummy_dep](), "unrelated_value")
+        finally:
+            # Restore previous state without clearing unrelated overrides
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(saved_overrides)
+
+    async def test_unauthenticated_call_to_settlement_endpoint_rejected(self):
+        """Endpoint-level authorization test: Unauthenticated request without token is rejected with HTTP 401."""
+        mock_db = MagicMock()
+        # Snapshot prior dependency overrides to maintain test isolation
+        saved_overrides = dict(app.dependency_overrides)
+        dummy_dep = lambda: "unrelated_unauth_dependency"
+        app.dependency_overrides[dummy_dep] = lambda: "unrelated_unauth_value"
+
+        try:
+            # Remove only the auth override if present, preserving unrelated overrides
+            app.dependency_overrides.pop(get_current_admin, None)
+            with patch("server.db", mock_db):
+                payload = {
+                    "worker_id": "w_10",
+                    "amount_le": 100.0,
+                    "payment_currency": "EGP",
+                }
+                status, body_str = await self._call_settlement_asgi(payload)
+
+            self.assertEqual(status, 401)
+            self.assertIn("Tidak terautentikasi", body_str)
+            # Ensure zero persistence writes occurred
+            mock_db.finance_transactions.insert_one.assert_not_called()
+            mock_db.wage_settlements.insert_one.assert_not_called()
+            mock_db.wage_obligations.update_one.assert_not_called()
+            mock_db.employee_wages.insert_one.assert_not_called()
+
+            # Isolation regression assertion: unrelated pre-existing overrides remain intact
+            self.assertIn(dummy_dep, app.dependency_overrides)
+            self.assertEqual(app.dependency_overrides[dummy_dep](), "unrelated_unauth_value")
+        finally:
+            # Restore previous state without clearing unrelated overrides
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(saved_overrides)
 
 
 class TestPhase1MapsRequirement(unittest.TestCase):

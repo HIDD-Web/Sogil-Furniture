@@ -503,4 +503,60 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
     expect(varianceNotice).not.toBeNull();
     expect(varianceNotice.textContent).toContain("+Rp 600");
   });
+
+  test("handles settlement API conflict error and displays error message without false success", async () => {
+    const { toast } = require("sonner");
+    toast.success.mockClear();
+
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const settleBtn = container.querySelector('[data-testid="settle-btn-w_1"]');
+    expect(settleBtn).not.toBeNull();
+    await act(async () => {
+      settleBtn.click();
+    });
+
+    const modal = container.querySelector('[data-testid="settle-wage-modal"]');
+    expect(modal).not.toBeNull();
+
+    const conflictError = Object.assign(new Error("Saldo kewajiban upah telah berubah"), {
+      response: {
+        status: 409,
+        data: { detail: "Saldo kewajiban upah telah berubah" },
+      },
+      msg: "Saldo kewajiban upah telah berubah",
+    });
+
+    api.post.mockRejectedValueOnce(conflictError);
+
+    const submitBtn = container.querySelector('[data-testid="submit-settle-btn"]');
+    expect(submitBtn).not.toBeNull();
+
+    await act(async () => {
+      submitBtn.click();
+    });
+
+    // 1. Verifies api.post was called with expected settlement payload
+    expect(api.post).toHaveBeenCalledWith(
+      "/admin/wages/settlements",
+      expect.objectContaining({
+        worker_id: "w_1",
+        amount_le: 300,
+      })
+    );
+
+    // 2. Verifies UI does NOT falsely indicate success
+    expect(toast.success).not.toHaveBeenCalled();
+
+    // 3. Verifies error message is displayed to the user
+    expect(container.textContent).toContain("Saldo kewajiban upah telah berubah");
+
+    // 4. Verifies modal remains open for user review
+    expect(container.querySelector('[data-testid="settle-wage-modal"]')).not.toBeNull();
+
+    // 5. Verifies submit control is not permanently disabled
+    expect(submitBtn.disabled).toBe(false);
+  });
 });
