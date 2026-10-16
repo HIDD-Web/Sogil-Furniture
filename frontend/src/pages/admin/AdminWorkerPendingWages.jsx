@@ -74,6 +74,8 @@ export default function AdminWorkerPendingWages() {
   const [settleRate, setSettleRate] = useState("");
   const [settleIsOverride, setSettleIsOverride] = useState(false);
   const [settleOverrideReason, setSettleOverrideReason] = useState("");
+  const [settleActualPayout, setSettleActualPayout] = useState("");
+  const [settleIsCustomPayout, setSettleIsCustomPayout] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [settleError, setSettleError] = useState("");
 
@@ -132,6 +134,8 @@ export default function AdminWorkerPendingWages() {
     setSettleRate("");
     setSettleIsOverride(false);
     setSettleOverrideReason("");
+    setSettleActualPayout("");
+    setSettleIsCustomPayout(false);
     setSettleDate(new Date().toISOString().slice(0, 10));
     setSettleIdempotencyKey(generateUUID());
     setSettleModalOpen(true);
@@ -172,6 +176,7 @@ export default function AdminWorkerPendingWages() {
     }
 
     let numRate = undefined;
+    let customActualPayout = undefined;
     if (settleCurrency === "IDR") {
       numRate = parseFloat(settleRate);
       if (isNaN(numRate) || numRate <= 0) {
@@ -181,6 +186,22 @@ export default function AdminWorkerPendingWages() {
       if (settleIsOverride && (!settleOverrideReason || settleOverrideReason.trim().length < 3)) {
         setSettleError("Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)");
         return;
+      }
+
+      if (settleIsCustomPayout && settleActualPayout !== "") {
+        customActualPayout = parseFloat(settleActualPayout);
+        if (isNaN(customActualPayout) || customActualPayout <= 0) {
+          setSettleError("Nominal pencairan IDR aktual harus berupa angka positif yang valid");
+          return;
+        }
+        const stdIdr = Math.round(amt * numRate);
+        if (Math.round(customActualPayout) !== stdIdr) {
+          const reasonOrNote = (settleOverrideReason || settleNotes || "").trim();
+          if (reasonOrNote.length < 3) {
+            setSettleError("Alasan / catatan wajib diisi jika nominal pencairan IDR berbeda dari hasil konversi standar (minimal 3 karakter)");
+            return;
+          }
+        }
       }
     }
 
@@ -196,6 +217,7 @@ export default function AdminWorkerPendingWages() {
         settlement_rate: settleCurrency === "IDR" ? numRate : undefined,
         is_rate_override: settleCurrency === "IDR" ? settleIsOverride : false,
         override_reason: (settleCurrency === "IDR" && settleIsOverride) ? settleOverrideReason.trim() : undefined,
+        actual_payout_amount: (settleCurrency === "IDR" && settleIsCustomPayout && customActualPayout !== undefined) ? customActualPayout : undefined,
         payment_date: settleDate,
         reference: settleRef.trim() || undefined,
         notes: settleNotes.trim() || undefined,
@@ -587,8 +609,28 @@ export default function AdminWorkerPendingWages() {
                       <td className="py-3 font-semibold text-[#8B5A2B]">{s.settlement_number}</td>
                       <td className="text-[#5C4A3D]">{s.settlement_date || s.created_at?.slice(0, 10)}</td>
                       <td className="font-medium text-[#2C1E16]">{s.worker_name}</td>
-                      <td className="capitalize text-[#5C4A3D]">{s.payment_method === "cash" ? "Tunai" : s.payment_method}</td>
-                      <td className="text-right font-bold text-emerald-800">{money(s.amount_le)}</td>
+                      <td>
+                        <div className="flex items-center gap-1.5">
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${
+                            (s.payout_currency || "EGP") === "IDR"
+                              ? "bg-purple-100 text-purple-800"
+                              : "bg-amber-100 text-amber-800"
+                          }`}>
+                            {s.payout_currency || "EGP"}
+                          </span>
+                          <span className="capitalize text-[#5C4A3D] text-xs">
+                            {s.payment_method === "cash" ? "Tunai" : s.payment_method}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="text-right">
+                        <div className="font-bold text-emerald-800">{money(s.amount_le)}</div>
+                        {(s.payout_currency === "IDR" || (s.payout_amount && s.payout_currency !== "EGP")) && (
+                          <div className="text-[10px] text-[#8B7355] font-medium">
+                            Rp {Number(s.payout_amount || 0).toLocaleString("id-ID")}
+                          </div>
+                        )}
+                      </td>
                       <td className="text-center">
                         <span
                           className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase ${
@@ -720,89 +762,153 @@ export default function AdminWorkerPendingWages() {
             </div>
 
             {/* IDR Conversion & Rate Override Card */}
-            {settleCurrency === "IDR" && (
-              <div className="mt-3 rounded-xl bg-amber-50/70 p-3 border border-amber-200 text-xs space-y-2.5">
-                <div className="flex justify-between items-center">
-                  <span className="font-semibold text-amber-950">Kurs Referensi Terkunci:</span>
-                  <span className="font-bold text-amber-900" data-testid="locked-rate-display">
-                    {settleLockedRate ? `1 LE = Rp ${Number(settleLockedRate).toLocaleString("id-ID")}` : "Tidak tersedia (Kewajiban lama)"}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center pt-1 border-t border-amber-200/60">
-                  <span className="text-[#5C4A3D]">Estimasi Pencairan IDR:</span>
-                  <span className="font-bold text-base text-[#8B5A2B]" data-testid="estimated-idr-payout">
-                    Rp {Math.round((parseFloat(settleAmount) || 0) * (parseFloat(settleRate) || 0)).toLocaleString("id-ID")}
-                  </span>
-                </div>
-                <p className="text-[11px] text-[#8B7355] leading-relaxed">
-                  Kewajiban upah pekerja terutang berkurang sebesar <strong>{parseFloat(settleAmount) || 0} LE</strong>. Rekening Bank IDR berkurang <strong>Rp {Math.round((parseFloat(settleAmount) || 0) * (parseFloat(settleRate) || 0)).toLocaleString("id-ID")}</strong>.
-                </p>
+            {settleCurrency === "IDR" && (() => {
+              const amtNum = parseFloat(settleAmount) || 0;
+              const rateNum = parseFloat(settleRate) || 0;
+              const standardIdr = Math.round(amtNum * rateNum);
+              const currentActualIdr = (settleIsCustomPayout && settleActualPayout !== "") ? Math.round(parseFloat(settleActualPayout) || 0) : standardIdr;
+              const payoutVariance = currentActualIdr - standardIdr;
 
-                {/* Override rate toggle / controls */}
-                {settleLockedRate ? (
+              return (
+                <div className="mt-3 rounded-xl bg-amber-50/70 p-3 border border-amber-200 text-xs space-y-2.5">
+                  <div className="flex justify-between items-center">
+                    <span className="font-semibold text-amber-950">Kurs Referensi Terkunci:</span>
+                    <span className="font-bold text-amber-900" data-testid="locked-rate-display">
+                      {settleLockedRate ? `1 LE = Rp ${Number(settleLockedRate).toLocaleString("id-ID")}` : "Tidak tersedia (Kewajiban lama)"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center pt-1 border-t border-amber-200/60">
+                    <span className="text-[#5C4A3D]">Estimasi Konversi Standar IDR:</span>
+                    <span className="font-bold text-base text-[#8B5A2B]" data-testid="estimated-idr-payout">
+                      Rp {standardIdr.toLocaleString("id-ID")}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-[#8B7355] leading-relaxed">
+                    Kewajiban upah pekerja terutang berkurang sebesar <strong>{amtNum} LE</strong>. Rekening Bank IDR berkurang <strong>Rp {currentActualIdr.toLocaleString("id-ID")}</strong>.
+                  </p>
+
+                  {/* Custom Actual IDR Payout Control */}
                   <div className="pt-2 border-t border-amber-200/60 space-y-2">
                     <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950">
                       <input
                         type="checkbox"
-                        checked={settleIsOverride}
+                        checked={settleIsCustomPayout}
                         onChange={(e) => {
-                          setSettleIsOverride(e.target.checked);
-                          if (!e.target.checked && settleLockedRate) {
-                            setSettleRate(String(settleLockedRate));
-                            setSettleOverrideReason("");
+                          setSettleIsCustomPayout(e.target.checked);
+                          if (!e.target.checked) {
+                            setSettleActualPayout("");
+                          } else {
+                            setSettleActualPayout(String(standardIdr));
                           }
                         }}
-                        data-testid="rate-override-toggle"
+                        data-testid="custom-payout-toggle"
                         className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B]"
                       />
-                      <span>Ubah kurs penyelesaian aktual (Override Kurs)</span>
+                      <span>Sesuaikan nominal pencairan IDR aktual (Transfer/Tunai riil)</span>
                     </label>
 
-                    {settleIsOverride && (
+                    {settleIsCustomPayout && (
                       <div className="space-y-2 pt-1">
                         <div>
-                          <Label className="text-[11px] text-[#5C4A3D]">Kurs Override (Rp per LE) *</Label>
+                          <Label className="text-[11px] text-[#5C4A3D]">Nominal Pencairan IDR Aktual (Rp) *</Label>
                           <Input
                             type="number"
-                            step="0.01"
+                            step="1"
                             required
-                            placeholder="Contoh: 360"
-                            value={settleRate}
-                            onChange={(e) => setSettleRate(e.target.value)}
+                            placeholder={`Contoh: ${standardIdr}`}
+                            value={settleActualPayout}
+                            onChange={(e) => setSettleActualPayout(e.target.value)}
                             className="bg-white border-amber-300 text-xs font-semibold mt-1"
-                            data-testid="settle-override-rate-input"
+                            data-testid="settle-actual-payout-input"
                           />
                         </div>
-                        <div>
-                          <Label className="text-[11px] text-[#5C4A3D]">Alasan Perubahan Kurs (Wajib dicatat untuk audit) *</Label>
-                          <Input
-                            placeholder="Contoh: Penyesuaian kurs transfer bank BCA riil"
-                            value={settleOverrideReason}
-                            onChange={(e) => setSettleOverrideReason(e.target.value)}
-                            className="bg-white border-amber-300 text-xs mt-1"
-                            data-testid="settle-override-reason-input"
-                          />
-                        </div>
+
+                        {payoutVariance !== 0 && (
+                          <div
+                            className="rounded-lg p-2.5 border bg-amber-100/70 border-amber-300 text-amber-950 text-xs space-y-1"
+                            data-testid="payout-variance-warning"
+                          >
+                            <div className="flex items-center justify-between font-semibold">
+                              <span>Selisih Konversi Aktual:</span>
+                              <span className={payoutVariance > 0 ? "text-amber-900 font-bold" : "text-blue-900 font-bold"}>
+                                {payoutVariance > 0 ? `+Rp ${payoutVariance.toLocaleString("id-ID")}` : `-Rp ${Math.abs(payoutVariance).toLocaleString("id-ID")}`}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-amber-900 leading-tight">
+                              <strong>Validasi Kewajiban:</strong> Pengurangan hutang upah pekerja tetap dihitung sebesar <strong>{amtNum} LE</strong>. Selisih pembayaran aktual ini ({payoutVariance > 0 ? "+" : ""}Rp {payoutVariance.toLocaleString("id-ID")}) dicatat dalam audit trail tanpa menghapus sisa saldo LE pekerja secara sepihak.
+                            </p>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
-                ) : (
-                  <div className="pt-2 border-t border-amber-200/60 space-y-1">
-                    <Label className="text-[11px] text-[#5C4A3D]">Kurs Penyelesaian IDR (Rp per LE) *</Label>
-                    <Input
-                      type="number"
-                      step="0.01"
-                      required
-                      placeholder="Masukkan kurs penyelesaian..."
-                      value={settleRate}
-                      onChange={(e) => setSettleRate(e.target.value)}
-                      className="bg-white border-amber-300 text-xs font-semibold mt-1"
-                      data-testid="settle-rate-legacy-input"
-                    />
-                  </div>
-                )}
-              </div>
-            )}
+
+                  {/* Override rate toggle / controls */}
+                  {settleLockedRate ? (
+                    <div className="pt-2 border-t border-amber-200/60 space-y-2">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950">
+                        <input
+                          type="checkbox"
+                          checked={settleIsOverride}
+                          onChange={(e) => {
+                            setSettleIsOverride(e.target.checked);
+                            if (!e.target.checked && settleLockedRate) {
+                              setSettleRate(String(settleLockedRate));
+                              setSettleOverrideReason("");
+                            }
+                          }}
+                          data-testid="rate-override-toggle"
+                          className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B]"
+                        />
+                        <span>Ubah kurs penyelesaian aktual (Override Kurs)</span>
+                      </label>
+
+                      {settleIsOverride && (
+                        <div className="space-y-2 pt-1">
+                          <div>
+                            <Label className="text-[11px] text-[#5C4A3D]">Kurs Override (Rp per LE) *</Label>
+                            <Input
+                              type="number"
+                              step="0.01"
+                              required
+                              placeholder="Contoh: 360"
+                              value={settleRate}
+                              onChange={(e) => setSettleRate(e.target.value)}
+                              className="bg-white border-amber-300 text-xs font-semibold mt-1"
+                              data-testid="settle-override-rate-input"
+                            />
+                          </div>
+                          <div>
+                            <Label className="text-[11px] text-[#5C4A3D]">Alasan Perubahan Kurs (Wajib dicatat untuk audit) *</Label>
+                            <Input
+                              placeholder="Contoh: Penyesuaian kurs transfer bank BCA riil"
+                              value={settleOverrideReason}
+                              onChange={(e) => setSettleOverrideReason(e.target.value)}
+                              className="bg-white border-amber-300 text-xs mt-1"
+                              data-testid="settle-override-reason-input"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="pt-2 border-t border-amber-200/60 space-y-1">
+                      <Label className="text-[11px] text-[#5C4A3D]">Kurs Penyelesaian IDR (Rp per LE) *</Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        required
+                        placeholder="Masukkan kurs penyelesaian..."
+                        value={settleRate}
+                        onChange={(e) => setSettleRate(e.target.value)}
+                        className="bg-white border-amber-300 text-xs font-semibold mt-1"
+                        data-testid="settle-rate-legacy-input"
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             <form onSubmit={handleSettleSubmit} className="mt-4 space-y-3">
               <div>
@@ -951,17 +1057,73 @@ export default function AdminWorkerPendingWages() {
                 <p className="font-semibold text-[#2C1E16]">{selectedSettlement.settlement_date}</p>
               </div>
               <div>
-                <span className="text-[#8B7355]">Nominal Dibayar:</span>
+                <span className="text-[#8B7355]">Nominal Kewajiban LE:</span>
                 <p className="font-bold text-emerald-800 text-sm">{money(selectedSettlement.amount_le)}</p>
               </div>
               <div>
-                <span className="text-[#8B7355]">Metode:</span>
-                <p className="font-medium text-[#2C1E16] capitalize">{selectedSettlement.payment_method}</p>
+                <span className="text-[#8B7355]">Mata Uang & Metode:</span>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${
+                    (selectedSettlement.payout_currency || "EGP") === "IDR"
+                      ? "bg-purple-100 text-purple-800 border border-purple-200"
+                      : "bg-amber-100 text-amber-800 border border-amber-200"
+                  }`}>
+                    {selectedSettlement.payout_currency || "EGP"}
+                  </span>
+                  <span className="font-medium text-[#2C1E16] capitalize">
+                    {selectedSettlement.payment_method === "cash" ? "Tunai" : selectedSettlement.payment_method}
+                  </span>
+                </div>
               </div>
+
+              {selectedSettlement.payout_currency === "IDR" && (
+                <>
+                  <div>
+                    <span className="text-[#8B7355]">Nominal Pencairan IDR:</span>
+                    <p className="font-bold text-[#8B5A2B] text-sm" data-testid="detail-payout-idr">
+                      Rp {Number(selectedSettlement.payout_amount || 0).toLocaleString("id-ID")}
+                    </p>
+                  </div>
+                  <div>
+                    <span className="text-[#8B7355]">Kurs Digunakan:</span>
+                    <p className="font-semibold text-[#2C1E16]">
+                      1 LE = Rp {Number(selectedSettlement.settlement_rate || selectedSettlement.locked_exchange_rate || 0).toLocaleString("id-ID")}
+                      {selectedSettlement.is_rate_override && (
+                        <span className="ml-1 text-[10px] font-bold text-amber-700 bg-amber-50 px-1 py-0.5 rounded border border-amber-200">
+                          (Override)
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                  {selectedSettlement.is_rate_override && selectedSettlement.override_reason && (
+                    <div className="col-span-2">
+                      <span className="text-[#8B7355]">Alasan Override Kurs:</span>
+                      <p className="text-[#2C1E16] bg-amber-50/70 p-1.5 rounded border border-amber-200 text-[11px]">
+                        {selectedSettlement.override_reason}
+                      </p>
+                    </div>
+                  )}
+                  {Number(selectedSettlement.variance_idr || 0) !== 0 && (
+                    <div className="col-span-2" data-testid="detail-variance-notice">
+                      <span className="text-[#8B7355]">Selisih Pencairan Aktual:</span>
+                      <p className="text-[#2C1E16] bg-blue-50/70 p-1.5 rounded border border-blue-200 text-[11px]">
+                        {Number(selectedSettlement.variance_idr) > 0 ? "+" : ""}Rp {Number(selectedSettlement.variance_idr).toLocaleString("id-ID")} dari konversi standar Rp {Number(selectedSettlement.standard_payout_amount || 0).toLocaleString("id-ID")}. Pengurangan kewajiban LE tetap murni sebesar {selectedSettlement.amount_le} LE.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+
               {selectedSettlement.reference && (
                 <div className="col-span-2">
                   <span className="text-[#8B7355]">Referensi:</span>
                   <p className="text-[#2C1E16]">{selectedSettlement.reference}</p>
+                </div>
+              )}
+              {selectedSettlement.notes && (
+                <div className="col-span-2">
+                  <span className="text-[#8B7355]">Catatan:</span>
+                  <p className="text-[#2C1E16]">{selectedSettlement.notes}</p>
                 </div>
               )}
             </div>

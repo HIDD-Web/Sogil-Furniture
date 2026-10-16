@@ -699,6 +699,325 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ctx.exception.status_code, 422)
             self.assertIn("Kurs penyelesaian IDR wajib diisi secara eksplisit", ctx.exception.detail)
 
+    async def test_settings_rate_change_does_not_affect_locked_rate_settlement(self):
+        """Settings rate changed to 500 after order creation does NOT affect locked rate (357)."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef17"),
+            "worker_id": "w_10",
+            "obligation_number": "WOB-004",
+            "total_amount_le": 100.0,
+            "paid_amount_le": 0.0,
+            "currency": "EGP",
+            "status": "accrued",
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.employee_wages.insert_one = AsyncMock()
+        mock_db.wage_settlements.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.wage_obligations.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
+        # Settings rate is changed to 500
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 500})
+
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="IDR",
+            payment_method="bank_transfer",
+        )
+
+        with patch("server.db", mock_db), \
+             patch("server.client.start_session", AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))), \
+             patch("server.is_standalone_fallback_permitted", return_value=True):
+            res = await admin_create_wage_settlement(payload, self.admin)
+
+        self.assertIsNotNone(res)
+        # Transaction and settlement must use locked rate 357, NOT settings rate 500
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["exchange_rate"], 357.0)
+        self.assertEqual(txn_call["amount"], 35700.0)
+
+        st_call = mock_db.wage_settlements.insert_one.call_args[0][0]
+        self.assertEqual(st_call["settlement_rate"], 357.0)
+        self.assertEqual(st_call["payout_amount"], 35700.0)
+
+    async def test_partial_idr_settlement_leaves_correct_remaining_le_liability(self):
+        """Partial IDR payment reduces obligation strictly in LE and leaves exact remaining LE balance."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef18"),
+            "worker_id": "w_10",
+            "obligation_number": "WOB-005",
+            "total_amount_le": 200.0,
+            "paid_amount_le": 0.0,
+            "currency": "EGP",
+            "status": "accrued",
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.employee_wages.insert_one = AsyncMock()
+        mock_db.wage_settlements.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.wage_obligations.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
+
+        # Settle partial 75 LE out of 200 LE in IDR
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=75.0,
+            payment_currency="IDR",
+            payment_method="bank_transfer",
+        )
+
+        with patch("server.db", mock_db), \
+             patch("server.client.start_session", AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))), \
+             patch("server.is_standalone_fallback_permitted", return_value=True):
+            res = await admin_create_wage_settlement(payload, self.admin)
+
+        self.assertIsNotNone(res)
+        # Bank account deducted in IDR: 75 * 357 = 26775 IDR
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["account"], "IDR")
+        self.assertEqual(txn_call["amount"], 26775.0)
+
+        # Obligation updated: paid_amount_le becomes 75.0, status becomes partially_paid
+        ob_call = mock_db.wage_obligations.update_one.call_args[0][1]
+        self.assertEqual(ob_call["$set"]["paid_amount_le"], 75.0)
+        self.assertEqual(ob_call["$set"]["status"], "partially_paid")
+
+    async def test_customized_actual_idr_payout_with_variance_and_reason(self):
+        """Customized IDR nominal (e.g. transfer rounding) validates variance, logs audit, and preserves exact LE liability."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef19"),
+            "worker_id": "w_10",
+            "obligation_number": "WOB-006",
+            "total_amount_le": 100.0,
+            "paid_amount_le": 0.0,
+            "currency": "EGP",
+            "status": "accrued",
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.employee_wages.insert_one = AsyncMock()
+        mock_db.wage_settlements.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.wage_obligations.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
+
+        # Standard is 100 * 357 = 35700. Admin disburses 36000 (+300 variance)
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="IDR",
+            payment_method="bank_transfer",
+            actual_payout_amount=36000.0,
+            notes="Pembulatan transfer bank BCA",
+        )
+
+        with patch("server.db", mock_db), \
+             patch("server.client.start_session", AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))), \
+             patch("server.is_standalone_fallback_permitted", return_value=True):
+            res = await admin_create_wage_settlement(payload, self.admin)
+
+        self.assertIsNotNone(res)
+        # Finance transaction deducted actual payout: 36000 IDR
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["amount"], 36000.0)
+
+        # Settlement document records both standard and actual payout and variance
+        st_call = mock_db.wage_settlements.insert_one.call_args[0][0]
+        self.assertEqual(st_call["payout_amount"], 36000.0)
+        self.assertEqual(st_call["standard_payout_amount"], 35700.0)
+        self.assertEqual(st_call["variance_idr"], 300.0)
+        self.assertEqual(st_call["amount_le"], 100.0)
+
+        # Obligation liability reduction remains strictly 100 LE
+        ob_call = mock_db.wage_obligations.update_one.call_args[0][1]
+        self.assertEqual(ob_call["$set"]["paid_amount_le"], 100.0)
+        self.assertEqual(ob_call["$set"]["status"], "paid")
+
+        # Audit log was created for payout variance
+        variance_logs = [c for c in mock_db.audit_logs.insert_one.call_args_list if c[0][0].get("action") == "wage_settlement_payout_variance"]
+        self.assertEqual(len(variance_logs), 1)
+        self.assertEqual(variance_logs[0][0][0]["metadata"]["variance_idr"], 300.0)
+
+    async def test_customized_actual_idr_payout_rejection_without_reason(self):
+        """Customized IDR nominal with variance requires explanation (notes or override_reason)."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef1a"),
+            "worker_id": "w_10",
+            "total_amount_le": 100.0,
+            "paid_amount_le": 0.0,
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="IDR",
+            actual_payout_amount=36000.0,  # Variance +300 without reason or notes
+            notes="",
+        )
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as ctx:
+                await admin_create_wage_settlement(payload, self.admin)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertIn("Alasan/keterangan wajib diisi", ctx.exception.detail)
+
+    async def test_customized_actual_idr_payout_invalid_nominal_rejected(self):
+        """Negative or non-finite actual IDR payout is rejected with HTTP 422."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef1b"),
+            "worker_id": "w_10",
+            "total_amount_le": 100.0,
+            "paid_amount_le": 0.0,
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="IDR",
+            actual_payout_amount=-500.0,  # Negative nominal
+            notes="Invalid test",
+        )
+
+        with patch("server.db", mock_db):
+            with self.assertRaises(HTTPException) as ctx:
+                await admin_create_wage_settlement(payload, self.admin)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertIn("angka positif yang valid", ctx.exception.detail)
+
+    async def test_duplicate_submission_with_idempotency_key_prevents_duplicate_settlement(self):
+        """Duplicate request with same idempotency key returns existing settlement without duplicate expense."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+
+        existing_settlement = {
+            "_id": ObjectId("670868f123456789abcdef1c"),
+            "settlement_number": "WST-202610-0010",
+            "worker_id": "w_10",
+            "amount_le": 100.0,
+            "payment_method": "cash",
+            "payout_currency": "EGP",
+            "payout_amount": 100.0,
+            "idempotency_key": "idem-key-12345",
+            "status": "recorded",
+        }
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=existing_settlement)
+
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="EGP",
+            payment_method="cash",
+            idempotency_key="idem-key-12345",
+        )
+
+        with patch("server.db", mock_db):
+            res = await admin_create_wage_settlement(payload, self.admin)
+
+        self.assertEqual(res["settlement_number"], "WST-202610-0010")
+        # No new finance transactions or settlements inserted
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.wage_settlements.insert_one.assert_not_called()
+
+    async def test_settlement_failure_compensating_rollback_leaves_consistent_state(self):
+        """Failure during settlement (e.g. concurrency update conflict) triggers compensating cleanup."""
+        mock_db = MagicMock()
+        mock_db.admins.find_one = AsyncMock(return_value=self.worker)
+        mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+
+        ob_doc = {
+            "_id": ObjectId("670868f123456789abcdef1d"),
+            "worker_id": "w_10",
+            "obligation_number": "WOB-007",
+            "total_amount_le": 100.0,
+            "paid_amount_le": 0.0,
+            "currency": "EGP",
+            "status": "accrued",
+            "locked_exchange_rate": 357.0,
+        }
+        find_ob_mock = MagicMock()
+        find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
+        mock_db.wage_obligations.find.return_value = find_ob_mock
+
+        inserted_txn_id = ObjectId()
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=inserted_txn_id))
+        mock_db.employee_wages.insert_one = AsyncMock()
+        mock_db.wage_settlements.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        # Simulate optimistic concurrency conflict: modified_count == 0
+        mock_db.wage_obligations.update_one = AsyncMock(return_value=MagicMock(modified_count=0))
+        mock_db.finance_transactions.delete_one = AsyncMock()
+        mock_db.employee_wages.delete_many = AsyncMock()
+        mock_db.wage_settlements.delete_one = AsyncMock()
+        mock_db.wage_obligations.update_many = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
+
+        payload = WageSettlementCreateInput(
+            worker_id="w_10",
+            amount_le=100.0,
+            payment_currency="IDR",
+            payment_method="bank_transfer",
+        )
+
+        with patch("server.db", mock_db), \
+             patch("server.client.start_session", AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))), \
+             patch("server.is_standalone_fallback_permitted", return_value=True):
+            with self.assertRaises(HTTPException) as ctx:
+                await admin_create_wage_settlement(payload, self.admin)
+            self.assertEqual(ctx.exception.status_code, 409)
+
+        # Confirm compensating deletion was invoked
+        mock_db.finance_transactions.delete_one.assert_called()
+        mock_db.employee_wages.delete_many.assert_called()
+
 
 class TestPhase1MapsRequirement(unittest.TestCase):
     """Verifies that Google Maps URLs are strictly validated and mandated for delivery orders

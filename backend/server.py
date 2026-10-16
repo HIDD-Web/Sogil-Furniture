@@ -4029,8 +4029,11 @@ async def admin_create_wage_settlement(
         async for ord_doc in db.orders.find({"_id": {"$in": multi_id_query(ob_order_ids)}}):
             ob_orders_map[str(ord_doc["_id"])] = ord_doc
 
+    allocated_ids = {str(item.wage_obligation_id).strip() for item in payload.allocations} if payload.allocations else set()
     locked_rates = []
     for o in worker_obligations:
+        if allocated_ids and str(o.get("_id")) not in allocated_ids and str(o.get("id")) not in allocated_ids:
+            continue
         l_rate = None
         if o.get("locked_exchange_rate"):
             l_rate = _num(o.get("locked_exchange_rate"))
@@ -4043,13 +4046,30 @@ async def admin_create_wage_settlement(
         if l_rate and l_rate > 0:
             locked_rates.append(l_rate)
 
+    # Fallback if no allocated obligations had a rate (or no allocations provided)
+    if not locked_rates:
+        for o in worker_obligations:
+            l_rate = None
+            if o.get("locked_exchange_rate"):
+                l_rate = _num(o.get("locked_exchange_rate"))
+            elif o.get("rate_policy_snapshot", {}).get("exchange_rate"):
+                l_rate = _num(o.get("rate_policy_snapshot", {}).get("exchange_rate"))
+            elif o.get("order_id"):
+                ord_doc = ob_orders_map.get(str(o.get("order_id")))
+                if ord_doc and ord_doc.get("exchange_rate_idr_per_le"):
+                    l_rate = _num(ord_doc.get("exchange_rate_idr_per_le"))
+            if l_rate and l_rate > 0:
+                locked_rates.append(l_rate)
+
     reference_locked_rate = locked_rates[0] if locked_rates else None
 
     # Handle IDR vs EGP rate resolution
     is_override = False
     override_reason = None
     actual_rate = None
+    standard_payout_amount = disbursed_amount
     actual_payout_amount = disbursed_amount
+    variance_idr = 0
 
     if payment_currency == "IDR":
         primary_account = "IDR"
@@ -4086,12 +4106,37 @@ async def admin_create_wage_settlement(
             if payload.override_reason and payload.override_reason.strip():
                 override_reason = payload.override_reason.strip()
 
-        actual_payout_amount = round(disbursed_amount * actual_rate)
+        standard_payout_amount = round(disbursed_amount * actual_rate)
+        if payload.actual_payout_amount is not None:
+            if not (math.isfinite(payload.actual_payout_amount) and payload.actual_payout_amount > 0):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Nominal pencairan IDR aktual harus berupa angka positif yang valid."
+                )
+            actual_payout_amount = round(float(payload.actual_payout_amount))
+            variance_idr = actual_payout_amount - standard_payout_amount
+            if variance_idr != 0:
+                explanation = (payload.override_reason or payload.notes or "").strip()
+                if len(explanation) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Alasan/keterangan wajib diisi saat nominal pencairan IDR aktual berbeda dari konversi standar (minimal 3 karakter)."
+                    )
+        else:
+            actual_payout_amount = standard_payout_amount
+            variance_idr = 0
     else:
         # EGP payment
         primary_account = "EGP"
         actual_rate = reference_locked_rate
         actual_payout_amount = disbursed_amount
+        standard_payout_amount = disbursed_amount
+        variance_idr = 0
+        if payload.actual_payout_amount is not None and round(float(payload.actual_payout_amount), 2) != disbursed_amount:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Untuk pembayaran EGP, nominal pencairan ({payload.actual_payout_amount}) harus sama dengan nominal kewajiban yang dilunasi ({disbursed_amount} LE)."
+            )
 
     resolved_allocations = []
     if payload.allocations and len(payload.allocations) > 0:
@@ -4209,6 +4254,8 @@ async def admin_create_wage_settlement(
         "currency": "EGP",
         "payout_currency": payment_currency,
         "payout_amount": actual_payout_amount,
+        "standard_payout_amount": standard_payout_amount,
+        "variance_idr": variance_idr,
         "locked_exchange_rate": reference_locked_rate,
         "settlement_rate": actual_rate if payment_currency == "IDR" else None,
         "is_rate_override": is_override,
@@ -4300,10 +4347,10 @@ async def admin_create_wage_settlement(
                     detail=f"Saldo kewajiban upah ({a['obligation_number']}) telah berubah oleh proses lain. Harap muat ulang."
                 )
 
-        # 6. Audit logging if rate override occurred
-        if is_override:
+        # 6. Audit logging if rate override or payout variance occurred
+        if is_override or variance_idr != 0:
             await record_audit_log(
-                action="wage_settlement_rate_override",
+                action="wage_settlement_rate_override" if is_override else "wage_settlement_payout_variance",
                 entity_type="wage_settlement",
                 entity_id=settlement_id,
                 entity_identifier=settlement_num,
@@ -4314,10 +4361,12 @@ async def admin_create_wage_settlement(
                     "wage_obligation_ids": [a["wage_obligation_id"] for a in resolved_allocations],
                     "original_locked_rate": reference_locked_rate,
                     "override_rate": actual_rate,
-                    "override_reason": override_reason,
+                    "override_reason": override_reason or (payload.notes or "").strip(),
                     "disbursed_amount_le": disbursed_amount,
                     "actual_payout_amount": actual_payout_amount,
-                    "payout_currency": "IDR",
+                    "standard_payout_amount": standard_payout_amount,
+                    "variance_idr": variance_idr,
+                    "payout_currency": payment_currency,
                 },
                 session=session
             )
@@ -4384,7 +4433,13 @@ async def admin_create_wage_settlement(
         if idem_key and ("uniq_wage_settlements_idempotency" in err_msg or idem_key in err_msg):
             winning = await db.wage_settlements.find_one({"idempotency_key": idem_key})
             if winning:
-                if str(winning.get("worker_id")) != worker_id or round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or winning.get("payment_method") != payment_method:
+                if (
+                    str(winning.get("worker_id")) != worker_id or
+                    round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or
+                    winning.get("payment_method") != payment_method or
+                    (winning.get("payout_currency") or "EGP") != payment_currency or
+                    round(float(winning.get("payout_amount", 0))) != round(float(actual_payout_amount))
+                ):
                     raise HTTPException(
                         status_code=409,
                         detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."

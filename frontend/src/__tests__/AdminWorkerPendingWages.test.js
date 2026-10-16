@@ -375,4 +375,132 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
       })
     );
   });
+
+  test("customizing actual IDR payout displays variance warning and sends actual_payout_amount", async () => {
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const settleBtn = container.querySelector('[data-testid="settle-btn-w_1"]');
+    await act(async () => {
+      settleBtn.click();
+    });
+
+    const idrBtn = container.querySelector('[data-testid="settle-currency-idr-btn"]');
+    await act(async () => {
+      idrBtn.click();
+    });
+
+    const customPayoutToggle = container.querySelector('[data-testid="custom-payout-toggle"]');
+    expect(customPayoutToggle).not.toBeNull();
+    await act(async () => {
+      customPayoutToggle.click();
+    });
+
+    const actualPayoutInput = container.querySelector('[data-testid="settle-actual-payout-input"]');
+    expect(actualPayoutInput).not.toBeNull();
+    expect(actualPayoutInput.value).toBe("107100");
+
+    // Edit to 108000 (+900 variance)
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      nativeSetter.call(actualPayoutInput, "108000");
+      actualPayoutInput.dispatchEvent(new Event("change", { bubbles: true }));
+      actualPayoutInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const varianceWarning = container.querySelector('[data-testid="payout-variance-warning"]');
+    expect(varianceWarning).not.toBeNull();
+    expect(varianceWarning.textContent).toContain("+Rp 900");
+    expect(varianceWarning.textContent).toContain("300 LE");
+
+    // Provide note for variance
+    const notesInput = container.querySelector('[data-testid="settle-notes-input"]');
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+      nativeSetter.call(notesInput, "Pembulatan transfer bank");
+      notesInput.dispatchEvent(new Event("change", { bubbles: true }));
+      notesInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const submitBtn = container.querySelector('[data-testid="submit-settle-btn"]');
+    await act(async () => {
+      submitBtn.click();
+    });
+
+    expect(api.post).toHaveBeenCalledWith(
+      "/admin/wages/settlements",
+      expect.objectContaining({
+        worker_id: "w_1",
+        amount_le: 300,
+        payment_currency: "IDR",
+        actual_payout_amount: 108000,
+        notes: "Pembulatan transfer bank",
+      })
+    );
+  });
+
+  test("settlement detail modal renders IDR payout amount, exchange rate, and variance notice", async () => {
+    const mockIdrSettlements = [
+      {
+        id: "st_idr",
+        settlement_number: "WST-202610-0099",
+        worker_name: "Ahmed Tukang",
+        settlement_date: "2026-10-15",
+        amount_le: 200.0,
+        payout_currency: "IDR",
+        payout_amount: 72000.0,
+        standard_payout_amount: 71400.0,
+        variance_idr: 600.0,
+        locked_exchange_rate: 357.0,
+        settlement_rate: 357.0,
+        is_rate_override: false,
+        payment_method: "bank_transfer",
+        status: "recorded",
+      },
+    ];
+
+    api.get.mockImplementation((url) => {
+      if (url === "/admin/wages/settlements") {
+        return Promise.resolve({ data: { settlements: mockIdrSettlements, total: 1 } });
+      }
+      if (url === "/admin/wages/pending-summary") {
+        return Promise.resolve({ data: mockSummary });
+      }
+      if (url === "/admin/wage-obligations") {
+        return Promise.resolve({ data: { obligations: mockObligations, total: 1 } });
+      }
+      if (url === "/admin/employees") {
+        return Promise.resolve({ data: mockEmployees });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const stTabBtn = container.querySelector('[data-testid="tab-settlements"]');
+    await act(async () => {
+      stTabBtn.click();
+    });
+
+    const viewDetailBtn = container.querySelector('[data-testid="view-settlement-btn-st_idr"]');
+    expect(viewDetailBtn).not.toBeNull();
+    await act(async () => {
+      viewDetailBtn.click();
+    });
+
+    const detailModal = container.querySelector('[data-testid="settlement-detail-modal"]');
+    expect(detailModal).not.toBeNull();
+    expect(detailModal.textContent).toContain("WST-202610-0099");
+
+    const idrPayout = container.querySelector('[data-testid="detail-payout-idr"]');
+    expect(idrPayout).not.toBeNull();
+    expect(idrPayout.textContent).toContain("72.000");
+
+    const varianceNotice = container.querySelector('[data-testid="detail-variance-notice"]');
+    expect(varianceNotice).not.toBeNull();
+    expect(varianceNotice.textContent).toContain("+Rp 600");
+  });
 });
