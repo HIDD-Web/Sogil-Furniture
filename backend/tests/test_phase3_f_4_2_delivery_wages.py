@@ -83,7 +83,10 @@ class MockCollection:
         if not filter_q:
             return True
         for k, v in filter_q.items():
-            if k == "_id":
+            if k == "$or":
+                if not any(self._matches(doc, cond) for cond in v):
+                    return False
+            elif k == "_id":
                 if isinstance(v, dict) and "$in" in v:
                     vals = [str(x) for x in v["$in"]]
                     if str(doc.get("_id")) not in vals:
@@ -91,6 +94,9 @@ class MockCollection:
                 else:
                     if str(doc.get("_id")) != str(v):
                         return False
+            elif isinstance(v, dict) and "$in" in v:
+                if doc.get(k) not in v["$in"]:
+                    return False
             elif k == "stops.outcome":
                 if isinstance(v, dict) and "$ne" in v:
                     for s in doc.get("stops", []):
@@ -350,22 +356,26 @@ async def test_01_owner_can_read_and_update_policy(mock_env):
     # 1. Read default policy (before explicit configuration)
     policy = await admin_get_delivery_wage_policy(admin=owner_user)
     assert policy["base_wage_per_order_le"] == 50.0
-    assert policy["unusual_amount_threshold_le"] == 500.0
+    assert policy["unusual_amount_threshold_le"] == 100.0
+    assert policy["max_helper_wage_per_order_le"] == 500.0
 
     # 2. Update policy as Owner
     new_input = DeliveryWagePolicyInput(
         base_wage_per_order_le=75.0,
-        unusual_amount_threshold_le=600.0,
+        unusual_amount_threshold_le=200.0,
         max_helper_wage_per_order_le=600.0
     )
     updated = await admin_update_delivery_wage_policy(payload=new_input, admin=owner_user)
     assert updated["base_wage_per_order_le"] == 75.0
-    assert updated["unusual_amount_threshold_le"] == 600.0
+    assert updated["unusual_amount_threshold_le"] == 200.0
+    assert updated["max_helper_wage_per_order_le"] == 600.0
     assert updated["updated_by_name"] == owner_user["name"]
 
     # 3. Verify persisted in db.settings
     saved = await mdb.settings.find_one({"key": "delivery_wage_policy"})
     assert saved["value"]["base_wage_per_order_le"] == 75.0
+    assert saved["value"]["unusual_amount_threshold_le"] == 200.0
+    assert saved["value"]["max_helper_wage_per_order_le"] == 600.0
 
 
 @pytest.mark.anyio
@@ -376,11 +386,14 @@ async def test_02_finance_authorized_non_owner_read_only(mock_env):
     # 1. Finance user can read policy
     policy = await admin_get_delivery_wage_policy(admin=finance_user)
     assert policy["base_wage_per_order_le"] == 50.0
+    assert policy["unusual_amount_threshold_le"] == 100.0
+    assert policy["max_helper_wage_per_order_le"] == 500.0
 
     # 2. Finance user attempting to update policy is rejected with 403 Forbidden
     new_input = DeliveryWagePolicyInput(
         base_wage_per_order_le=100.0,
-        unusual_amount_threshold_le=800.0
+        unusual_amount_threshold_le=200.0,
+        max_helper_wage_per_order_le=800.0
     )
     with pytest.raises(HTTPException) as ctx:
         await admin_update_delivery_wage_policy(payload=new_input, admin=finance_user)
@@ -409,21 +422,44 @@ async def test_04_invalid_or_negative_values_rejected(mock_env):
 
     # 1. Negative base wage rejected
     with pytest.raises(Exception):
-        DeliveryWagePolicyInput(base_wage_per_order_le=-10.0, unusual_amount_threshold_le=500.0)
+        DeliveryWagePolicyInput(base_wage_per_order_le=-10.0, unusual_amount_threshold_le=100.0, max_helper_wage_per_order_le=500.0)
 
     # 2. Zero or negative threshold rejected
     with pytest.raises(Exception):
-        DeliveryWagePolicyInput(base_wage_per_order_le=50.0, unusual_amount_threshold_le=0.0)
+        DeliveryWagePolicyInput(base_wage_per_order_le=50.0, unusual_amount_threshold_le=0.0, max_helper_wage_per_order_le=500.0)
 
     # 3. Threshold lower than base wage rejected by endpoint validator
     invalid_input = DeliveryWagePolicyInput(
         base_wage_per_order_le=300.0,
-        unusual_amount_threshold_le=100.0
+        unusual_amount_threshold_le=100.0,
+        max_helper_wage_per_order_le=500.0
     )
     with pytest.raises(HTTPException) as ctx:
         await admin_update_delivery_wage_policy(payload=invalid_input, admin=owner_user)
     assert ctx.value.status_code == 422
     assert "tidak boleh lebih kecil" in ctx.value.detail
+
+    # 4. Hard cap missing or <= 0 rejected
+    invalid_cap = DeliveryWagePolicyInput(
+        base_wage_per_order_le=50.0,
+        unusual_amount_threshold_le=100.0,
+        max_helper_wage_per_order_le=None
+    )
+    with pytest.raises(HTTPException) as ctx:
+        await admin_update_delivery_wage_policy(payload=invalid_cap, admin=owner_user)
+    assert ctx.value.status_code == 422
+    assert "hard cap" in ctx.value.detail
+
+    # 5. Threshold >= hard cap rejected
+    invalid_tier = DeliveryWagePolicyInput(
+        base_wage_per_order_le=50.0,
+        unusual_amount_threshold_le=500.0,
+        max_helper_wage_per_order_le=500.0
+    )
+    with pytest.raises(HTTPException) as ctx:
+        await admin_update_delivery_wage_policy(payload=invalid_tier, admin=owner_user)
+    assert ctx.value.status_code == 422
+    assert "lebih kecil dari batas maksimum keras" in ctx.value.detail
 
 
 @pytest.mark.anyio
@@ -433,7 +469,7 @@ async def test_05_policy_change_history_recorded_in_audit_log(mock_env):
 
     # Update 1: Set to 60.0 LE
     await admin_update_delivery_wage_policy(
-        payload=DeliveryWagePolicyInput(base_wage_per_order_le=60.0, unusual_amount_threshold_le=550.0),
+        payload=DeliveryWagePolicyInput(base_wage_per_order_le=60.0, unusual_amount_threshold_le=200.0, max_helper_wage_per_order_le=600.0),
         admin=owner_user
     )
 
@@ -451,23 +487,24 @@ async def test_06_changing_threshold_affects_future_validations(mock_env):
     """Test 6: Increasing or lowering the threshold dynamically changes the threshold override trigger."""
     mdb, owner_user, finance_user, _, _, helpers = mock_env
 
-    # 1. Set threshold to 300 LE
+    # 1. Set threshold to 300 LE, hard cap 500 LE
     await admin_update_delivery_wage_policy(
-        payload=DeliveryWagePolicyInput(base_wage_per_order_le=50.0, unusual_amount_threshold_le=300.0),
+        payload=DeliveryWagePolicyInput(base_wage_per_order_le=50.0, unusual_amount_threshold_le=300.0, max_helper_wage_per_order_le=500.0),
         admin=owner_user
     )
 
-    # 2. Preview 350 LE wage: should require confirmation now (350 > 300)
+    # 2. Preview 350 LE wage: should require confirmation now (350 > 300 and <= 500)
     prev = await admin_preview_delivery_wage_allocation(
         payload=DeliveryWagePreviewInput(total_wage_le=350.0, helpers=[helpers[0]]),
         admin=finance_user
     )
     assert prev["requires_confirmation"] is True
     assert prev["threshold_le"] == 300.0
+    assert prev["exceeds_hard_cap"] is False
 
-    # 3. Increase threshold to 1000 LE
+    # 3. Increase threshold to 1000 LE, hard cap 2000 LE
     await admin_update_delivery_wage_policy(
-        payload=DeliveryWagePolicyInput(base_wage_per_order_le=50.0, unusual_amount_threshold_le=1000.0),
+        payload=DeliveryWagePolicyInput(base_wage_per_order_le=50.0, unusual_amount_threshold_le=1000.0, max_helper_wage_per_order_le=2000.0),
         admin=owner_user
     )
 
@@ -478,6 +515,7 @@ async def test_06_changing_threshold_affects_future_validations(mock_env):
     )
     assert prev2["requires_confirmation"] is False
     assert prev2["threshold_le"] == 1000.0
+    assert prev2["exceeds_hard_cap"] is False
 
 
 # =============================================================================
@@ -486,7 +524,7 @@ async def test_06_changing_threshold_affects_future_validations(mock_env):
 
 @pytest.mark.anyio
 async def test_07_amount_at_or_below_threshold_normal_flow(mock_env):
-    """Test 7: Amounts at or below threshold (e.g. 50 EGP or 400 EGP) do not require override confirmation."""
+    """Test 7: Amounts at or below threshold (e.g. 50 EGP or 80 EGP) do not require override confirmation."""
     mdb, _, finance_user, _, _, helpers = mock_env
     trip_id = ObjectId("670f00000000000000000001")
     ord_id = ObjectId("660f00000000000000000001")
@@ -507,21 +545,21 @@ async def test_07_amount_at_or_below_threshold_normal_flow(mock_env):
         "stops": [{"order_id": str(ord_id), "outcome": "out_for_delivery"}]
     })
 
-    # Deliver with normal custom wage 200.0 LE (<= 500 threshold) without confirmation/reason
+    # Deliver with normal custom wage 80.0 LE (<= 100 threshold) without confirmation/reason
     res = await record_delivery_stop_handover_core(
         trip_id=str(trip_id),
         order_id=str(ord_id),
-        payload=DeliveryStopHandoverInput(recipient_name="Pak Budi", helper_confirmed=True, custom_wage_le=200.0),
+        payload=DeliveryStopHandoverInput(recipient_name="Pak Budi", helper_confirmed=True, custom_wage_le=80.0),
         admin=finance_user
     )
     assert res["ok"] is True
     assert len(res["wage_obligations"]) == 1
-    assert res["wage_obligations"][0]["total_amount_le"] == 200.0
+    assert res["wage_obligations"][0]["total_amount_le"] == 80.0
 
 
 @pytest.mark.anyio
 async def test_08_amount_above_threshold_requires_confirmation(mock_env):
-    """Test 8: An amount exceeding 500 EGP without confirmed_unusual_amount is rejected with 422."""
+    """Test 8: An amount exceeding 100 EGP (e.g. 250 LE <= 500 hard cap) without confirmed_unusual_amount is rejected with 422."""
     mdb, _, finance_user, _, _, helpers = mock_env
     trip_id = ObjectId("670f00000000000000000002")
     ord_id = ObjectId("660f00000000000000000002")
@@ -535,7 +573,7 @@ async def test_08_amount_above_threshold_requires_confirmation(mock_env):
         "stops": [{"order_id": str(ord_id), "outcome": "out_for_delivery"}]
     })
 
-    # Unconfirmed 600 LE (> 500 threshold)
+    # Unconfirmed 250 LE (> 100 threshold, <= 500 hard cap)
     with pytest.raises(HTTPException) as ctx:
         await record_delivery_stop_handover_core(
             trip_id=str(trip_id),
@@ -543,7 +581,7 @@ async def test_08_amount_above_threshold_requires_confirmation(mock_env):
             payload=DeliveryStopHandoverInput(
                 recipient_name="Pak Budi",
                 helper_confirmed=True,
-                custom_wage_le=600.0,
+                custom_wage_le=250.0,
                 confirmed_unusual_amount=False
             ),
             admin=finance_user
@@ -575,7 +613,7 @@ async def test_09_confirming_without_meaningful_reason_rejected(mock_env):
             payload=DeliveryStopHandoverInput(
                 recipient_name="Pak Budi",
                 helper_confirmed=True,
-                custom_wage_le=600.0,
+                custom_wage_le=250.0,
                 confirmed_unusual_amount=True,
                 override_reason="ok"  # Too short
             ),
@@ -607,14 +645,14 @@ async def test_10_valid_confirmation_and_reason_permits_recording_without_owner_
         payload=DeliveryStopHandoverInput(
             recipient_name="Pak Budi",
             helper_confirmed=True,
-            custom_wage_le=650.0,
+            custom_wage_le=350.0,
             confirmed_unusual_amount=True,
             override_reason="Pengantaran naik ke lantai 5 tanpa lift untuk lemari 3 pintu jati"
         ),
         admin=finance_user
     )
     assert res["ok"] is True
-    assert res["wage_obligations"][0]["total_amount_le"] == 650.0
+    assert res["wage_obligations"][0]["total_amount_le"] == 350.0
     assert res["wage_obligations"][0]["rate_policy_snapshot"]["is_override"] is True
     assert "lantai 5" in res["wage_obligations"][0]["rate_policy_snapshot"]["override_reason"]
 
@@ -641,7 +679,7 @@ async def test_11_saved_audit_record_contains_full_override_context(mock_env):
         payload=DeliveryStopHandoverInput(
             recipient_name="Pak Budi",
             helper_confirmed=True,
-            custom_wage_le=700.0,
+            custom_wage_le=400.0,
             confirmed_unusual_amount=True,
             override_reason="Bongkar muat khusus lokasi terpencil luar kota"
         ),
@@ -651,7 +689,7 @@ async def test_11_saved_audit_record_contains_full_override_context(mock_env):
     audit_entry = await mdb.audit_logs.find_one({"action": "delivery_wage_threshold_override"})
     assert audit_entry is not None
     assert audit_entry["performed_by_name"] == finance_user["name"]
-    assert audit_entry["metadata"]["recorded_amount_le"] == 700.0
+    assert audit_entry["metadata"]["recorded_amount_le"] == 400.0
     assert audit_entry["metadata"]["trip_number"] == "TRP-20261015-0005"
     assert audit_entry["metadata"]["order_number"] == "ORD-005"
     assert "lokasi terpencil" in audit_entry["metadata"]["override_reason"]
@@ -947,7 +985,7 @@ async def test_23_historical_allocations_remain_unchanged_after_policy_update(mo
 
     # 2. Owner raises policy base wage to 100 LE
     await admin_update_delivery_wage_policy(
-        payload=DeliveryWagePolicyInput(base_wage_per_order_le=100.0, unusual_amount_threshold_le=700.0),
+        payload=DeliveryWagePolicyInput(base_wage_per_order_le=100.0, unusual_amount_threshold_le=200.0, max_helper_wage_per_order_le=700.0),
         admin=owner_user
     )
 
@@ -1069,7 +1107,7 @@ async def test_26_policy_update_after_dispatch_does_not_affect_running_trip(mock
 
     # Owner changes active policy to 80 LE
     await admin_update_delivery_wage_policy(
-        payload=DeliveryWagePolicyInput(base_wage_per_order_le=80.0, unusual_amount_threshold_le=600.0),
+        payload=DeliveryWagePolicyInput(base_wage_per_order_le=80.0, unusual_amount_threshold_le=200.0, max_helper_wage_per_order_le=800.0),
         admin=owner_user
     )
 

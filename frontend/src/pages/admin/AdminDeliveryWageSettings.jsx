@@ -33,7 +33,7 @@ export default function AdminDeliveryWageSettings() {
   const [saving, setSaving] = useState(false);
   const [policy, setPolicy] = useState({
     base_wage_per_order_le: 50.0,
-    unusual_amount_threshold_le: 500.0,
+    unusual_amount_threshold_le: 100.0,
     max_helper_wage_per_order_le: 500.0,
     currency: "EGP",
     rounding_policy: "piastre_round_half_up"
@@ -54,8 +54,8 @@ export default function AdminDeliveryWageSettings() {
       if (res.data) {
         setPolicy({
           base_wage_per_order_le: Number(res.data.base_wage_per_order_le) || 50.0,
-          unusual_amount_threshold_le: Number(res.data.unusual_amount_threshold_le) || 500.0,
-          max_helper_wage_per_order_le: Number(res.data.max_helper_wage_per_order_le) || Number(res.data.unusual_amount_threshold_le) || 500.0,
+          unusual_amount_threshold_le: Number(res.data.unusual_amount_threshold_le) || 100.0,
+          max_helper_wage_per_order_le: Number(res.data.max_helper_wage_per_order_le) || 500.0,
           currency: res.data.currency || "EGP",
           rounding_policy: res.data.rounding_policy || "piastre_round_half_up",
           updated_at: res.data.updated_at,
@@ -108,7 +108,9 @@ export default function AdminDeliveryWageSettings() {
     return list;
   }, [simAmount, simHelperCount]);
 
-  const isSimOverThreshold = Number(simAmount) > Number(policy.unusual_amount_threshold_le);
+  const isSimOverHardCap = Number(simAmount) > Number(policy.max_helper_wage_per_order_le);
+  const isSimOverThreshold = Number(simAmount) > Number(policy.unusual_amount_threshold_le) && !isSimOverHardCap;
+  const isSimNormal = Number(simAmount) <= Number(policy.unusual_amount_threshold_le);
 
   const handleSavePolicy = async () => {
     if (!isOwner) {
@@ -117,6 +119,7 @@ export default function AdminDeliveryWageSettings() {
     }
     const baseWage = Number(policy.base_wage_per_order_le);
     const threshold = Number(policy.unusual_amount_threshold_le);
+    const hardCap = Number(policy.max_helper_wage_per_order_le);
 
     if (isNaN(baseWage) || baseWage < 0) {
       toast.error("Tarif dasar upah harus berupa angka valid dan tidak boleh negatif.");
@@ -126,8 +129,16 @@ export default function AdminDeliveryWageSettings() {
       toast.error("Batas konfirmasi nominal tidak wajar harus lebih besar dari 0.");
       return;
     }
-    if (threshold < baseWage) {
-      toast.error(`Batas konfirmasi (${threshold} LE) tidak boleh lebih kecil dari tarif dasar (${baseWage} LE).`);
+    if (isNaN(hardCap) || hardCap <= 0) {
+      toast.error("Batas maksimum keras upah (hard cap) harus lebih besar dari 0.");
+      return;
+    }
+    if (baseWage > threshold) {
+      toast.error(`Tarif dasar (${baseWage} LE) tidak boleh melebihi batas konfirmasi (${threshold} LE).`);
+      return;
+    }
+    if (threshold >= hardCap) {
+      toast.error(`Batas konfirmasi (${threshold} LE) harus lebih kecil dari batas maksimum keras (${hardCap} LE). Hubungan yang diwajibkan: dasar <= batas konfirmasi < batas maksimum keras.`);
       return;
     }
 
@@ -136,12 +147,12 @@ export default function AdminDeliveryWageSettings() {
       const payload = {
         base_wage_per_order_le: baseWage,
         unusual_amount_threshold_le: threshold,
-        max_helper_wage_per_order_le: threshold,
+        max_helper_wage_per_order_le: hardCap,
         currency: policy.currency || "EGP",
         rounding_policy: "piastre_round_half_up"
       };
       await api.put("/admin/delivery-wage-policy", payload);
-      toast.success("Kebijakan upah pengiriman berhasil disimpan!");
+      toast.success("Kebijakan upah bertingkat berhasil disimpan!");
       await loadPolicy();
       await loadHistory();
     } catch (err) {
@@ -205,13 +216,13 @@ export default function AdminDeliveryWageSettings() {
       {/* Main Settings Card */}
       <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 sm:p-6 shadow-sm space-y-5">
         <div className="flex items-center gap-2 font-heading text-sm font-bold uppercase tracking-wider text-[#8B5A2B]">
-          <CircleDollarSign size={18} /> Kebijakan Dasar Upah Helper
+          <CircleDollarSign size={18} /> Kebijakan Upah Helper Bertingkat
         </div>
 
         {loading ? (
           <div className="py-8 text-center text-sm text-[#8B7355]">Memuat kebijakan...</div>
         ) : (
-          <div className="grid gap-5 sm:grid-cols-2">
+          <div className="grid gap-5 sm:grid-cols-3">
             <div>
               <Label className="block text-sm font-semibold text-[#2C1E16] mb-1">
                 Tarif Dasar Upah per Pesanan (EGP)
@@ -235,7 +246,7 @@ export default function AdminDeliveryWageSettings() {
 
             <div>
               <Label className="block text-sm font-semibold text-[#2C1E16] mb-1">
-                Batas Konfirmasi Nominal Tidak Wajar (EGP)
+                Batas Konfirmasi Nominal (EGP)
               </Label>
               <div className="relative">
                 <Input
@@ -250,16 +261,37 @@ export default function AdminDeliveryWageSettings() {
                 <span className="absolute right-3 top-2.5 text-xs font-bold text-[#8B7355]">EGP</span>
               </div>
               <p className="mt-1 text-xs text-[#8B7355]">
-                Nominal di atas batas ini mewajibkan konfirmasi dialog dan alasan override tertulis (Default: 500 EGP).
+                Ambang peringatan. Di atas batas ini butuh konfirmasi dan alasan tertulis (Default: 100 EGP).
               </p>
             </div>
 
-            <div className="sm:col-span-2 rounded-xl border border-[#F1EBE0] bg-[#FAF8F5] p-3.5 space-y-1">
+            <div>
+              <Label className="block text-sm font-semibold text-[#2C1E16] mb-1">
+                Batas Maksimum Keras (EGP)
+              </Label>
+              <div className="relative">
+                <Input
+                  type="number"
+                  min="1"
+                  step="10"
+                  disabled={!isOwner || saving}
+                  value={policy.max_helper_wage_per_order_le}
+                  onChange={(e) => setPolicy({ ...policy, max_helper_wage_per_order_le: e.target.value })}
+                  className="bg-white pr-12 font-medium text-rose-700"
+                />
+                <span className="absolute right-3 top-2.5 text-xs font-bold text-rose-600">EGP</span>
+              </div>
+              <p className="mt-1 text-xs text-[#8B7355]">
+                Plafon liabilitas mutlak. Di atas batas ini otomatis ditolak oleh backend (Default: 500 EGP).
+              </p>
+            </div>
+
+            <div className="sm:col-span-3 rounded-xl border border-[#F1EBE0] bg-[#FAF8F5] p-3.5 space-y-1">
               <div className="text-xs font-semibold text-[#5C4A3D] flex items-center gap-1.5">
-                <Coins size={14} className="text-[#8B5A2B]" /> Kebijakan Pembulatan (Rounding Policy)
+                <Coins size={14} className="text-[#8B5A2B]" /> Aturan Kebijakan Bertingkat: Dasar &le; Batas Konfirmasi &lt; Batas Maksimum Keras
               </div>
               <p className="text-xs text-[#8B7355]">
-                Sistem menggunakan aritmatika integer piastre eksak (1 piastre = 0.01 EGP). Seluruh alokasi helper selalu berjumlah persis 100% dari total upah tanpa ada selisih uang mengambang atau pembulatan biner.
+                Sistem menggunakan aritmatika integer piastre eksak (1 piastre = 0.01 EGP). Seluruh alokasi helper selalu berjumlah persis 100% dari total upah tanpa ada selisih uang mengambang.
               </p>
             </div>
           </div>
@@ -289,7 +321,7 @@ export default function AdminDeliveryWageSettings() {
         </div>
 
         <p className="text-xs sm:text-sm text-[#8B7355]">
-          Simulasikan bagaimana nominal upah dibagi rata di antara helper dan verifikasi apakah suatu nominal memicu dialog konfirmasi ambang batas.
+          Simulasikan bagaimana nominal upah dibagi rata di antara helper dan verifikasi bagaimana kebijakan bertingkat memperlakukan nominal tersebut.
         </p>
 
         <div className="grid gap-4 sm:grid-cols-2 bg-[#F9F6F0] p-4 rounded-xl border border-[#E5DCC5]/60">
@@ -329,15 +361,27 @@ export default function AdminDeliveryWageSettings() {
           </div>
         </div>
 
-        {/* Warning Badge if Over Threshold */}
+        {/* Tier Status Badges */}
+        {isSimOverHardCap && (
+          <div className="rounded-xl border border-rose-300 bg-rose-50 p-4 text-xs sm:text-sm text-rose-950 flex items-start gap-2.5">
+            <ShieldAlert size={20} className="text-rose-600 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold">Nominal Melebihi Batas Maksimum Keras ({policy.max_helper_wage_per_order_le} EGP):</span>
+              <p className="mt-0.5 text-xs text-rose-800">
+                Sistem backend akan <strong>MENOLAK OTOMATIS</strong> pengajuan ini dengan HTTP 422. Konfirmasi petugas dan alasan tidak dapat melewati batas ini.
+              </p>
+            </div>
+          </div>
+        )}
+
         {isSimOverThreshold && (
           <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs sm:text-sm text-amber-950 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div className="flex items-start gap-2.5">
               <AlertTriangle size={20} className="text-amber-600 shrink-0 mt-0.5" />
               <div>
-                <span className="font-bold">Nominal Melebihi Batas Konfirmasi ({policy.unusual_amount_threshold_le} EGP):</span>
+                <span className="font-bold">Nominal Memerlukan Konfirmasi Petugas ({policy.unusual_amount_threshold_le} - {policy.max_helper_wage_per_order_le} EGP):</span>
                 <p className="mt-0.5 text-xs text-amber-800">
-                  Pada alur serah terima, sistem akan memunculkan dialog konfirmasi untuk mencegah kesalahan ketik (typo) dan mewajibkan alasan override.
+                  Pada alur serah terima, sistem mewajibkan checkbox konfirmasi kebenaran nominal dan alasan tertulis minimal 5 karakter.
                 </p>
               </div>
             </div>
@@ -349,6 +393,16 @@ export default function AdminDeliveryWageSettings() {
             >
               Uji Coba Dialog Konfirmasi
             </Button>
+          </div>
+        )}
+
+        {isSimNormal && (
+          <div className="rounded-xl border border-emerald-300 bg-emerald-50 p-3 text-xs sm:text-sm text-emerald-950 flex items-center gap-2.5">
+            <CheckCircle2 size={18} className="text-emerald-600 shrink-0" />
+            <div>
+              <span className="font-bold">Nominal Standar (&le; {policy.unusual_amount_threshold_le} EGP):</span>
+              <span className="ml-1 text-xs text-emerald-800">Diproses secara normal tanpa memerlukan dialog konfirmasi khusus.</span>
+            </div>
           </div>
         )}
 
@@ -394,7 +448,7 @@ export default function AdminDeliveryWageSettings() {
       {/* Change History Card */}
       <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 sm:p-6 shadow-sm space-y-4">
         <div className="flex items-center gap-2 font-heading text-sm font-bold uppercase tracking-wider text-[#8B5A2B]">
-          <History size={18} /> Riwayat Perubahan Kebijakan
+          <History size={18} /> Riwayat Kebijakan &amp; Audit Upah
         </div>
 
         {history.length === 0 ? (
@@ -407,9 +461,9 @@ export default function AdminDeliveryWageSettings() {
               <thead className="bg-[#FAF8F5] text-xs font-bold text-[#8B7355] border-b border-[#E5DCC5]">
                 <tr>
                   <th className="py-2.5 px-3">Waktu</th>
+                  <th className="py-2.5 px-3">Jenis Kegiatan</th>
                   <th className="py-2.5 px-3">Petugas</th>
-                  <th className="py-2.5 px-3">Field Diubah</th>
-                  <th className="py-2.5 px-3">Nilai Baru</th>
+                  <th className="py-2.5 px-3">Detail &amp; Nilai</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#F1EBE0]">
@@ -418,13 +472,44 @@ export default function AdminDeliveryWageSettings() {
                     <td className="py-2 px-3 text-[#5C4A3D]">
                       {h.timestamp ? new Date(h.timestamp).toLocaleString("id-ID") : "-"}
                     </td>
-                    <td className="py-2 px-3 font-medium text-[#2C1E16]">{h.performed_by_name || "Owner"}</td>
-                    <td className="py-2 px-3 text-[#8B5A2B] font-mono">
-                      {(h.metadata?.changed_fields || []).join(", ") || "Inisialisasi"}
+                    <td className="py-2 px-3">
+                      {h.action === "update_delivery_wage_policy" && (
+                        <span className="inline-flex rounded-md bg-blue-100 px-2 py-0.5 text-[11px] font-semibold text-blue-800">
+                          Kebijakan
+                        </span>
+                      )}
+                      {h.action === "delivery_wage_threshold_override" && (
+                        <span className="inline-flex rounded-md bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">
+                          Konfirmasi Override
+                        </span>
+                      )}
+                      {h.action === "delivery_wage_hard_cap_rejection" && (
+                        <span className="inline-flex rounded-md bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-800">
+                          Ditolak Hard Cap
+                        </span>
+                      )}
+                      {!["update_delivery_wage_policy", "delivery_wage_threshold_override", "delivery_wage_hard_cap_rejection"].includes(h.action) && (
+                        <span className="inline-flex rounded-md bg-stone-100 px-2 py-0.5 text-[11px] font-semibold text-stone-700">
+                          {h.action || "Log"}
+                        </span>
+                      )}
                     </td>
+                    <td className="py-2 px-3 font-medium text-[#2C1E16]">{h.performed_by_name || "Petugas"}</td>
                     <td className="py-2 px-3 text-[#5C4A3D]">
-                      {h.metadata?.new?.base_wage_per_order_le !== undefined && (
-                        <span>Dasar: {h.metadata.new.base_wage_per_order_le} LE | Ambang: {h.metadata.new.unusual_amount_threshold_le} LE</span>
+                      {h.action === "update_delivery_wage_policy" && h.metadata?.new && (
+                        <span>
+                          Dasar: {h.metadata.new.base_wage_per_order_le} LE | Ambang: {h.metadata.new.unusual_amount_threshold_le} LE | Cap: {h.metadata.new.max_helper_wage_per_order_le} LE
+                        </span>
+                      )}
+                      {h.action === "delivery_wage_threshold_override" && (
+                        <span>
+                          Pesanan: <span className="font-mono font-medium">{h.entity_identifier || h.metadata?.order_number}</span> | Upah: <strong>{h.metadata?.recorded_amount_le} LE</strong> | Alasan: <em>{h.metadata?.override_reason}</em>
+                        </span>
+                      )}
+                      {h.action === "delivery_wage_hard_cap_rejection" && (
+                        <span className="text-rose-700">
+                          Pesanan: <span className="font-mono">{h.entity_identifier || h.metadata?.order_number}</span> | Dicoba: <strong>{h.metadata?.attempted_amount_le} LE</strong> (Batas Keras: {h.metadata?.hard_cap_le} LE) — Ditolak
+                        </span>
                       )}
                     </td>
                   </tr>

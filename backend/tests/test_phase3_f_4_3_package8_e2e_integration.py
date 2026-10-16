@@ -943,6 +943,7 @@ async def test_e2e_scenario_a_step03_dispatch_and_wage_rate_snapshot_lock(mock_e
         DeliveryWagePolicyInput(
             base_wage_per_order_le=80.0,
             unusual_amount_threshold_le=600.0,
+            max_helper_wage_per_order_le=1000.0,
             currency="EGP",
             rounding_policy="piastre_round_half_up"
         ),

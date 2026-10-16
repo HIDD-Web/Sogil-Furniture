@@ -5007,7 +5007,7 @@ class DeliveryTripCompleteInput(BaseModel):
 class DeliveryWagePolicyInput(BaseModel):
     base_wage_per_order_le: float = Field(..., ge=0.0, description="Tarif dasar upah per pesanan/lokasi yang berhasil diantar")
     unusual_amount_threshold_le: float = Field(..., gt=0.0, description="Batas konfirmasi nominal tidak wajar")
-    max_helper_wage_per_order_le: Optional[float] = Field(None, ge=0.0, description="Batas atas upah (cap) per pesanan")
+    max_helper_wage_per_order_le: Optional[float] = Field(None, gt=0.0, description="Batas maksimum keras upah (hard cap) per pesanan")
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
 
@@ -5062,9 +5062,8 @@ def check_trip_can_be_completed(trip: dict) -> None:
 
 async def validate_delivery_trip_wage_cap(rate_le: float, session=None) -> float:
     """
-    FAIL-CLOSED check for Authoritative Owner Wage Cap.
-    Owner has not set the cap yet.
-    If cap is missing, None, or <= 0: rejects dispatch with HTTP 422.
+    FAIL-CLOSED check for Authoritative Owner Wage Cap and Tiered Policy.
+    If policy is missing, incomplete, or cap <= 0: rejects dispatch with HTTP 422.
     No default values, no Manager bypass.
     """
     policy = await get_setting("delivery_wage_policy", None)
@@ -5074,10 +5073,16 @@ async def validate_delivery_trip_wage_cap(rate_le: float, session=None) -> float
             detail="Batas atas upah pengiriman (cap) belum ditetapkan oleh Owner. Penetapan tarif dan dispatch trip terkunci (Fail-Closed)."
         )
     cap = policy.get("max_helper_wage_per_order_le")
+    threshold = policy.get("unusual_amount_threshold_le")
     if cap is None or _num(cap) <= 0:
         raise HTTPException(
             status_code=422,
             detail="Batas atas upah pengiriman (cap) belum ditetapkan oleh Owner. Penetapan tarif dan dispatch trip terkunci (Fail-Closed)."
+        )
+    if threshold is None or _num(threshold) <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Batas konfirmasi upah pengiriman belum ditetapkan oleh Owner. Penetapan tarif dan dispatch trip terkunci (Fail-Closed)."
         )
     cap_val = _num(cap)
     if _num(rate_le) > cap_val:
@@ -5090,9 +5095,10 @@ async def validate_delivery_trip_wage_cap(rate_le: float, session=None) -> float
 async def get_active_delivery_wage_policy(db_inst=None) -> dict:
     """
     Returns the active delivery wage policy from db.settings.
-    If not explicitly configured, provides the approved initial business defaults:
+    If not explicitly configured, provides the approved tiered business defaults:
     - Base helper wage: 50.0 EGP per successfully delivered order/location.
-    - Unusual amount confirmation threshold: 500.0 EGP per order/location.
+    - Unusual amount confirmation threshold: 100.0 EGP per order/location.
+    - Hard maximum helper wage cap: 500.0 EGP per order/location.
     - Currency: EGP.
     - Rounding policy: Exact integer piastres (ROUND_HALF_UP).
     """
@@ -5103,16 +5109,20 @@ async def get_active_delivery_wage_policy(db_inst=None) -> dict:
         doc = await res if inspect.isawaitable(res) else res
 
     val = doc.get("value") if doc and isinstance(doc.get("value"), dict) else {}
+    has_hard_cap = "max_helper_wage_per_order_le" in val and val["max_helper_wage_per_order_le"] is not None
+    has_threshold = "unusual_amount_threshold_le" in val and val["unusual_amount_threshold_le"] is not None
+    is_configured = bool(val and has_hard_cap and has_threshold)
+
     return {
         "base_wage_per_order_le": _num(val.get("base_wage_per_order_le"), 50.0),
-        "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), 500.0),
-        "max_helper_wage_per_order_le": _num(val.get("max_helper_wage_per_order_le"), val.get("unusual_amount_threshold_le", 500.0)),
+        "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), 100.0),
+        "max_helper_wage_per_order_le": _num(val.get("max_helper_wage_per_order_le"), 500.0) if has_hard_cap else 500.0,
         "currency": val.get("currency", "EGP"),
         "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
-        "is_configured": bool(val)
+        "is_configured": is_configured
     }
 
 def calculate_delivery_helper_wage_allocations(total_wage_le: float, helpers: list) -> list:
@@ -5842,11 +5852,18 @@ async def record_delivery_stop_handover_core(
     snapshot = trip.get("rate_policy_snapshot")
     snapshot_rate = _num(snapshot.get("applied_rate_le")) if (isinstance(snapshot, dict) and snapshot.get("applied_rate_le") is not None) else None
 
-    # Threshold prioritized from immutable dispatch snapshot, falling back to active policy
+    # Threshold and hard cap resolved from immutable dispatch snapshot, falling back to active policy
     if isinstance(snapshot, dict) and snapshot.get("unusual_amount_threshold_le") is not None:
         threshold = _num(snapshot.get("unusual_amount_threshold_le"))
     else:
-        threshold = _num(policy.get("unusual_amount_threshold_le"), 500.0)
+        threshold = _num(policy.get("unusual_amount_threshold_le"), 100.0)
+
+    if isinstance(snapshot, dict) and snapshot.get("max_cap_at_dispatch_le") is not None:
+        hard_cap = _num(snapshot.get("max_cap_at_dispatch_le"))
+    elif isinstance(snapshot, dict) and snapshot.get("max_helper_wage_per_order_le") is not None:
+        hard_cap = _num(snapshot.get("max_helper_wage_per_order_le"))
+    else:
+        hard_cap = _num(policy.get("max_helper_wage_per_order_le"), 500.0)
 
     is_override = False
     override_reason = None
@@ -5855,6 +5872,36 @@ async def record_delivery_stop_handover_core(
         total_wage = _num(payload.custom_wage_le)
         if total_wage < 0:
             raise HTTPException(status_code=422, detail="Nominal upah tidak boleh bernilai negatif.")
+
+        # Hard cap check: strict absolute maximum ceiling (Stage 2)
+        if total_wage > hard_cap:
+            await record_audit_log(
+                action="delivery_wage_hard_cap_rejection",
+                entity_type="order",
+                entity_id=str(order_id),
+                entity_identifier=order_doc.get("order_number", ""),
+                admin=admin,
+                metadata={
+                    "trip_id": str(trip["_id"]),
+                    "trip_number": trip.get("trip_number"),
+                    "order_id": str(order_id),
+                    "order_number": order_doc.get("order_number"),
+                    "attempted_amount_le": total_wage,
+                    "hard_cap_le": hard_cap,
+                    "threshold_le": threshold,
+                    "reason_provided": payload.override_reason,
+                    "confirmed_unusual_amount": payload.confirmed_unusual_amount,
+                    "idempotency_key": payload.idempotency_key,
+                    "result": "rejected"
+                },
+                session=None
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=f"Nominal upah ({total_wage} LE) melebihi batas maksimum keras ({hard_cap} LE). Konfirmasi dan alasan tidak dapat melewati batas keras."
+            )
+
+        # Unusual amount check: threshold < total_wage <= hard_cap
         if total_wage > threshold:
             if not payload.confirmed_unusual_amount:
                 raise HTTPException(
@@ -5951,6 +5998,7 @@ async def record_delivery_stop_handover_core(
             "rate_policy_snapshot": {
                 "base_wage_per_order_le": base_wage,
                 "unusual_amount_threshold_le": threshold,
+                "max_cap_at_dispatch_le": hard_cap,
                 "total_order_wage_le": total_wage,
                 "is_override": is_override,
                 "override_reason": override_reason,
@@ -5964,8 +6012,8 @@ async def record_delivery_stop_handover_core(
         await db.wage_obligations.insert_one(wob_doc, session=session)
         created_obligations.append(wob_doc)
 
-    # 6. Audit Logging if threshold override occurred
-    if is_override:
+    # 6. Audit Logging if threshold override occurred (risky submission > threshold confirmed by officer)
+    if total_wage > threshold:
         await record_audit_log(
             action="delivery_wage_threshold_override",
             entity_type="order",
@@ -5979,10 +6027,13 @@ async def record_delivery_stop_handover_core(
                 "order_number": order_doc.get("order_number"),
                 "base_wage_le": base_wage,
                 "threshold_le": threshold,
+                "hard_cap_le": hard_cap,
                 "recorded_amount_le": total_wage,
                 "override_reason": override_reason,
                 "helpers_count": len(helpers),
                 "allocations": allocations,
+                "idempotency_key": payload.idempotency_key,
+                "result": "approved"
             },
             session=session
         )
@@ -6235,11 +6286,13 @@ async def admin_update_delivery_trip_status(
             is_custom_rate = False
 
         cap_val = await validate_delivery_trip_wage_cap(applied_rate)
+        threshold_val = _num(active_policy.get("unusual_amount_threshold_le"), 100.0)
         update_doc["rate_policy_snapshot"] = {
             "applied_rate_le": applied_rate,
             "is_custom_rate": is_custom_rate,
             "max_cap_at_dispatch_le": cap_val,
-            "unusual_amount_threshold_le": _num(active_policy.get("unusual_amount_threshold_le"), 500.0),
+            "unusual_amount_threshold_le": threshold_val,
+            "base_wage_per_order_le": _num(active_policy.get("base_wage_per_order_le"), 50.0),
             "currency": active_policy.get("currency", "EGP"),
             "rounding_policy": active_policy.get("rounding_policy", "piastre_round_half_up"),
             "policy_updated_at": active_policy.get("updated_at"),
@@ -6360,23 +6413,27 @@ async def admin_update_delivery_wage_policy(
         raise HTTPException(status_code=422, detail="Tarif dasar upah tidak boleh negatif")
     if payload.unusual_amount_threshold_le <= 0:
         raise HTTPException(status_code=422, detail="Batas konfirmasi nominal tidak wajar harus lebih besar dari 0")
-    if payload.unusual_amount_threshold_le < payload.base_wage_per_order_le:
+    if payload.max_helper_wage_per_order_le is None or payload.max_helper_wage_per_order_le <= 0:
+        raise HTTPException(status_code=422, detail="Batas maksimum keras upah (hard cap) wajib diisi dan harus lebih besar dari 0")
+
+    if payload.base_wage_per_order_le > payload.unusual_amount_threshold_le:
         raise HTTPException(
             status_code=422,
             detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) tidak boleh lebih kecil dari tarif dasar ({payload.base_wage_per_order_le} LE)"
+        )
+    if payload.unusual_amount_threshold_le >= payload.max_helper_wage_per_order_le:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) harus lebih kecil dari batas maksimum keras ({payload.max_helper_wage_per_order_le} LE)"
         )
 
     old_policy = await get_active_delivery_wage_policy(db_inst=db)
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    cap_val = payload.max_helper_wage_per_order_le
-    if cap_val is None or cap_val <= 0:
-        cap_val = payload.unusual_amount_threshold_le
-
     new_policy_val = {
         "base_wage_per_order_le": float(payload.base_wage_per_order_le),
         "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
-        "max_helper_wage_per_order_le": float(cap_val),
+        "max_helper_wage_per_order_le": float(payload.max_helper_wage_per_order_le),
         "currency": "EGP",
         "rounding_policy": "piastre_round_half_up",
         "updated_at": now_iso,
@@ -6415,7 +6472,12 @@ async def admin_get_delivery_wage_policy_history(
     limit: int = 50,
     admin: dict = Depends(require_perm("access_finance"))
 ):
-    query = {"entity_type": "delivery_wage_policy"}
+    query = {
+        "$or": [
+            {"entity_type": "delivery_wage_policy"},
+            {"action": {"$in": ["update_delivery_wage_policy", "delivery_wage_threshold_override", "delivery_wage_hard_cap_rejection"]}}
+        ]
+    }
     cursor = db.audit_logs.find(query).sort("timestamp", -1)
     to_list_fn = getattr(cursor, "to_list", None)
     if callable(to_list_fn):
@@ -6431,21 +6493,25 @@ async def admin_preview_delivery_wage_allocation(
     admin: dict = Depends(require_perm("access_finance"))
 ):
     policy = await get_active_delivery_wage_policy(db_inst=db)
-    threshold = _num(policy.get("unusual_amount_threshold_le"), 500.0)
+    threshold = _num(policy.get("unusual_amount_threshold_le"), 100.0)
+    hard_cap = _num(policy.get("max_helper_wage_per_order_le"), 500.0)
     base_wage = _num(policy.get("base_wage_per_order_le"), 50.0)
 
     total_wage = _num(payload.total_wage_le) if payload.total_wage_le is not None else base_wage
     if total_wage < 0:
         raise HTTPException(status_code=422, detail="Nominal upah tidak boleh negatif")
 
-    requires_confirmation = total_wage > threshold
+    exceeds_hard_cap = total_wage > hard_cap
+    requires_confirmation = threshold < total_wage <= hard_cap
     allocations = calculate_delivery_helper_wage_allocations(total_wage, payload.helpers)
 
     return {
         "total_wage_le": total_wage,
         "base_wage_le": base_wage,
         "threshold_le": threshold,
+        "hard_cap_le": hard_cap,
         "requires_confirmation": requires_confirmation,
+        "exceeds_hard_cap": exceeds_hard_cap,
         "helpers_count": len(payload.helpers),
         "allocations": allocations
     }

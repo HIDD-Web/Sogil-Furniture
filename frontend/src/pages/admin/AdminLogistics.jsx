@@ -842,7 +842,8 @@ export default function AdminLogistics() {
       return;
     }
 
-    const threshold = activeTrip?.rate_policy_snapshot?.unusual_amount_threshold_le || 500;
+    const threshold = activeTrip?.rate_policy_snapshot?.unusual_amount_threshold_le || 100;
+    const hardCap = activeTrip?.rate_policy_snapshot?.max_cap_at_dispatch_le || 500;
     const payload = {
       recipient_name: rName,
       handover_notes: handoverNotes.trim() || null,
@@ -853,6 +854,12 @@ export default function AdminLogistics() {
       const cWage = Number(customWageLe);
       if (cWage < 0) {
         setHandoverError("Nominal upah tidak boleh negatif.");
+        return;
+      }
+      if (cWage > hardCap) {
+        setHandoverError(
+          `Nominal upah (${cWage} LE) melebihi batas maksimum keras (${hardCap} LE). Konfirmasi dan alasan tidak dapat melewati batas keras.`
+        );
         return;
       }
       payload.custom_wage_le = cWage;
@@ -2943,20 +2950,30 @@ export default function AdminLogistics() {
           activeTrip.trip_wage_rate_le ||
           50;
         const threshold =
-          activeTrip.rate_policy_snapshot?.unusual_amount_threshold_le || 500;
+          activeTrip.rate_policy_snapshot?.unusual_amount_threshold_le || 100;
+        const hardCap =
+          activeTrip.rate_policy_snapshot?.max_cap_at_dispatch_le || 500;
+        const cWageNum = Number(customWageLe);
+        const isOverHardCap =
+          isCustomWage &&
+          customWageLe !== "" &&
+          !isNaN(cWageNum) &&
+          cWageNum > hardCap;
         const isUnusual =
           isCustomWage &&
           customWageLe !== "" &&
-          !isNaN(Number(customWageLe)) &&
-          Number(customWageLe) > threshold;
+          !isNaN(cWageNum) &&
+          cWageNum > threshold &&
+          !isOverHardCap;
         const canSubmit =
           !submittingHandover &&
           recipientName.trim().length > 0 &&
           helperConfirmed &&
           (!isCustomWage ||
             (customWageLe !== "" &&
-              !isNaN(Number(customWageLe)) &&
-              Number(customWageLe) >= 0 &&
+              !isNaN(cWageNum) &&
+              cWageNum >= 0 &&
+              !isOverHardCap &&
               (!isUnusual ||
                 (confirmedUnusualAmount && overrideReason.trim().length >= 5))));
 
@@ -3114,7 +3131,27 @@ export default function AdminLogistics() {
                         />
                       </div>
 
-                      {/* Unusual Amount Warning & Confirmation (> 500 LE) */}
+                      {/* Hard Cap Warning (> hardCap LE) */}
+                      {isOverHardCap && (
+                        <div
+                          data-testid="hard-cap-warning"
+                          className="rounded-xl bg-rose-50 border border-rose-300 p-3 space-y-1.5 text-xs text-rose-950"
+                        >
+                          <div className="flex items-start gap-2">
+                            <AlertTriangle size={16} className="text-rose-600 shrink-0 mt-0.5" />
+                            <div>
+                              <p className="font-bold">
+                                Nominal upah ({customWageLe} LE) melebihi batas maksimum keras ({hardCap} LE).
+                              </p>
+                              <p className="mt-0.5 text-[11px] text-rose-800">
+                                Pengajuan ini otomatis ditolak oleh backend. Konfirmasi dan alasan tertulis tidak dapat melewati batas keras.
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Unusual Amount Warning & Confirmation (> threshold and <= hardCap) */}
                       {isUnusual && (
                         <div
                           data-testid="unusual-amount-warning"

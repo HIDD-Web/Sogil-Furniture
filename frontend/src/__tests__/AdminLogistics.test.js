@@ -1841,7 +1841,7 @@ describe("AdminLogistics - Phase 3.F.4.2B Package 2 Suite", () => {
       id: "trip_transit_004",
       trip_number: "TRIP-20261015-TRANSIT4",
       status: "in_transit",
-      rate_policy_snapshot: { applied_rate_le: 50.0, unusual_amount_threshold_le: 500.0 },
+      rate_policy_snapshot: { applied_rate_le: 50.0, unusual_amount_threshold_le: 100.0, max_cap_at_dispatch_le: 500.0 },
       stops: [
         {
           stop_id: "stp_101",
@@ -1903,11 +1903,11 @@ describe("AdminLogistics - Phase 3.F.4.2B Package 2 Suite", () => {
       customWageToggle.click();
     });
 
-    // Enter 600 LE (> 500 LE threshold)
+    // Enter 250 LE (> 100 LE threshold, <= 500 LE hard cap)
     const customWageInput = container.querySelector('[data-testid="input-custom-wage"]');
     await act(async () => {
       const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-      nativeSetter.call(customWageInput, "600");
+      nativeSetter.call(customWageInput, "250");
       customWageInput.dispatchEvent(new Event("change", { bubbles: true }));
     });
 
@@ -1952,11 +1952,94 @@ describe("AdminLogistics - Phase 3.F.4.2B Package 2 Suite", () => {
         recipient_name: "Fatima",
         handover_notes: null,
         helper_confirmed: true,
-        custom_wage_le: 600,
+        custom_wage_le: 250,
         confirmed_unusual_amount: true,
         override_reason: "Lantai 5 tanpa lift",
       }
     );
+  });
+
+  test("42b. Unusual wage override above 500 LE hard cap displays rejection alert and keeps submit disabled", async () => {
+    mockSearchParams = new URLSearchParams("tab=trips");
+    const testTrip = {
+      ...mockTrips[0],
+      id: "trip_transit_004b",
+      trip_number: "TRIP-20261015-TRANSIT4B",
+      status: "in_transit",
+      rate_policy_snapshot: {
+        applied_rate_le: 50.0,
+        unusual_amount_threshold_le: 100.0,
+        max_cap_at_dispatch_le: 500.0,
+      },
+      stops: [
+        {
+          stop_id: "stp_101b",
+          order_id: "ord_101b",
+          order_number: "ORD-20261015-001B",
+          customer_name: "Youssef Ibrahim",
+          outcome: "out_for_delivery",
+        },
+      ],
+      stops_count: 1,
+    };
+
+    api.get.mockImplementation((url) => {
+      if (url === "/delivery-zones") return Promise.resolve({ data: mockZones });
+      if (url === "/admin/workers") return Promise.resolve({ data: mockWorkers });
+      if (url === "/admin/delivery-trips/unassigned-orders") {
+        return Promise.resolve({ data: mockUnassignedOrders });
+      }
+      if (url === "/admin/delivery-trips/trip_transit_004b") {
+        return Promise.resolve({ data: testTrip });
+      }
+      if (url.startsWith("/admin/delivery-trips")) {
+        return Promise.resolve({ data: [testTrip] });
+      }
+      return Promise.reject(new Error(`Unhandled GET url: ${url}`));
+    });
+
+    await act(async () => {
+      root.render(<AdminLogistics />);
+    });
+
+    await act(async () => {
+      container
+        .querySelector('[data-testid="btn-manage-stops-TRIP-20261015-TRANSIT4B"]')
+        .click();
+    });
+
+    await act(async () => {
+      container
+        .querySelector('[data-testid="btn-handover-stop-ORD-20261015-001B"]')
+        .click();
+    });
+
+    const recipientInput = container.querySelector('[data-testid="input-handover-recipient"]');
+    const helperCheck = container.querySelector('[data-testid="checkbox-helper-confirmed"]');
+    const customWageToggle = container.querySelector('[data-testid="toggle-custom-wage"]');
+    const submitBtn = container.querySelector('[data-testid="btn-confirm-handover-submit"]');
+
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      nativeSetter.call(recipientInput, "Fatima");
+      recipientInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+      helperCheck.click();
+      customWageToggle.click();
+    });
+
+    // Enter 600 LE (> 500 LE hard cap)
+    const customWageInput = container.querySelector('[data-testid="input-custom-wage"]');
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      nativeSetter.call(customWageInput, "600");
+      customWageInput.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    // Hard cap rejection alert is visible
+    expect(container.querySelector('[data-testid="hard-cap-warning"]')).not.toBeNull();
+    // Submit button permanently disabled
+    expect(submitBtn.disabled).toBe(true);
   });
 
   test("43. Handover failure (HTTP 409/422/network) displays error alert without false success or optimistic mutation", async () => {

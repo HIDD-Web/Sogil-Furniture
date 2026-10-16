@@ -441,7 +441,7 @@ async def test_08_wage_cap_not_set_fails_closed(mock_env):
 async def test_09_wage_rate_exceeding_owner_cap_rejected(mock_env):
     """Test 24b: If wage rate exceeds Owner cap, rejected with HTTP 422."""
     with patch("server.get_setting", new_callable=AsyncMock) as mock_setting:
-        mock_setting.return_value = {"max_helper_wage_per_order_le": 60.0}
+        mock_setting.return_value = {"max_helper_wage_per_order_le": 60.0, "unusual_amount_threshold_le": 50.0}
         with pytest.raises(HTTPException) as ctx:
             await validate_delivery_trip_wage_cap(75.0)
         assert ctx.value.status_code == 422
@@ -452,7 +452,7 @@ async def test_09_wage_rate_exceeding_owner_cap_rejected(mock_env):
 async def test_10_wage_rate_within_cap_accepted(mock_env):
     """Test 24c: Wage rate within valid Owner cap is accepted."""
     with patch("server.get_setting", new_callable=AsyncMock) as mock_setting:
-        mock_setting.return_value = {"max_helper_wage_per_order_le": 60.0}
+        mock_setting.return_value = {"max_helper_wage_per_order_le": 60.0, "unusual_amount_threshold_le": 50.0}
         cap_val = await validate_delivery_trip_wage_cap(50.0)
         assert cap_val == 60.0
 
@@ -798,7 +798,7 @@ async def test_24_dispatch_excludes_cancelled_stops_from_in_transit_orders_updat
     mdb.settings.docs["delivery_wage_policy"] = {
         "_id": "delivery_wage_policy",
         "key": "delivery_wage_policy",
-        "value": {"max_helper_wage_per_order_le": 50.0}
+        "value": {"max_helper_wage_per_order_le": 50.0, "unusual_amount_threshold_le": 45.0}
     }
 
     # Setup orders
