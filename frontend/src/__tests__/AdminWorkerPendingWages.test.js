@@ -559,4 +559,64 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
     // 5. Verifies submit control is not permanently disabled
     expect(submitBtn.disabled).toBe(false);
   });
+
+  test("handles wage settlement stale-rate HTTP 422 error and instructs admin to refresh rate without auto-submitting", async () => {
+    const { toast } = require("sonner");
+    toast.success.mockClear();
+
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const settleBtn = container.querySelector('[data-testid="settle-btn-w_1"]');
+    expect(settleBtn).not.toBeNull();
+    await act(async () => {
+      settleBtn.click();
+    });
+
+    const idrBtn = container.querySelector('[data-testid="settle-currency-idr-btn"]');
+    expect(idrBtn).not.toBeNull();
+    await act(async () => {
+      idrBtn.click();
+    });
+
+    const staleRateError = Object.assign(
+      new Error("Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)."),
+      {
+        response: {
+          status: 422,
+          data: { detail: "Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)." },
+        },
+      }
+    );
+    api.post.mockRejectedValueOnce(staleRateError);
+
+    const submitBtn = container.querySelector('[data-testid="submit-settle-btn"]');
+    expect(submitBtn).not.toBeNull();
+
+    await act(async () => {
+      submitBtn.click();
+    });
+
+    // 1. Verifies api.post called with settlement_rate but is_rate_override = false
+    expect(api.post).toHaveBeenCalledWith(
+      "/admin/wages/settlements",
+      expect.objectContaining({
+        worker_id: "w_1",
+        payment_currency: "IDR",
+        is_rate_override: false,
+      })
+    );
+
+    // 2. No false success
+    expect(toast.success).not.toHaveBeenCalled();
+
+    // 3. User-facing stale rate instruction displayed
+    const expectedMsg = "Kurs transaksi di sistem telah berubah. Muat ulang rincian atau tutup modal untuk memperbarui kurs sebelum memproses pembayaran upah.";
+    expect(container.textContent).toContain(expectedMsg);
+
+    // 4. Modal remains open and inputs preserved without auto-submitting
+    expect(container.querySelector('[data-testid="settle-wage-modal"]')).not.toBeNull();
+    expect(submitBtn.disabled).toBe(false);
+  });
 });

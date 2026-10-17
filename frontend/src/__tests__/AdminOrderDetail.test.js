@@ -266,4 +266,145 @@ describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => 
       expect(submitCallCount).toBe(1); // Call count remains 1
     });
   });
+
+  describe("Payment Modal Error & Stale-Rate UX Handling", () => {
+    let container = null;
+    let root = null;
+
+    beforeEach(() => {
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "menunggu_pembayaran",
+        payment_status: "belum_dibayar",
+        payment_method: "cash",
+        total_le: 1500,
+        subtotal_le: 1300,
+        delivery_fee_le: 200,
+        items: [],
+        payments: [],
+      };
+      api.get.mockImplementation((url) => {
+        if (typeof url === "string" && url.includes("/payments")) {
+          return Promise.resolve({ data: { payments: [] } });
+        }
+        return Promise.resolve({ data: dummyOrder });
+      });
+      if (api.post) api.post.mockResolvedValue({ data: {} });
+      if (api.patch) api.patch.mockResolvedValue({ data: {} });
+      if (api.delete) api.delete.mockResolvedValue({ data: {} });
+    });
+
+    afterEach(() => {
+      act(() => {
+        if (root) root.unmount();
+      });
+      if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
+      }
+      container = null;
+      root = null;
+      jest.clearAllMocks();
+    });
+
+    test("handles customer IDR overpayment HTTP 422 and displays clear rejection alert without resetting inputs", async () => {
+      const { toast } = require("sonner");
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      const openBtn = container.querySelector('[data-testid="btn-record-payment"]');
+      expect(openBtn).not.toBeNull();
+
+      await act(async () => {
+        openBtn.click();
+      });
+
+      const amountInput = container.querySelector('[data-testid="input-payment-amount"]');
+      expect(amountInput).not.toBeNull();
+
+      await act(async () => {
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeInputValueSetter.call(amountInput, "600");
+        amountInput.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+
+      const overpayError = {
+        response: {
+          status: 422,
+          data: {
+            detail: "Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran.",
+          },
+        },
+      };
+      api.post.mockRejectedValueOnce(overpayError);
+
+      const submitBtn = container.querySelector('[data-testid="btn-submit-payment"]');
+      expect(submitBtn).not.toBeNull();
+
+      await act(async () => {
+        submitBtn.click();
+      });
+
+      expect(toast.error).toHaveBeenCalledWith(
+        "Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran."
+      );
+      const alertBox = container.querySelector('[data-testid="payment-error-alert"]');
+      expect(alertBox).not.toBeNull();
+      expect(alertBox.textContent).toContain("Nominal transfer melebihi sisa tagihan pesanan");
+
+      // Verify form inputs remain preserved and modal stays open
+      expect(container.querySelector('[data-testid="input-payment-amount"]')).not.toBeNull();
+      expect(amountInput.value).toBe("600");
+    });
+
+    test("handles stale-rate HTTP 422 error and instructs admin to reload order details before saving payment", async () => {
+      const { toast } = require("sonner");
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      const openBtn = container.querySelector('[data-testid="btn-record-payment"]');
+      expect(openBtn).not.toBeNull();
+
+      await act(async () => {
+        openBtn.click();
+      });
+
+      const amountInput = container.querySelector('[data-testid="input-payment-amount"]');
+      await act(async () => {
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeInputValueSetter.call(amountInput, "400");
+        amountInput.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+
+      const staleRateError = {
+        response: {
+          status: 422,
+          data: {
+            detail: "Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter).",
+          },
+        },
+      };
+      api.post.mockRejectedValueOnce(staleRateError);
+
+      const submitBtn = container.querySelector('[data-testid="btn-submit-payment"]');
+      await act(async () => {
+        submitBtn.click();
+      });
+
+      const expectedMsg = "Kurs transaksi di sistem telah berubah. Muat ulang rincian pesanan untuk memperbarui kurs sebelum menyimpan pembayaran.";
+      expect(toast.error).toHaveBeenCalledWith(expectedMsg);
+
+      const alertBox = container.querySelector('[data-testid="payment-error-alert"]');
+      expect(alertBox).not.toBeNull();
+      expect(alertBox.textContent).toContain("Kurs transaksi di sistem telah berubah");
+
+      // Form state preserved, no auto-submit
+      expect(amountInput.value).toBe("400");
+    });
+  });
 });

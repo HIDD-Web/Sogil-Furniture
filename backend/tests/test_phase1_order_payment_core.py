@@ -557,3 +557,384 @@ class TestPhase1PaymentCore(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(txn_trf["amount"], 500.0 * 350.0)
             self.assertEqual(txn_trf["counterpart_currency"], "EGP")
             self.assertEqual(txn_trf["counterpart_amount"], 500.0)
+
+    async def test_customer_idr_transfer_defaults_to_settings_rate_not_historical_order_rate(self):
+        """Customer IDR payment defaults to current configured rate at payment time, not historical order rate."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-HIST-1",
+            "total_le": 1000.0,
+            "exchange_rate_idr_per_le": 300.0,  # Historical rate at creation
+            "estimated_total_idr": 300000.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 109})
+        # Current configured rate in settings is 357.0 (differs from order's 300.0)
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            payload = PaymentCreateInput(amount=500.0, payment_method="transfer")
+            res = await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        # Finance transaction must use 357.0, NOT 300.0
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["exchange_rate"], 357.0)
+        self.assertEqual(txn_call["amount"], 500.0 * 357.0)  # 178,500 IDR
+        self.assertEqual(txn_call["currency"], "IDR")
+
+        # Payment record preserves current exchange rate snapshot
+        pmt_call = mock_db.payments.insert_one.call_args[0][0]
+        self.assertEqual(pmt_call["exchange_rate_snapshot"], 357.0)
+        self.assertEqual(pmt_call["amount_le"], 500.0)
+        self.assertFalse(pmt_call["is_rate_override"])
+
+    async def test_customer_idr_transfer_with_actual_received_amount_and_variance(self):
+        """Customer IDR payment with actual received IDR calculates discharged LE and logs variance."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-HIST-2",
+            "total_le": 1000.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 110})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            # Standard for 500 LE at 357 is 178500 IDR. Customer actually transferred 179000 IDR (+500 IDR variance)
+            payload = PaymentCreateInput(
+                amount=500.0,
+                payment_method="transfer",
+                actual_received_amount=179000.0,
+                notes="Pembulatan transfer bank oleh customer",
+            )
+            res = await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        # Finance transaction records actual received IDR (179000)
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["amount"], 179000.0)
+        self.assertEqual(txn_call["currency"], "IDR")
+
+        # Payment record stores actual_received_amount and variance
+        pmt_call = mock_db.payments.insert_one.call_args[0][0]
+        self.assertEqual(pmt_call["actual_received_amount"], 179000.0)
+        self.assertEqual(pmt_call["variance_idr"], 500.0)
+
+        # Audit log was created for variance
+        var_calls = [c for c in mock_db.audit_logs.insert_one.call_args_list if c[0][0].get("action") == "order_payment_idr_variance"]
+        self.assertEqual(len(var_calls), 1)
+        self.assertEqual(var_calls[0][0][0]["metadata"]["variance_idr"], 500.0)
+
+    async def test_customer_idr_overpayment_rejected_with_422(self):
+        """MED-1: Customer IDR payment exceeding outstanding LE balance must be rejected with HTTP 422."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-OVERPAY-1",
+            "total_le": 500.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 111})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            # 500 LE * 357 = 178,500 IDR. Customer transfers 180,000 IDR (discharges 504.20 LE > 500 LE)
+            payload = PaymentCreateInput(
+                amount=500.0,
+                payment_method="transfer",
+                actual_received_amount=180000.0,
+                notes="Transfer IDR melebihi sisa tagihan pesanan",
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(
+                ctx.exception.detail,
+                "Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran."
+            )
+
+        # Invariant: No payment, finance transaction, or audit log must be persisted on rejection
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.audit_logs.insert_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
+
+    async def test_customer_idr_exact_payment_accepted_cleanly(self):
+        """MED-1: Customer IDR payment exactly discharging outstanding LE balance succeeds cleanly."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-EXACT-1",
+            "total_le": 500.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 112})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            # 500 LE * 357 = 178,500 IDR (exact payment)
+            payload = PaymentCreateInput(
+                amount=500.0,
+                payment_method="transfer",
+                actual_received_amount=178500.0,
+                notes="Pembayaran pelunasan pas",
+            )
+            res = await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        self.assertIsNotNone(res)
+        pmt_call = mock_db.payments.insert_one.call_args[0][0]
+        self.assertEqual(pmt_call["amount_le"], 500.0)
+        self.assertEqual(pmt_call["actual_received_amount"], 178500.0)
+        self.assertEqual(pmt_call["variance_idr"], 0)
+
+        txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
+        self.assertEqual(txn_call["amount"], 178500.0)
+        self.assertEqual(txn_call["counterpart_amount"], 500.0)
+
+    async def test_customer_idr_partial_payment_accepted_cleanly(self):
+        """MED-1: Customer IDR valid partial payment discharges proportional LE without overpayment error."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-PARTIAL-1",
+            "total_le": 1000.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 113})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            # 250 LE * 357 = 89,250 IDR (discharges 250 LE of 1000 LE)
+            payload = PaymentCreateInput(
+                amount=250.0,
+                payment_method="transfer",
+                actual_received_amount=89250.0,
+                notes="Pembayaran DP bertahap",
+            )
+            res = await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        self.assertIsNotNone(res)
+        pmt_call = mock_db.payments.insert_one.call_args[0][0]
+        self.assertEqual(pmt_call["amount_le"], 250.0)
+        self.assertEqual(pmt_call["actual_received_amount"], 89250.0)
+        self.assertEqual(pmt_call["variance_idr"], 0)
+
+    async def test_customer_idr_underpayment_preserves_residual_balance(self):
+        """Rp178,499 at 357 for 500 LE discharges 499.99 LE and preserves 0.01 LE residual balance (never falsely lunas)."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-UNDER-1",
+            "total_le": 500.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 114})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            # 178,499 IDR at 357 rate = 499.997198... LE. Must floor to 499.99 LE, not round up to 500.00
+            payload = PaymentCreateInput(
+                amount=500.0,
+                payment_method="transfer",
+                actual_received_amount=178499.0,
+                notes="Transfer kurang 1 rupiah",
+            )
+            res = await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        self.assertIsNotNone(res)
+        pmt_call = mock_db.payments.insert_one.call_args[0][0]
+        self.assertEqual(pmt_call["amount_le"], 499.99)
+        self.assertEqual(pmt_call["actual_received_amount"], 178499.0)
+        self.assertEqual(pmt_call["variance_idr"], -1)
+
+        # Invariant: Order summary with this payment maintains remaining obligation (0.01 LE) and status is 'dp'
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[
+            {"amount_le": 499.99, "status": "recorded"}
+        ])
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            summary = await compute_order_payment_summary(order_doc)
+
+        self.assertEqual(summary["payment_status"], "dp")
+        self.assertEqual(summary["paid_amount_le"], 499.99)
+        self.assertEqual(summary["outstanding_amount_le"], 0.01)
+
+    async def test_customer_idr_one_rupiah_overpayment_rejected_with_422(self):
+        """Rp178,501 at 357 for 500 LE (exceeding 178,500 by Rp1) is strictly rejected with HTTP 422."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-OVER-1RP",
+            "total_le": 500.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 115})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            payload = PaymentCreateInput(
+                amount=500.0,
+                payment_method="transfer",
+                actual_received_amount=178501.0,
+                notes="Transfer lebih 1 rupiah",
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(
+                ctx.exception.detail,
+                "Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran."
+            )
+
+        # Invariant: No payment, finance transaction, or audit log must be persisted on rejection
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.audit_logs.insert_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
+
+    async def test_customer_idr_legacy_payload_overpayment_rejected_with_422(self):
+        """Legacy transfer payload omitting actual_received_amount cannot bypass overpayment check."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-LEGACY-OVER-1",
+            "total_le": 500.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 116})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            # Amount 501 LE exceeds 500 LE obligation without actual_received_amount
+            payload = PaymentCreateInput(
+                amount=501.0,
+                payment_method="transfer",
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(
+                ctx.exception.detail,
+                "Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran."
+            )
+
+        mock_db.payments.insert_one.assert_not_called()
+        mock_db.finance_transactions.insert_one.assert_not_called()
+        mock_db.audit_logs.insert_one.assert_not_called()
+        mock_db.orders.update_one.assert_not_called()
+
+    async def test_customer_idr_legacy_payload_valid_payment_succeeds(self):
+        """Legacy transfer payload omitting actual_received_amount with valid amount succeeds cleanly."""
+        mock_db = MagicMock()
+        self._setup_mock_db(mock_db)
+        order_id = "507f1f77bcf86cd799439011"
+        order_doc = {
+            "_id": ObjectId(order_id),
+            "order_number": "SGF-LEGACY-VALID-1",
+            "total_le": 500.0,
+            "exchange_rate_idr_per_le": 357.0,
+        }
+        mock_db.orders.find_one = AsyncMock(return_value=order_doc)
+        mock_db.payments.find_one = AsyncMock(return_value=None)
+        mock_db.payments.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("607f1f77bcf86cd799439022")))
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId("707f1f77bcf86cd799439033")))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.orders.update_one = AsyncMock()
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 117})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357.0})
+        mock_db.payments.find.return_value.to_list = AsyncMock(return_value=[])
+
+        with patch("server.db", mock_db), patch("server.client", self.mock_client):
+            payload = PaymentCreateInput(
+                amount=500.0,
+                payment_method="transfer",
+            )
+            res = await admin_create_order_payment(order_id, payload, self.admin_finance)
+
+        self.assertIsNotNone(res)
+        pmt_call = mock_db.payments.insert_one.call_args[0][0]
+        self.assertEqual(pmt_call["amount_le"], 500.0)
+        self.assertEqual(pmt_call["actual_received_amount"], 178500.0)
+        self.assertEqual(pmt_call["variance_idr"], 0)

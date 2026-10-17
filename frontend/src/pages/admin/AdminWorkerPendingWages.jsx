@@ -71,6 +71,7 @@ export default function AdminWorkerPendingWages() {
   const [settleIdempotencyKey, setSettleIdempotencyKey] = useState("");
   const [settleCurrency, setSettleCurrency] = useState("EGP");
   const [settleLockedRate, setSettleLockedRate] = useState(null);
+  const [settleOrderHistoricalRate, setSettleOrderHistoricalRate] = useState(null);
   const [settleRate, setSettleRate] = useState("");
   const [settleIsOverride, setSettleIsOverride] = useState(false);
   const [settleOverrideReason, setSettleOverrideReason] = useState("");
@@ -131,6 +132,7 @@ export default function AdminWorkerPendingWages() {
     setSettleMethod("cash");
     setSettleCurrency("EGP");
     setSettleLockedRate(null);
+    setSettleOrderHistoricalRate(null);
     setSettleRate("");
     setSettleIsOverride(false);
     setSettleOverrideReason("");
@@ -143,8 +145,10 @@ export default function AdminWorkerPendingWages() {
     try {
       const res = await api.get(`/admin/workers/${worker.worker_id || worker.id}/pending-wages`);
       setSettleWorkerObligations(res.data?.obligations || []);
-      const lRate = res.data?.default_locked_exchange_rate || null;
+      const lRate = res.data?.default_settlement_rate || res.data?.default_locked_exchange_rate || null;
+      const histRate = res.data?.order_historical_rate || null;
       setSettleLockedRate(lRate);
+      setSettleOrderHistoricalRate(histRate);
       if (lRate) {
         setSettleRate(String(lRate));
       }
@@ -230,7 +234,17 @@ export default function AdminWorkerPendingWages() {
       await loadData();
     } catch (err) {
       console.error("Settlement error:", err);
-      setSettleError(formatApiError(err) || "Gagal memproses pembayaran upah");
+      const rawDetail = err.response?.data?.detail;
+      const detailStr = typeof rawDetail === "string" ? rawDetail : (rawDetail?.msg || JSON.stringify(rawDetail || ""));
+      let displayMsg = formatApiError(rawDetail || err.message) || "Gagal memproses pembayaran upah";
+      if (
+        err.response?.status === 422 &&
+        !settleIsOverride &&
+        (detailStr.includes("Alasan perubahan kurs") || detailStr.includes("kurs override") || detailStr.includes("kurs transaksi"))
+      ) {
+        displayMsg = "Kurs transaksi di sistem telah berubah. Muat ulang rincian atau tutup modal untuk memperbarui kurs sebelum memproses pembayaran upah.";
+      }
+      setSettleError(displayMsg);
     } finally {
       setSubmitting(false);
     }
@@ -672,7 +686,7 @@ export default function AdminWorkerPendingWages() {
           data-testid="settle-wage-modal"
         >
           <div
-            className="relative w-full max-w-lg rounded-2xl border border-[#E5DCC5] bg-white p-5 sm:p-6 shadow-xl"
+            className="relative w-full max-w-xl sm:max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-6 shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-[#F1EBE0] pb-3">
@@ -687,7 +701,7 @@ export default function AdminWorkerPendingWages() {
               <button
                 disabled={submitting}
                 onClick={() => setSettleModalOpen(false)}
-                className="p-1 text-[#8B7355] hover:text-[#2C1E16]"
+                className="p-1.5 text-[#8B7355] hover:text-[#2C1E16] rounded-lg hover:bg-[#FBF9F4]"
               >
                 <X size={18} />
               </button>
@@ -728,7 +742,7 @@ export default function AdminWorkerPendingWages() {
                     setSettleMethod("cash");
                   }}
                   data-testid="settle-currency-egp-btn"
-                  className={`flex flex-col items-center justify-center p-2.5 rounded-xl border text-xs font-semibold transition-all ${
+                  className={`flex flex-col items-center justify-center p-2.5 rounded-xl border text-xs font-semibold transition-all min-h-[48px] ${
                     settleCurrency === "EGP"
                       ? "border-[#8B5A2B] bg-[#8B5A2B] text-white shadow-xs"
                       : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
@@ -747,7 +761,7 @@ export default function AdminWorkerPendingWages() {
                     if (settleLockedRate) setSettleRate(String(settleLockedRate));
                   }}
                   data-testid="settle-currency-idr-btn"
-                  className={`flex flex-col items-center justify-center p-2.5 rounded-xl border text-xs font-semibold transition-all ${
+                  className={`flex flex-col items-center justify-center p-2.5 rounded-xl border text-xs font-semibold transition-all min-h-[48px] ${
                     settleCurrency === "IDR"
                       ? "border-[#8B5A2B] bg-[#8B5A2B] text-white shadow-xs"
                       : "border-[#E5DCC5] bg-white text-[#5C4A3D] hover:bg-[#FBF9F4]"
@@ -772,11 +786,17 @@ export default function AdminWorkerPendingWages() {
               return (
                 <div className="mt-3 rounded-xl bg-amber-50/70 p-3 border border-amber-200 text-xs space-y-2.5">
                   <div className="flex justify-between items-center">
-                    <span className="font-semibold text-amber-950">Kurs Referensi Terkunci:</span>
+                    <span className="font-semibold text-amber-950">Kurs Terkini (Pengaturan):</span>
                     <span className="font-bold text-amber-900" data-testid="locked-rate-display">
                       {settleLockedRate ? `1 LE = Rp ${Number(settleLockedRate).toLocaleString("id-ID")}` : "Tidak tersedia (Kewajiban lama)"}
                     </span>
                   </div>
+                  {settleOrderHistoricalRate && (
+                    <div className="flex justify-between items-center text-[11px] text-[#8B7355] pt-0.5">
+                      <span>Kurs Order Historis (Informasi):</span>
+                      <span className="font-medium">1 LE = Rp {Number(settleOrderHistoricalRate).toLocaleString("id-ID")}</span>
+                    </div>
+                  )}
                   <div className="flex justify-between items-center pt-1 border-t border-amber-200/60">
                     <span className="text-[#5C4A3D]">Estimasi Konversi Standar IDR:</span>
                     <span className="font-bold text-base text-[#8B5A2B]" data-testid="estimated-idr-payout">
@@ -789,7 +809,7 @@ export default function AdminWorkerPendingWages() {
 
                   {/* Custom Actual IDR Payout Control */}
                   <div className="pt-2 border-t border-amber-200/60 space-y-2">
-                    <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950">
+                    <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950 py-1">
                       <input
                         type="checkbox"
                         checked={settleIsCustomPayout}
@@ -802,7 +822,7 @@ export default function AdminWorkerPendingWages() {
                           }
                         }}
                         data-testid="custom-payout-toggle"
-                        className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B]"
+                        className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
                       />
                       <span>Sesuaikan nominal pencairan IDR aktual (Transfer/Tunai riil)</span>
                     </label>
@@ -818,7 +838,7 @@ export default function AdminWorkerPendingWages() {
                             placeholder={`Contoh: ${standardIdr}`}
                             value={settleActualPayout}
                             onChange={(e) => setSettleActualPayout(e.target.value)}
-                            className="bg-white border-amber-300 text-xs font-semibold mt-1"
+                            className="bg-white border-amber-300 text-xs font-semibold mt-1 h-10 sm:h-9"
                             data-testid="settle-actual-payout-input"
                           />
                         </div>
@@ -846,7 +866,7 @@ export default function AdminWorkerPendingWages() {
                   {/* Override rate toggle / controls */}
                   {settleLockedRate ? (
                     <div className="pt-2 border-t border-amber-200/60 space-y-2">
-                      <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950 py-1">
                         <input
                           type="checkbox"
                           checked={settleIsOverride}
@@ -858,7 +878,7 @@ export default function AdminWorkerPendingWages() {
                             }
                           }}
                           data-testid="rate-override-toggle"
-                          className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B]"
+                          className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
                         />
                         <span>Ubah kurs penyelesaian aktual (Override Kurs)</span>
                       </label>
@@ -874,7 +894,7 @@ export default function AdminWorkerPendingWages() {
                               placeholder="Contoh: 360"
                               value={settleRate}
                               onChange={(e) => setSettleRate(e.target.value)}
-                              className="bg-white border-amber-300 text-xs font-semibold mt-1"
+                              className="bg-white border-amber-300 text-xs font-semibold mt-1 h-10 sm:h-9"
                               data-testid="settle-override-rate-input"
                             />
                           </div>
@@ -884,7 +904,7 @@ export default function AdminWorkerPendingWages() {
                               placeholder="Contoh: Penyesuaian kurs transfer bank BCA riil"
                               value={settleOverrideReason}
                               onChange={(e) => setSettleOverrideReason(e.target.value)}
-                              className="bg-white border-amber-300 text-xs mt-1"
+                              className="bg-white border-amber-300 text-xs mt-1 h-10 sm:h-9"
                               data-testid="settle-override-reason-input"
                             />
                           </div>
@@ -901,7 +921,7 @@ export default function AdminWorkerPendingWages() {
                         placeholder="Masukkan kurs penyelesaian..."
                         value={settleRate}
                         onChange={(e) => setSettleRate(e.target.value)}
-                        className="bg-white border-amber-300 text-xs font-semibold mt-1"
+                        className="bg-white border-amber-300 text-xs font-semibold mt-1 h-10 sm:h-9"
                         data-testid="settle-rate-legacy-input"
                       />
                     </div>
@@ -917,7 +937,7 @@ export default function AdminWorkerPendingWages() {
                   <button
                     type="button"
                     onClick={() => setSettleAmount(String(settleWorker.total_le || settleWorker.total_pending_wages_le || 0))}
-                    className="text-[11px] text-[#8B5A2B] font-semibold hover:underline"
+                    className="text-xs text-[#8B5A2B] font-semibold hover:underline py-1 flex items-center"
                     data-testid="pay-full-btn"
                   >
                     Bayar Lunas Semua
@@ -930,16 +950,16 @@ export default function AdminWorkerPendingWages() {
                   placeholder="Contoh: 250"
                   value={settleAmount}
                   onChange={(e) => setSettleAmount(e.target.value)}
-                  className="bg-white border-[#E5DCC5] font-semibold text-[#2C1E16]"
+                  className="bg-white border-[#E5DCC5] font-semibold text-[#2C1E16] h-10 sm:h-9 text-sm sm:text-xs"
                   data-testid="settle-amount-input"
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <Label className="text-xs text-[#5C4A3D]">Metode Pembayaran</Label>
                   <Select value={settleMethod} onValueChange={setSettleMethod}>
-                    <SelectTrigger className="bg-white border-[#E5DCC5] text-xs mt-1" data-testid="settle-method-select">
+                    <SelectTrigger className="bg-white border-[#E5DCC5] text-xs mt-1 h-10 sm:h-9" data-testid="settle-method-select">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -966,33 +986,34 @@ export default function AdminWorkerPendingWages() {
                     required
                     value={settleDate}
                     onChange={(e) => setSettleDate(e.target.value)}
-                    className="bg-white border-[#E5DCC5] text-xs mt-1"
+                    className="bg-white border-[#E5DCC5] text-xs mt-1 h-10 sm:h-9"
                     data-testid="settle-date-input"
                   />
                 </div>
               </div>
 
-              <div>
-                <Label className="text-xs text-[#5C4A3D]">Nomor Referensi (Opsional)</Label>
-                <Input
-                  placeholder="Contoh: Kuitansi No. 12 / Bukti Transfer"
-                  value={settleRef}
-                  onChange={(e) => setSettleRef(e.target.value)}
-                  className="bg-white border-[#E5DCC5] text-xs mt-1"
-                  data-testid="settle-ref-input"
-                />
-              </div>
-
-              <div>
-                <Label className="text-xs text-[#5C4A3D]">Catatan (Opsional)</Label>
-                <Textarea
-                  placeholder="Keterangan tambahan..."
-                  rows={2}
-                  value={settleNotes}
-                  onChange={(e) => setSettleNotes(e.target.value)}
-                  className="bg-white border-[#E5DCC5] text-xs mt-1"
-                  data-testid="settle-notes-input"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs text-[#5C4A3D]">Nomor Referensi (Opsional)</Label>
+                  <Input
+                    placeholder="Contoh: Kuitansi No. 12 / Bukti Transfer"
+                    value={settleRef}
+                    onChange={(e) => setSettleRef(e.target.value)}
+                    className="bg-white border-[#E5DCC5] text-xs mt-1 h-10 sm:h-9"
+                    data-testid="settle-ref-input"
+                  />
+                </div>
+                <div>
+                  <Label className="text-xs text-[#5C4A3D]">Catatan (Opsional)</Label>
+                  <Textarea
+                    placeholder="Keterangan tambahan..."
+                    rows={2}
+                    value={settleNotes}
+                    onChange={(e) => setSettleNotes(e.target.value)}
+                    className="bg-white border-[#E5DCC5] text-xs mt-1"
+                    data-testid="settle-notes-input"
+                  />
+                </div>
               </div>
 
               {/* Allocation Preview */}
@@ -1000,20 +1021,20 @@ export default function AdminWorkerPendingWages() {
                 Sistem akan mengalokasikan pembayaran secara <strong>FIFO</strong> (kewajiban tugas tertua akan dilunasi terlebih dahulu).
               </div>
 
-              <div className="pt-3 border-t border-[#F1EBE0] flex justify-end gap-2">
+              <div className="pt-3 border-t border-[#F1EBE0] flex flex-col-reverse sm:flex-row justify-end gap-2">
                 <Button
                   type="button"
                   variant="outline"
                   disabled={submitting}
                   onClick={() => setSettleModalOpen(false)}
-                  className="rounded-xl border-[#E5DCC5] text-xs"
+                  className="rounded-xl border-[#E5DCC5] text-xs h-10 sm:h-9 w-full sm:w-auto"
                 >
                   Batal
                 </Button>
                 <Button
                   type="submit"
                   disabled={submitting}
-                  className="rounded-xl bg-[#8B5A2B] text-white hover:bg-[#6D4522] text-xs font-semibold"
+                  className="rounded-xl bg-[#8B5A2B] text-white hover:bg-[#6D4522] text-xs font-semibold h-10 sm:h-9 w-full sm:w-auto"
                   data-testid="submit-settle-btn"
                 >
                   {submitting ? "Memproses..." : "Konfirmasi Pembayaran Upah"}

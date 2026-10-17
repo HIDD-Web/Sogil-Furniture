@@ -611,6 +611,7 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.admins.find_one = AsyncMock(return_value=self.worker)
         mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
 
         ob_doc = {
             "_id": ObjectId("670868f123456789abcdef14"),
@@ -643,6 +644,7 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.admins.find_one = AsyncMock(return_value=self.worker)
         mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
 
         ob_doc = {
             "_id": ObjectId("670868f123456789abcdef15"),
@@ -670,8 +672,8 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ctx.exception.status_code, 422)
             self.assertIn("Kurs override harus berupa angka positif", ctx.exception.detail)
 
-    async def test_legacy_obligation_without_locked_rate_requires_explicit_entry(self):
-        """Legacy obligation with no locked rate requires explicit settlement_rate entry for IDR."""
+    async def test_legacy_obligation_without_locked_rate_defaults_to_settings_rate(self):
+        """Legacy obligation with no locked rate cleanly defaults to current settings rate for IDR."""
         mock_db = MagicMock()
         mock_db.admins.find_one = AsyncMock(return_value=self.worker)
         mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
@@ -679,6 +681,7 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         ob_doc = {
             "_id": ObjectId("670868f123456789abcdef16"),
             "worker_id": "w_10",
+            "obligation_number": "WOB-LEGACY",
             "total_amount_le": 100.0,
             "paid_amount_le": 0.0,
             "currency": "EGP",
@@ -689,21 +692,36 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         find_ob_mock.sort.return_value.to_list = AsyncMock(return_value=[ob_doc])
         mock_db.wage_obligations.find.return_value = find_ob_mock
 
+        mock_db.finance_transactions.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.employee_wages.insert_one = AsyncMock()
+        mock_db.wage_settlements.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId()))
+        mock_db.finance_transactions.update_one = AsyncMock()
+        mock_db.wage_obligations.update_one = AsyncMock(return_value=MagicMock(modified_count=1))
+        mock_db.audit_logs.insert_one = AsyncMock()
+        mock_db.counters.find_one_and_update = AsyncMock(return_value={"seq": 1})
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
+
         payload = WageSettlementCreateInput(
             worker_id="w_10",
             amount_le=100.0,
             payment_currency="IDR",
+            payment_method="bank_transfer",
             # settlement_rate omitted
         )
 
-        with patch("server.db", mock_db):
-            with self.assertRaises(HTTPException) as ctx:
-                await admin_create_wage_settlement(payload, self.admin)
-            self.assertEqual(ctx.exception.status_code, 422)
-            self.assertIn("Kurs penyelesaian IDR wajib diisi secara eksplisit", ctx.exception.detail)
+        with patch("server.db", mock_db), \
+             patch("server.client.start_session", AsyncMock(side_effect=pymongo.errors.ConfigurationError("Standalone"))), \
+             patch("server.is_standalone_fallback_permitted", return_value=True):
+            res = await admin_create_wage_settlement(payload, self.admin)
 
-    async def test_settings_rate_change_does_not_affect_locked_rate_settlement(self):
-        """Settings rate changed to 500 after order creation does NOT affect locked rate (357)."""
+        self.assertIsNotNone(res)
+        st_call = mock_db.wage_settlements.insert_one.call_args[0][0]
+        self.assertEqual(st_call["settlement_rate"], 357.0)
+        self.assertIsNone(st_call["order_historical_rate"])
+        self.assertEqual(st_call["payout_amount"], 35700.0)
+
+    async def test_settings_rate_change_updates_default_wage_settlement_rate(self):
+        """Settings rate changed to 500 after order creation updates default wage settlement rate to 500."""
         mock_db = MagicMock()
         mock_db.admins.find_one = AsyncMock(return_value=self.worker)
         mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
@@ -745,14 +763,16 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
             res = await admin_create_wage_settlement(payload, self.admin)
 
         self.assertIsNotNone(res)
-        # Transaction and settlement must use locked rate 357, NOT settings rate 500
+        # Transaction and settlement must use current settings rate 500
         txn_call = mock_db.finance_transactions.insert_one.call_args[0][0]
-        self.assertEqual(txn_call["exchange_rate"], 357.0)
-        self.assertEqual(txn_call["amount"], 35700.0)
+        self.assertEqual(txn_call["exchange_rate"], 500.0)
+        self.assertEqual(txn_call["amount"], 50000.0)
 
         st_call = mock_db.wage_settlements.insert_one.call_args[0][0]
-        self.assertEqual(st_call["settlement_rate"], 357.0)
-        self.assertEqual(st_call["payout_amount"], 35700.0)
+        self.assertEqual(st_call["settlement_rate"], 500.0)
+        self.assertEqual(st_call["order_historical_rate"], 357.0)
+        self.assertEqual(st_call["payout_amount"], 50000.0)
+        self.assertFalse(st_call["is_rate_override"])
 
     async def test_partial_idr_settlement_leaves_correct_remaining_le_liability(self):
         """Partial IDR payment reduces obligation strictly in LE and leaves exact remaining LE balance."""
@@ -948,6 +968,7 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.admins.find_one = AsyncMock(return_value=self.worker)
         mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
 
         ob_doc = {
             "_id": ObjectId("670868f123456789abcdef1a"),
@@ -979,6 +1000,7 @@ class TestPhase1MultiCurrencyWageSettlement(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.admins.find_one = AsyncMock(return_value=self.worker)
         mock_db.wage_settlements.find_one = AsyncMock(return_value=None)
+        mock_db.settings.find_one = AsyncMock(return_value={"key": "exchange_rate_idr_per_le", "value": 357})
 
         ob_doc = {
             "_id": ObjectId("670868f123456789abcdef1b"),

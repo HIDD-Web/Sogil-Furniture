@@ -27,7 +27,7 @@ import boto3
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from bson.errors import InvalidId
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 import math
 import pymongo
 from pymongo import ReturnDocument
@@ -326,6 +326,10 @@ class PaymentCreateInput(BaseModel):
     notes: Optional[str] = ""
     allocations: Optional[List[PaymentAllocationInput]] = None
     idempotency_key: Optional[str] = None
+    exchange_rate: Optional[float] = None
+    is_rate_override: Optional[bool] = False
+    override_reason: Optional[str] = None
+    actual_received_amount: Optional[float] = None
 
 class PaymentVoidInput(BaseModel):
     reason: str
@@ -2659,7 +2663,107 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
     now = datetime.now(timezone.utc).isoformat()
     payment_date = payload.payment_date or now
 
-    # 3. Allocations Validation & Invariant
+    # 3. Exchange Rate Resolution & Actual Amount Evaluation
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    is_rate_override = False
+    override_reason = None
+    expected_idr = None
+    actual_idr = None
+    variance_idr = 0
+
+    if payment_method == "transfer":
+        primary_currency = "IDR"
+        primary_account = "IDR"
+        if payload.exchange_rate is not None and _num(payload.exchange_rate) > 0:
+            req_rate = _num(payload.exchange_rate)
+            if payload.is_rate_override or round(req_rate, 4) != round(settings_rate, 4):
+                override_reason = (payload.override_reason or "").strip()
+                if len(override_reason) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)."
+                    )
+                rate = round(float(req_rate), 4)
+                is_rate_override = True
+            else:
+                rate = settings_rate
+        else:
+            rate = settings_rate
+
+        expected_idr = round(raw_amount * rate)
+
+        # Preflight outstanding obligation check for overpayment gate
+        curr_summary_chk = await compute_order_payment_summary(order)
+        out_le = curr_summary_chk.get("outstanding_amount_le")
+        out_le_d = Decimal(str(out_le)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if out_le is not None else None
+
+        if payload.actual_received_amount is not None:
+            act_recv = _num(payload.actual_received_amount)
+            if act_recv <= 0 or not math.isfinite(act_recv):
+                raise HTTPException(status_code=422, detail="Nominal transfer IDR aktual harus lebih besar dari 0.")
+            actual_idr = round(act_recv)
+            variance_idr = actual_idr - expected_idr
+            if variance_idr != 0:
+                explanation = (payload.override_reason or payload.notes or "").strip()
+                if len(explanation) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Alasan/catatan wajib diisi saat nominal transfer IDR aktual berbeda dari konversi standar (minimal 3 karakter)."
+                    )
+
+            # Precise Decimal comparison without pre-rounding to 2 decimals
+            actual_idr_d = Decimal(str(actual_idr))
+            rate_d = Decimal(str(rate))
+            exact_discharged_d = actual_idr_d / rate_d
+
+            # Overpayment rejection gate (MED-1): reject if exact LE equivalent exceeds outstanding LE obligation
+            if out_le_d is not None and exact_discharged_d > out_le_d:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran."
+                )
+
+            # Calculate LE discharged with ROUND_DOWN to prevent rounding underpayments up to full obligation
+            discharged_le_dec = exact_discharged_d.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            raw_amount = float(discharged_le_dec)
+            primary_amount = actual_idr
+        else:
+            # Legacy transfer path omitting actual_received_amount:
+            # Prevent bypassing overpayment validation
+            req_le_d = Decimal(str(raw_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if out_le_d is not None and req_le_d > out_le_d:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Nominal transfer melebihi sisa tagihan pesanan. Periksa nominal dan kurs sebelum menyimpan pembayaran."
+                )
+            actual_idr = expected_idr
+            primary_amount = actual_idr
+
+        conv = {
+            "primary_amount": primary_amount,
+            "primary_currency": "IDR",
+            "counterpart_amount": round(raw_amount, 2),
+            "counterpart_currency": "EGP",
+            "rate": rate,
+        }
+    elif payment_method == "customer_credit":
+        rate = settings_rate
+        primary_currency = "EGP"
+        primary_account = "CUSTOMER_CREDIT"
+        conv = {
+            "primary_amount": raw_amount,
+            "primary_currency": "EGP",
+            "counterpart_amount": round(raw_amount * rate),
+            "counterpart_currency": "IDR",
+            "rate": rate,
+        }
+    else:  # cash
+        rate = settings_rate
+        primary_currency = "EGP"
+        primary_account = "EGP"
+        conv = compute_currency_conversion("EGP", raw_amount, rate)
+
+    # 4. Allocations Validation & Invariant
     # Default allocation if not provided: Allocate to product first, then shipping, remainder to unallocated_credit
     total_le = _num(order.get("total_le", 0.0))
     shipping_fee_le = _num(order.get("delivery_fee_le", 0.0))
@@ -2703,30 +2807,6 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             allocations.append({"target_type": "shipping", "amount_le": round(alloc_ship, 2), "order_item_id": None, "notes": "Auto-alokasi Ongkir"})
         if alloc_credit > 0 or len(allocations) == 0:
             allocations.append({"target_type": "unallocated_credit", "amount_le": round(alloc_credit if alloc_credit > 0 else raw_amount, 2), "order_item_id": None, "notes": "Kredit Belum Teralokasi"})
-
-    # 4. Exchange rate snapshot & counterpart computation
-    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
-    rate = resolve_transaction_rate(None, order.get("exchange_rate_idr_per_le"), settings_rate)
-
-    if payment_method == "transfer":
-        primary_currency = "IDR"
-        primary_account = "IDR"
-        conv = compute_currency_conversion("IDR", round(raw_amount * rate), rate)
-    elif payment_method == "customer_credit":
-        # Non-cash settlement: EGP currency, non-cash settlement account, zero physical cash
-        primary_currency = "EGP"
-        primary_account = "CUSTOMER_CREDIT"
-        conv = {
-            "primary_amount": raw_amount,
-            "primary_currency": "EGP",
-            "counterpart_amount": round(raw_amount * rate),
-            "counterpart_currency": "IDR",
-            "rate": rate,
-        }
-    else:
-        primary_currency = "EGP"
-        primary_account = "EGP"
-        conv = compute_currency_conversion("EGP", raw_amount, rate)
 
     payment_num = await generate_payment_number()
     txn_desc = (
@@ -2804,6 +2884,11 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             "amount_le": round(raw_amount, 2),
             "currency": "EGP",
             "exchange_rate_snapshot": rate,
+            "expected_amount_idr": expected_idr if payment_method == "transfer" else None,
+            "actual_received_amount": actual_idr if payment_method == "transfer" else None,
+            "variance_idr": variance_idr if payment_method == "transfer" else 0,
+            "is_rate_override": is_rate_override,
+            "override_reason": override_reason,
             "primary_amount": conv["primary_amount"],
             "primary_currency": primary_currency,
             "payment_method": payment_method,
@@ -2828,6 +2913,51 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             {"$set": {"payment_id": created_pmt_id}},
             **ins_kw
         )
+
+        # Audit logging for transfer variance and rate override
+        if variance_idr != 0 and payment_method == "transfer":
+            audit_var_doc = {
+                "action": "order_payment_idr_variance",
+                "entity_type": "payment",
+                "entity_id": created_pmt_id,
+                "entity_identifier": payment_num,
+                "actor_id": admin.get("id"),
+                "actor_name": admin.get("name", "Admin"),
+                "actor_role": admin.get("role", "admin"),
+                "metadata": {
+                    "order_id": str(order["_id"]),
+                    "order_number": order.get("order_number"),
+                    "payment_number": payment_num,
+                    "expected_amount_idr": expected_idr,
+                    "actual_received_amount": actual_idr,
+                    "variance_idr": variance_idr,
+                    "rate": rate,
+                    "reason": (payload.override_reason or payload.notes or "").strip(),
+                },
+                "timestamp": now,
+            }
+            await db.audit_logs.insert_one(audit_var_doc, **ins_kw)
+
+        if is_rate_override and payment_method == "transfer":
+            audit_ovr_doc = {
+                "action": "order_payment_rate_override",
+                "entity_type": "payment",
+                "entity_id": created_pmt_id,
+                "entity_identifier": payment_num,
+                "actor_id": admin.get("id"),
+                "actor_name": admin.get("name", "Admin"),
+                "actor_role": admin.get("role", "admin"),
+                "metadata": {
+                    "order_id": str(order["_id"]),
+                    "order_number": order.get("order_number"),
+                    "payment_number": payment_num,
+                    "configured_rate": settings_rate,
+                    "override_rate": rate,
+                    "override_reason": override_reason,
+                },
+                "timestamp": now,
+            }
+            await db.audit_logs.insert_one(audit_ovr_doc, **ins_kw)
 
         # Phase 3.B.3: Record credit_applied event in customer_credit_events
         if payment_method == "customer_credit":
@@ -3870,7 +4000,8 @@ async def admin_get_worker_pending_wages(
             locked_rates.append(l_rate)
         cleaned_obligations.append(c_ob)
 
-    default_locked_rate = locked_rates[0] if locked_rates else None
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
+    order_hist_rate = locked_rates[0] if locked_rates else None
 
     return {
         "worker_id": worker_id,
@@ -3880,7 +4011,10 @@ async def admin_get_worker_pending_wages(
         "total_paid_le": total_paid_le,
         "total_pending_wages_le": total_pending_le,
         "currency": "EGP",
-        "default_locked_exchange_rate": default_locked_rate,
+        "default_locked_exchange_rate": settings_rate,
+        "current_exchange_rate": settings_rate,
+        "default_settlement_rate": settings_rate,
+        "order_historical_rate": order_hist_rate,
         "obligations": cleaned_obligations,
     }
 
@@ -4062,6 +4196,7 @@ async def admin_create_wage_settlement(
                 locked_rates.append(l_rate)
 
     reference_locked_rate = locked_rates[0] if locked_rates else None
+    settings_rate = _num(await get_setting("exchange_rate_idr_per_le", 357), 357)
 
     # Handle IDR vs EGP rate resolution
     is_override = False
@@ -4076,35 +4211,24 @@ async def admin_create_wage_settlement(
         is_explicit_override = bool(payload.is_rate_override)
         req_rate = payload.settlement_rate
 
-        if reference_locked_rate is not None:
-            # Locked rate exists from allocation/dispatch
-            if is_explicit_override or (req_rate is not None and round(req_rate, 4) != round(reference_locked_rate, 4)):
-                is_override = True
-                override_reason = (payload.override_reason or "").strip()
-                if len(override_reason) < 3:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)."
-                    )
-                if req_rate is None or not (math.isfinite(req_rate) and req_rate > 0):
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Kurs override harus berupa angka positif yang valid."
-                    )
-                actual_rate = round(float(req_rate), 4)
-            else:
-                is_override = False
-                actual_rate = reference_locked_rate
-        else:
-            # Legacy obligations without locked rate
+        # IDR wage settlements default to current configured rate (settings_rate)
+        if is_explicit_override or (req_rate is not None and round(req_rate, 4) != round(settings_rate, 4)):
+            is_override = True
+            override_reason = (payload.override_reason or "").strip()
+            if len(override_reason) < 3:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Alasan perubahan kurs wajib diisi saat menggunakan kurs override (minimal 3 karakter)."
+                )
             if req_rate is None or not (math.isfinite(req_rate) and req_rate > 0):
                 raise HTTPException(
                     status_code=422,
-                    detail="Kewajiban upah lama ini tidak memiliki kurs terkunci. Kurs penyelesaian IDR wajib diisi secara eksplisit."
+                    detail="Kurs override harus berupa angka positif yang valid."
                 )
             actual_rate = round(float(req_rate), 4)
-            if payload.override_reason and payload.override_reason.strip():
-                override_reason = payload.override_reason.strip()
+        else:
+            is_override = False
+            actual_rate = settings_rate
 
         standard_payout_amount = round(disbursed_amount * actual_rate)
         if payload.actual_payout_amount is not None:
@@ -4128,7 +4252,7 @@ async def admin_create_wage_settlement(
     else:
         # EGP payment
         primary_account = "EGP"
-        actual_rate = reference_locked_rate
+        actual_rate = settings_rate
         actual_payout_amount = disbursed_amount
         standard_payout_amount = disbursed_amount
         variance_idr = 0
@@ -4256,7 +4380,8 @@ async def admin_create_wage_settlement(
         "payout_amount": actual_payout_amount,
         "standard_payout_amount": standard_payout_amount,
         "variance_idr": variance_idr,
-        "locked_exchange_rate": reference_locked_rate,
+        "locked_exchange_rate": reference_locked_rate if reference_locked_rate is not None else settings_rate,
+        "order_historical_rate": reference_locked_rate,
         "settlement_rate": actual_rate if payment_currency == "IDR" else None,
         "is_rate_override": is_override,
         "override_reason": override_reason,
@@ -4359,7 +4484,8 @@ async def admin_create_wage_settlement(
                     "worker_id": worker_id,
                     "worker_name": worker_name,
                     "wage_obligation_ids": [a["wage_obligation_id"] for a in resolved_allocations],
-                    "original_locked_rate": reference_locked_rate,
+                    "original_locked_rate": settings_rate,
+                    "order_historical_rate": reference_locked_rate,
                     "override_rate": actual_rate,
                     "override_reason": override_reason or (payload.notes or "").strip(),
                     "disbursed_amount_le": disbursed_amount,

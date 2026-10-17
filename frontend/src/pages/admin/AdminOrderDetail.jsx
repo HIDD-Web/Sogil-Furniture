@@ -28,6 +28,11 @@ const INITIAL_PAYMENT_FORM = {
   alloc_credit: "",
   use_custom_alloc: false,
   idempotency_key: "",
+  use_custom_idr: false,
+  actual_received_amount: "",
+  exchange_rate: "",
+  is_rate_override: false,
+  override_reason: "",
 };
 
 export default function AdminOrderDetail() {
@@ -49,6 +54,8 @@ export default function AdminOrderDetail() {
   const [paymentModalOpen, setPaymentModalOpen] = useState(false);
   const [paymentLoading, setPaymentLoading] = useState(false);
   const [paymentForm, setPaymentForm] = useState(INITIAL_PAYMENT_FORM);
+  const [paymentError, setPaymentError] = useState("");
+  const [currentRate, setCurrentRate] = useState(null);
   const [priceForm, setPriceForm] = useState({
     subtotal_le: 0,
     delivery_fee_le: 0,
@@ -111,6 +118,13 @@ export default function AdminOrderDetail() {
       });
     loadPayments();
     loadAssignments();
+    api.get("/store-info")
+      .then((r) => {
+        if (r.data?.exchange_rate_idr_per_le) {
+          setCurrentRate(r.data.exchange_rate_idr_per_le);
+        }
+      })
+      .catch(() => {});
   };
   useEffect(() => {
     load();
@@ -256,6 +270,7 @@ export default function AdminOrderDetail() {
   const handleRecordPayment = async (e) => {
     e.preventDefault();
     if (paymentLoading) return;
+    setPaymentError("");
 
     const amt = parseFloat(paymentForm.amount);
     if (!amt || amt <= 0) {
@@ -276,6 +291,44 @@ export default function AdminOrderDetail() {
       notes: paymentForm.notes || undefined,
       idempotency_key: currentIdemKey,
     };
+
+    if (paymentForm.payment_method === "transfer") {
+      const effRate = paymentForm.is_rate_override && paymentForm.exchange_rate
+        ? parseFloat(paymentForm.exchange_rate)
+        : (currentRate || 357);
+
+      payload.exchange_rate = effRate;
+
+      if (paymentForm.use_custom_idr && paymentForm.actual_received_amount !== "") {
+        const actualIdr = parseFloat(paymentForm.actual_received_amount);
+        if (isNaN(actualIdr) || actualIdr <= 0) {
+          toast.error("Nominal transfer IDR riil harus berupa angka positif yang valid");
+          return;
+        }
+        payload.actual_received_amount = actualIdr;
+        const expectedIdr = Math.round(amt * effRate);
+        if (Math.round(actualIdr) !== expectedIdr) {
+          const reason = (paymentForm.override_reason || paymentForm.notes || "").trim();
+          if (reason.length < 3) {
+            toast.error("Alasan/catatan wajib diisi saat nominal transfer IDR riil berbeda dari konversi standar (minimal 3 karakter)");
+            return;
+          }
+        }
+      }
+      if (paymentForm.is_rate_override) {
+        if (!paymentForm.exchange_rate || parseFloat(paymentForm.exchange_rate) <= 0) {
+          toast.error("Kurs override harus berupa angka positif yang valid");
+          return;
+        }
+        if (!paymentForm.override_reason || paymentForm.override_reason.trim().length < 3) {
+          toast.error("Alasan perubahan kurs wajib diisi (minimal 3 karakter)");
+          return;
+        }
+        payload.is_rate_override = true;
+        payload.exchange_rate = parseFloat(paymentForm.exchange_rate);
+        payload.override_reason = paymentForm.override_reason.trim();
+      }
+    }
 
     if (paymentForm.use_custom_alloc) {
       const pAmt = parseFloat(paymentForm.alloc_product) || 0;
@@ -299,9 +352,21 @@ export default function AdminOrderDetail() {
       toast.success("Pembayaran berhasil dicatat & masuk kas keuangan");
       setPaymentModalOpen(false);
       setPaymentForm(INITIAL_PAYMENT_FORM);
+      setPaymentError("");
       load();
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Gagal mencatat pembayaran");
+      const rawDetail = err.response?.data?.detail;
+      const detailStr = typeof rawDetail === "string" ? rawDetail : (rawDetail?.msg || JSON.stringify(rawDetail || ""));
+      let displayMsg = formatApiError(rawDetail || err.message) || "Gagal mencatat pembayaran";
+      if (
+        err.response?.status === 422 &&
+        !paymentForm.is_rate_override &&
+        (detailStr.includes("Alasan perubahan kurs") || detailStr.includes("kurs override") || detailStr.includes("kurs transaksi"))
+      ) {
+        displayMsg = "Kurs transaksi di sistem telah berubah. Muat ulang rincian pesanan untuk memperbarui kurs sebelum menyimpan pembayaran.";
+      }
+      setPaymentError(displayMsg);
+      toast.error(displayMsg);
     } finally {
       setPaymentLoading(false);
     }
@@ -767,6 +832,7 @@ export default function AdminOrderDetail() {
                         use_custom_alloc: false,
                         idempotency_key: generateUUID(),
                       });
+                      setPaymentError("");
                       setPaymentModalOpen(true);
                     }}
                     data-testid="btn-quick-settlement"
@@ -782,6 +848,7 @@ export default function AdminOrderDetail() {
                       payment_method: order.payment_method || "cash",
                       idempotency_key: generateUUID(),
                     });
+                    setPaymentError("");
                     setPaymentModalOpen(true);
                   }}
                   data-testid="btn-record-payment"
@@ -1034,16 +1101,32 @@ export default function AdminOrderDetail() {
       {/* Modal Pencatatan Pembayaran (Phase 1) */}
       {paymentModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-xl max-h-[90vh] overflow-y-auto">
+          <div className="w-full max-w-md sm:max-w-lg rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 shadow-xl max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-[#F1EBE0] pb-3">
               <div>
                 <h3 className="font-heading text-lg font-bold text-[#2C1E16]">Catat Pembayaran Masuk</h3>
                 <p className="text-xs text-[#8B7355]">Penerimaan kas/transfer nyata dari pelanggan</p>
               </div>
-              <button onClick={() => setPaymentModalOpen(false)} className="rounded-lg p-1 text-[#8B7355] hover:bg-[#F1EBE0]">
+              <button
+                onClick={() => {
+                  setPaymentModalOpen(false);
+                  setPaymentError("");
+                }}
+                className="rounded-lg p-1 text-[#8B7355] hover:bg-[#F1EBE0]"
+              >
                 <X size={18} />
               </button>
             </div>
+
+            {paymentError && (
+              <div
+                className="mt-3 rounded-lg border border-red-200 bg-red-50 p-2.5 text-xs text-red-800 flex items-center gap-2"
+                data-testid="payment-error-alert"
+              >
+                <AlertTriangle size={14} className="shrink-0 text-red-600" />
+                <span>{paymentError}</span>
+              </div>
+            )}
 
             <form onSubmit={handleRecordPayment} className="mt-4 space-y-3">
               <div>
@@ -1075,6 +1158,100 @@ export default function AdminOrderDetail() {
                   </SelectContent>
                 </Select>
               </div>
+
+              {paymentForm.payment_method === "transfer" && (() => {
+                const amtNum = parseFloat(paymentForm.amount) || 0;
+                const effRate = paymentForm.is_rate_override && paymentForm.exchange_rate
+                  ? (parseFloat(paymentForm.exchange_rate) || (currentRate || 357))
+                  : (currentRate || 357);
+                const standardIdr = Math.round(amtNum * effRate);
+                const actualIdrNum = (paymentForm.use_custom_idr && paymentForm.actual_received_amount !== "")
+                  ? (parseFloat(paymentForm.actual_received_amount) || 0)
+                  : standardIdr;
+                const idrVariance = Math.round(actualIdrNum) - standardIdr;
+                const dischargedLe = effRate > 0 ? Math.floor((actualIdrNum / effRate) * 100) / 100 : amtNum;
+
+                return (
+                  <div className="rounded-xl bg-amber-50/70 p-3 border border-amber-200 text-xs space-y-2">
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-amber-950">Kurs Konversi (Pengaturan Terkini):</span>
+                      <span className="font-bold text-amber-900" data-testid="payment-rate-display">
+                        1 LE = Rp {Number(effRate).toLocaleString("id-ID")}
+                      </span>
+                    </div>
+                    {order?.exchange_rate_idr_per_le && order.exchange_rate_idr_per_le !== effRate && (
+                      <div className="flex justify-between items-center text-[11px] text-[#8B7355]">
+                        <span>Kurs Estimasi Awal Pesanan:</span>
+                        <span className="font-medium">1 LE = Rp {Number(order.exchange_rate_idr_per_le).toLocaleString("id-ID")}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between items-center pt-1 border-t border-amber-200/60">
+                      <span className="text-[#5C4A3D]">Estimasi Penerimaan Standar IDR:</span>
+                      <span className="font-bold text-base text-[#8B5A2B]" data-testid="payment-expected-idr">
+                        Rp {standardIdr.toLocaleString("id-ID")}
+                      </span>
+                    </div>
+
+                    {/* Custom Actual IDR received toggle */}
+                    <div className="pt-2 border-t border-amber-200/60 space-y-2">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-950 py-1">
+                        <input
+                          type="checkbox"
+                          checked={paymentForm.use_custom_idr}
+                          onChange={(e) => {
+                            const chk = e.target.checked;
+                            setPaymentForm({
+                              ...paymentForm,
+                              use_custom_idr: chk,
+                              actual_received_amount: chk ? String(standardIdr) : "",
+                            });
+                          }}
+                          className="rounded border-amber-300 text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
+                          data-testid="toggle-custom-received-idr"
+                        />
+                        <span>Input nominal transfer IDR riil yang diterima bank</span>
+                      </label>
+
+                      {paymentForm.use_custom_idr && (
+                        <div className="space-y-2 pt-1">
+                          <div>
+                            <Label className="text-[11px] text-[#5C4A3D]">Nominal Transfer IDR Riil (Rp) *</Label>
+                            <Input
+                              type="number"
+                              step="1"
+                              placeholder={`Contoh: ${standardIdr}`}
+                              value={paymentForm.actual_received_amount}
+                              onChange={(e) => setPaymentForm({ ...paymentForm, actual_received_amount: e.target.value })}
+                              className="bg-white border-amber-300 text-xs font-semibold mt-1 h-9"
+                              data-testid="input-actual-received-idr"
+                            />
+                          </div>
+
+                          <div className="rounded-lg p-2.5 border bg-white/80 border-amber-200 text-xs space-y-1">
+                            <div className="flex items-center justify-between font-semibold">
+                              <span className="text-[#5C4A3D]">Kewajiban LE Terlunasi:</span>
+                              <span className="font-bold text-emerald-800 text-sm" data-testid="discharged-le-display">
+                                {dischargedLe} LE
+                              </span>
+                            </div>
+                            {idrVariance !== 0 && (
+                              <div className="flex items-center justify-between text-[11px] pt-1 border-t border-amber-100">
+                                <span className="text-amber-900">Selisih Nominal IDR:</span>
+                                <span className={idrVariance > 0 ? "text-amber-900 font-bold" : "text-blue-900 font-bold"}>
+                                  {idrVariance > 0 ? `+Rp ${idrVariance.toLocaleString("id-ID")}` : `-Rp ${Math.abs(idrVariance).toLocaleString("id-ID")}`}
+                                </span>
+                              </div>
+                            )}
+                            <p className="text-[10px] text-[#8B7355] leading-tight pt-1">
+                              Pelunasan dihitung dari nominal uang nyata yang diterima pada kurs transaksi. Sisa tagihan pesanan akan diperbarui secara akurat dalam LE.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div>
                 <Label className="text-xs font-semibold text-[#5C4A3D]">No. Referensi / Transfer (Opsional)</Label>
