@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useId } from "react";
 import api from "../../lib/api";
-import { formatApiError } from "../../lib/format";
+import { formatApiError, formatMoney, fmtLE, fmtIDR } from "../../lib/format";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
@@ -35,13 +35,7 @@ export const generateUUID = () => {
   });
 };
 
-const money = (v) => {
-  const n = Number(v) || 0;
-  const formatted = n % 1 !== 0
-    ? n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    : Math.round(n).toLocaleString("de-DE");
-  return formatted + " LE";
-};
+const money = (v) => formatMoney(v, "EGP");
 
 export default function AdminWorkerPendingWages() {
   const [activeTab, setActiveTab] = useState("workers"); // "workers" | "obligations" | "settlements"
@@ -641,7 +635,7 @@ export default function AdminWorkerPendingWages() {
                         <div className="font-bold text-emerald-800">{money(s.amount_le)}</div>
                         {(s.payout_currency === "IDR" || (s.payout_amount && s.payout_currency !== "EGP")) && (
                           <div className="text-[10px] text-[#8B7355] font-medium">
-                            Rp {Number(s.payout_amount || 0).toLocaleString("id-ID")}
+                            {fmtIDR(s.payout_amount, { space: true })}
                           </div>
                         )}
                       </td>
@@ -800,11 +794,11 @@ export default function AdminWorkerPendingWages() {
                   <div className="flex justify-between items-center pt-1 border-t border-amber-200/60">
                     <span className="text-[#5C4A3D]">Estimasi Konversi Standar IDR:</span>
                     <span className="font-bold text-base text-[#8B5A2B]" data-testid="estimated-idr-payout">
-                      Rp {standardIdr.toLocaleString("id-ID")}
+                      {fmtIDR(standardIdr, { space: true })}
                     </span>
                   </div>
                   <p className="text-[11px] text-[#8B7355] leading-relaxed">
-                    Kewajiban upah pekerja terutang berkurang sebesar <strong>{amtNum} LE</strong>. Rekening Bank IDR berkurang <strong>Rp {currentActualIdr.toLocaleString("id-ID")}</strong>.
+                    Kewajiban upah pekerja terutang berkurang sebesar <strong>{fmtLE(amtNum)} LE</strong>. Rekening Bank IDR berkurang <strong>{fmtIDR(currentActualIdr, { space: true })}</strong>.
                   </p>
 
                   {/* Custom Actual IDR Payout Control */}
@@ -851,11 +845,11 @@ export default function AdminWorkerPendingWages() {
                             <div className="flex items-center justify-between font-semibold">
                               <span>Selisih Konversi Aktual:</span>
                               <span className={payoutVariance > 0 ? "text-amber-900 font-bold" : "text-blue-900 font-bold"}>
-                                {payoutVariance > 0 ? `+Rp ${payoutVariance.toLocaleString("id-ID")}` : `-Rp ${Math.abs(payoutVariance).toLocaleString("id-ID")}`}
+                                {(payoutVariance > 0 ? "+" : "") + fmtIDR(payoutVariance, { space: true })}
                               </span>
                             </div>
                             <p className="text-[11px] text-amber-900 leading-tight">
-                              <strong>Validasi Kewajiban:</strong> Pengurangan hutang upah pekerja tetap dihitung sebesar <strong>{amtNum} LE</strong>. Selisih pembayaran aktual ini ({payoutVariance > 0 ? "+" : ""}Rp {payoutVariance.toLocaleString("id-ID")}) dicatat dalam audit trail tanpa menghapus sisa saldo LE pekerja secara sepihak.
+                              <strong>Validasi Kewajiban:</strong> Pengurangan hutang upah pekerja tetap dihitung sebesar <strong>{fmtLE(amtNum)} LE</strong>. Selisih pembayaran aktual ini ({(payoutVariance > 0 ? "+" : "") + fmtIDR(payoutVariance, { space: true })}) dicatat dalam audit trail tanpa menghapus sisa saldo LE pekerja secara sepihak.
                             </p>
                           </div>
                         )}
@@ -1102,7 +1096,7 @@ export default function AdminWorkerPendingWages() {
                   <div>
                     <span className="text-[#8B7355]">Nominal Pencairan IDR:</span>
                     <p className="font-bold text-[#8B5A2B] text-sm" data-testid="detail-payout-idr">
-                      Rp {Number(selectedSettlement.payout_amount || 0).toLocaleString("id-ID")}
+                      {fmtIDR(selectedSettlement.payout_amount, { space: true })}
                     </p>
                   </div>
                   <div>
@@ -1128,7 +1122,7 @@ export default function AdminWorkerPendingWages() {
                     <div className="col-span-2" data-testid="detail-variance-notice">
                       <span className="text-[#8B7355]">Selisih Pencairan Aktual:</span>
                       <p className="text-[#2C1E16] bg-blue-50/70 p-1.5 rounded border border-blue-200 text-[11px]">
-                        {Number(selectedSettlement.variance_idr) > 0 ? "+" : ""}Rp {Number(selectedSettlement.variance_idr).toLocaleString("id-ID")} dari konversi standar Rp {Number(selectedSettlement.standard_payout_amount || 0).toLocaleString("id-ID")}. Pengurangan kewajiban LE tetap murni sebesar {selectedSettlement.amount_le} LE.
+                        {(Number(selectedSettlement.variance_idr || 0) > 0 ? "+" : "") + fmtIDR(selectedSettlement.variance_idr, { space: true })} dari konversi standar {fmtIDR(selectedSettlement.standard_payout_amount, { space: true })}. Pengurangan kewajiban LE tetap murni sebesar {fmtLE(selectedSettlement.amount_le)} LE.
                       </p>
                     </div>
                   )}

@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo } from "react";
 import api from "../../lib/api";
-import { formatApiError } from "../../lib/format";
+import { formatApiError, fmtLE } from "../../lib/format";
 import { useAuth } from "../../context/AuthContext";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
@@ -421,7 +421,7 @@ export default function AdminDeliveryWageSettings() {
               {simAllocations.map((a) => (
                 <tr key={a.index} className="hover:bg-[#FAF8F5]/60">
                   <td className="py-2.5 px-3 font-medium text-[#2C1E16]">Helper {a.index}</td>
-                  <td className="py-2.5 px-3 font-mono font-bold text-[#8B5A2B]">{a.amount_le} EGP</td>
+                  <td className="py-2.5 px-3 font-mono font-bold text-[#8B5A2B]">{fmtLE(a.amount_le)} EGP</td>
                   <td className="py-2.5 px-3 text-[#5C4A3D] font-mono">{a.piastres} piastre</td>
                   <td className="py-2.5 px-3 text-[#8B7355]">{a.pct}%</td>
                 </tr>
@@ -431,7 +431,7 @@ export default function AdminDeliveryWageSettings() {
               <tr>
                 <td className="py-2.5 px-3 text-[#2C1E16]">Total Alokasi Terdistribusi</td>
                 <td className="py-2.5 px-3 font-mono text-[#8B5A2B]">
-                  {(Number(simAmount) || 0).toFixed(2)} EGP
+                  {fmtLE(simAmount)} EGP
                 </td>
                 <td className="py-2.5 px-3 font-mono text-[#5C4A3D]">
                   {Math.round((Number(simAmount) || 0) * 100)} piastre

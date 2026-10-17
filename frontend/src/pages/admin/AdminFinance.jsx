@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import api from "../../lib/api";
-import { formatApiError } from "../../lib/format";
+import { formatApiError, formatMoney } from "../../lib/format";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
@@ -12,16 +12,7 @@ import { Trash2, ArrowRightLeft, TrendingUp, TrendingDown, Pencil, X, ChevronRig
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { toast } from "sonner";
 
-const money = (v, cur) => {
-  const n = Number(v) || 0;
-  if (cur === "IDR") {
-    return "Rp " + Math.round(n).toLocaleString("de-DE");
-  }
-  const formatted = n % 1 !== 0
-    ? n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    : Math.round(n).toLocaleString("de-DE");
-  return formatted + (cur === "EGP" ? " LE" : "");
-};
+const money = (v, cur) => formatMoney(v, cur, { space: true });
 const PERIODS = [["this_month", "Bulan Ini"], ["last_month", "Bulan Lalu"], ["this_year", "Tahun Ini"], ["last_year", "Tahun Lalu"], ["custom", "Kustom"]];
 
 export default function AdminFinance() {

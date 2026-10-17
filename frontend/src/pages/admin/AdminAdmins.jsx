@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../../lib/api";
-import { formatApiError } from "../../lib/format";
+import { formatApiError, fmtLE } from "../../lib/format";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Switch } from "../../components/ui/switch";
@@ -296,7 +296,7 @@ export default function AdminAdmins() {
                   Total Upah Diterima:{" "}
                   {wageMap[a.id] && Object.entries(wageMap[a.id].totals || {}).length > 0
                     ? Object.entries(wageMap[a.id].totals)
-                        .map(([c, v]) => `${Math.round(v).toLocaleString("de-DE")} ${c}`)
+                        .map(([c, v]) => `${fmtLE(v)} ${c}`)
                         .join(" · ")
                     : "0 LE"}{" "}
                   ({wageMap[a.id]?.count || 0}x)

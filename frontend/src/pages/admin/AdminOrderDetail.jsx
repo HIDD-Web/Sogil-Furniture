@@ -1188,7 +1188,7 @@ export default function AdminOrderDetail() {
                     <div className="flex justify-between items-center pt-1 border-t border-amber-200/60">
                       <span className="text-[#5C4A3D]">Estimasi Penerimaan Standar IDR:</span>
                       <span className="font-bold text-base text-[#8B5A2B]" data-testid="payment-expected-idr">
-                        Rp {standardIdr.toLocaleString("id-ID")}
+                        {fmtIDR(standardIdr, { space: true })}
                       </span>
                     </div>
 
@@ -1231,14 +1231,14 @@ export default function AdminOrderDetail() {
                             <div className="flex items-center justify-between font-semibold">
                               <span className="text-[#5C4A3D]">Kewajiban LE Terlunasi:</span>
                               <span className="font-bold text-emerald-800 text-sm" data-testid="discharged-le-display">
-                                {dischargedLe} LE
+                                {fmtLE(dischargedLe)} LE
                               </span>
                             </div>
                             {idrVariance !== 0 && (
                               <div className="flex items-center justify-between text-[11px] pt-1 border-t border-amber-100">
                                 <span className="text-amber-900">Selisih Nominal IDR:</span>
                                 <span className={idrVariance > 0 ? "text-amber-900 font-bold" : "text-blue-900 font-bold"}>
-                                  {idrVariance > 0 ? `+Rp ${idrVariance.toLocaleString("id-ID")}` : `-Rp ${Math.abs(idrVariance).toLocaleString("id-ID")}`}
+                                  {(idrVariance > 0 ? "+" : "") + fmtIDR(idrVariance, { space: true })}
                                 </span>
                               </div>
                             )}

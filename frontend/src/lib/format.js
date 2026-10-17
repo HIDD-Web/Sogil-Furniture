@@ -1,11 +1,41 @@
 export const fmtLE = (v) => {
-  const n = Math.round(Number(v) || 0);
-  return n.toLocaleString("de-DE");
+  if (v == null || v === "") return "-";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+  return n.toLocaleString("de-DE", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 4,
+  });
 };
 
-export const fmtIDR = (v) => {
-  const n = Math.round(Number(v) || 0);
-  return "Rp" + n.toLocaleString("de-DE");
+export const fmtIDR = (v, options = {}) => {
+  if (v == null || v === "") return "-";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+  const prefix = options.prefix != null ? options.prefix : (options.space ? "Rp " : "Rp");
+  const rounded = Math.round(n);
+  const sign = rounded < 0 ? "-" : "";
+  return `${sign}${prefix}${Math.abs(rounded).toLocaleString("de-DE")}`;
+};
+
+export const formatMoney = (v, cur = "EGP", options = {}) => {
+  if (v == null || v === "") return "-";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+
+  const upperCur = cur != null ? String(cur).trim().toUpperCase() : "";
+  if (upperCur === "IDR") {
+    return fmtIDR(n, options);
+  }
+
+  const numStr = n.toLocaleString("de-DE", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 4,
+  });
+  const suffix = options.suffix != null
+    ? options.suffix
+    : (upperCur === "EGP" || upperCur === "LE" ? " LE" : (upperCur && upperCur !== "CUSTOMER_CREDIT" ? ` ${upperCur}` : ""));
+  return `${numStr}${suffix}`;
 };
 
 export const formatApiError = (detail) => {

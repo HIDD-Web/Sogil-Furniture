@@ -1,21 +1,13 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import api from "../../lib/api";
+import { formatMoney } from "../../lib/format";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
 import { Input } from "../../components/ui/input";
 import { Button } from "../../components/ui/button";
 import { X, ChevronRight, ChevronLeft, Wallet, CircleDollarSign, Coins } from "lucide-react";
 
-const money = (v, cur) => {
-  const n = Number(v) || 0;
-  if (cur === "IDR") {
-    return "Rp" + Math.round(n).toLocaleString("de-DE");
-  }
-  const formatted = n % 1 !== 0
-    ? n.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-    : Math.round(n).toLocaleString("de-DE");
-  return formatted + (cur === "EGP" ? " LE" : "");
-};
+const money = (v, cur) => formatMoney(v, cur);
 
 const formatDrilldownAmount = (t) => {
   const primCur = t.primary_currency || t.currency || "EGP";
