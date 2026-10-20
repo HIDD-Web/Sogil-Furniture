@@ -18,6 +18,7 @@ from enum import Enum
 import secrets
 import inspect
 import json
+import hashlib
 import re
 import urllib.parse
 import jwt
@@ -33,6 +34,15 @@ import pymongo
 from pymongo import ReturnDocument
 
 import certifi
+
+try:
+    from backend.outbox_worker import get_outbox_metrics, replay_dead_letter_event
+except ImportError:
+    try:
+        from outbox_worker import get_outbox_metrics, replay_dead_letter_event
+    except ImportError:
+        get_outbox_metrics = None
+        replay_dead_letter_event = None
 
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url, tlsCAFile=certifi.where())
@@ -870,6 +880,8 @@ class WorkAssignmentCreateInput(BaseModel):
     wage_rule_id: Optional[str] = None
     rate_override_reason: Optional[str] = None
     task_notes: Optional[str] = ""
+    instance_ids: Optional[List[str]] = None
+    assignment_group_id: Optional[str] = None
 
 class WorkAssignmentProgressInput(BaseModel):
     status: str  # "in_progress" | "ready_for_review"
@@ -907,6 +919,70 @@ class WageSettlementCreateInput(BaseModel):
 
 class WageSettlementVoidInput(BaseModel):
     reason: str
+
+class AssignmentGroupFissionInput(BaseModel):
+    target_instance_id: str
+    child_worker_id: str
+    child_group_id: Optional[str] = None
+    notes: Optional[str] = ""
+
+class AssignmentGroupRecoverInput(BaseModel):
+    expected_generation: int
+    action: str = "repair_forward"  # "repair_forward" | "rollback"
+    notes: Optional[str] = ""
+
+class OutboxEventDispatchInput(BaseModel):
+    deduplication_token: Optional[str] = None
+
+class OutboxEventReplayInput(BaseModel):
+    reason: Optional[str] = "Manual administrative replay"
+
+def compute_payload_hash(payload: Any) -> str:
+    """Computes deterministic SHA-256 hash of normalized payload."""
+    if hasattr(payload, "model_dump"):
+        payload_dict = payload.model_dump()
+    elif hasattr(payload, "dict"):
+        payload_dict = payload.dict()
+    elif isinstance(payload, dict):
+        payload_dict = payload
+    else:
+        payload_dict = dict(payload)
+    canonical = json.dumps(payload_dict, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+async def create_outbox_event(
+    event_type: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    payload: dict,
+    session: Optional[Any] = None
+) -> dict:
+    """Atomically records a transactional outbox event inside the provided ACID session."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    p_hash = compute_payload_hash(payload)
+    outbox_doc = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": event_type,
+        "aggregate_type": aggregate_type,
+        "aggregate_id": aggregate_id,
+        "payload": payload,
+        "payload_hash": p_hash,
+        "status": "pending",
+        "retry_count": 0,
+        "created_at": now_iso,
+        "dispatched_at": None,
+        "last_error": None,
+    }
+    ins_kw = {"session": session} if session else {}
+    try:
+        res = db.outbox_events.insert_one(outbox_doc, **ins_kw)
+        if inspect.isawaitable(res):
+            await res
+    except Exception as e:
+        logger.warning(f"Outbox event insertion warning: {e}")
+        if session:
+            raise
+    return outbox_doc
 
 async def record_audit_log(
     action: str,
@@ -3592,13 +3668,55 @@ async def admin_create_work_assignment(
         "task_notes": (payload.task_notes or "").strip(),
         "assigned_by_id": admin.get("id"),
         "assigned_by_name": admin.get("name", "Admin"),
+        "instance_ids": payload.instance_ids or [],
+        "assignment_group_id": payload.assignment_group_id or None,
         "created_at": now,
         "updated_at": now,
     }
 
+    async def _do_create(sess):
+        ins_kw = {"session": sess} if sess else {}
+        if payload.instance_ids:
+            res_itm = db.item_instances.update_many(
+                {"instance_id": {"$in": payload.instance_ids}},
+                {"$set": {"status": "assigned", "assigned_worker_id": payload.worker_id, "updated_at": now}, "$inc": {"claim_generation": 1}},
+                **ins_kw
+            )
+            if inspect.isawaitable(res_itm):
+                await res_itm
+        res = db.work_assignments.insert_one(doc, **ins_kw)
+        if inspect.isawaitable(res):
+            res = await res
+        doc["_id"] = str(getattr(res, "inserted_id", res))
+        await create_outbox_event(
+            event_type="assignment.created",
+            aggregate_type="work_assignment",
+            aggregate_id=doc["_id"],
+            payload={
+                "assignment_id": doc["_id"],
+                "worker_id": payload.worker_id,
+                "order_id": order_id_str,
+                "order_item_id": payload.order_item_id,
+                "target_quantity": payload.target_quantity,
+                "agreed_rate_le": rate_flt,
+                "instance_ids": payload.instance_ids or [],
+            },
+            session=sess
+        )
+
+    session = None
     try:
-        res = await db.work_assignments.insert_one(doc)
-        doc["_id"] = str(res.inserted_id)
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError):
+            session = None
+
+        if session is not None:
+            async with session:
+                async with session.start_transaction():
+                    await _do_create(session)
+        else:
+            await _do_create(None)
         return clean(doc)
     except pymongo.errors.DuplicateKeyError:
         raise HTTPException(status_code=409, detail="Penugasan serupa sudah terdaftar")
@@ -3678,15 +3796,24 @@ async def admin_verify_work_assignment(
     aid_str = str(assignment.get("_id") or assignment.get("id"))
     accrual_event_key = f"acc_{aid_str}"
 
+    current_payload_dict = {
+        "accepted_quantity": payload.accepted_quantity,
+        "notes": (payload.notes or "").strip(),
+    }
+    current_payload_hash = compute_payload_hash(current_payload_dict)
+
     # Check if already completed and obligation exists (Idempotent replay)
     existing_wob = await db.wage_obligations.find_one({"accrual_event_key": accrual_event_key})
-    if assignment.get("status") == "completed" and existing_wob:
+    if existing_wob:
         # Validate linkage
         if existing_wob.get("work_assignment_id") != aid_str:
             raise HTTPException(status_code=500, detail="Data collision on accrual_event_key")
-        clean_wob = clean(existing_wob)
-        clean_wob["assignment"] = clean(assignment)
-        return clean_wob
+        if existing_wob.get("payload_hash") and existing_wob.get("payload_hash") != current_payload_hash:
+            raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) pada kunci idempotensi yang sama")
+        if assignment.get("status") == "completed":
+            clean_wob = clean(existing_wob)
+            clean_wob["assignment"] = clean(assignment)
+            return clean_wob
 
     if assignment.get("status") != "ready_for_review":
         raise HTTPException(
@@ -3751,6 +3878,7 @@ async def admin_verify_work_assignment(
         "verified_by_id": admin_id,
         "verified_by_name": admin.get("name", "Admin"),
         "verification_notes": (payload.notes or "").strip(),
+        "payload_hash": current_payload_hash,
         "created_at": now,
         "updated_at": now,
     }
@@ -3788,11 +3916,27 @@ async def admin_verify_work_assignment(
         res_wob = await db.wage_obligations.insert_one(obligation_doc, **ins_kw)
         obligation_doc["_id"] = str(res_wob.inserted_id)
 
+        # 3. Create Outbox Event
+        await create_outbox_event(
+            event_type="assignment.verified",
+            aggregate_type="work_assignment",
+            aggregate_id=aid_str,
+            payload={
+                "assignment_id": aid_str,
+                "obligation_number": wob_num,
+                "worker_id": worker_id,
+                "total_amount_le": oblig_amount_le,
+                "accepted_quantity": accepted_qty,
+                "payload_hash": current_payload_hash,
+            },
+            session=session
+        )
+
     session = None
     try:
         try:
             session = await client.start_session()
-        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
             if not is_standalone_fallback_permitted():
                 logger.error(f"Transaction capability unavailable in mode {get_environment_mode()!r}: {sess_err}")
                 raise HTTPException(
@@ -3821,6 +3965,20 @@ async def admin_verify_work_assignment(
                     {"_id": assignment["_id"], "status": "accruing"},
                     {"$set": assignment_update}
                 )
+                await create_outbox_event(
+                    event_type="assignment.verified",
+                    aggregate_type="work_assignment",
+                    aggregate_id=aid_str,
+                    payload={
+                        "assignment_id": aid_str,
+                        "obligation_number": wob_num,
+                        "worker_id": worker_id,
+                        "total_amount_le": oblig_amount_le,
+                        "accepted_quantity": accepted_qty,
+                        "payload_hash": current_payload_hash,
+                    },
+                    session=None
+                )
             except Exception as e:
                 # Compensating rollback
                 await db.work_assignments.update_one(
@@ -3829,10 +3987,22 @@ async def admin_verify_work_assignment(
                 )
                 await db.wage_obligations.delete_one({"accrual_event_key": accrual_event_key})
                 raise HTTPException(status_code=500, detail=f"Gagal memproses akrual kewajiban upah: {e}")
+    except (pymongo.errors.ConnectionFailure, pymongo.errors.ExecutionTimeout) as net_err:
+        reconciled = await db.wage_obligations.find_one({"accrual_event_key": accrual_event_key})
+        if reconciled:
+            if reconciled.get("payload_hash") and reconciled.get("payload_hash") != current_payload_hash:
+                raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) terdeteksi saat rekonsiliasi transaksi")
+            fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
+            clean_rec = clean(reconciled)
+            clean_rec["assignment"] = clean(fresh_assign)
+            return clean_rec
+        raise HTTPException(status_code=503, detail=f"Koneksi terputus saat commit transaksi: {net_err}")
     except pymongo.errors.DuplicateKeyError:
         # Re-fetch existing canonical obligation
         canonical_wob = await db.wage_obligations.find_one({"accrual_event_key": accrual_event_key})
         if canonical_wob:
+            if canonical_wob.get("payload_hash") and canonical_wob.get("payload_hash") != current_payload_hash:
+                raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) pada kunci idempotensi yang sama")
             clean_cwob = clean(canonical_wob)
             fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
             clean_cwob["assignment"] = clean(fresh_assign)
@@ -3925,11 +4095,23 @@ async def admin_cancel_work_assignment(
             }},
             **ins_kw
         )
+        await create_outbox_event(
+            event_type="assignment.cancelled",
+            aggregate_type="work_assignment",
+            aggregate_id=aid_str,
+            payload={
+                "assignment_id": aid_str,
+                "order_number": assignment.get("order_number"),
+                "task_category": assignment.get("task_category"),
+                "cancellation_reason": reason,
+            },
+            session=session
+        )
 
     session = None
     try:
         session = await client.start_session()
-    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
         if not is_standalone_fallback_permitted():
             logger.error(f"Transaction capability unavailable for cancellation in mode {get_environment_mode()!r}: {sess_err}")
             raise HTTPException(
@@ -3948,6 +4130,351 @@ async def admin_cancel_work_assignment(
 
     updated = await db.work_assignments.find_one({"_id": assignment["_id"]})
     return clean(updated)
+
+# --------------------------------------------------------------------------
+# Admin: Assignment Groups (Work Package B) & Transactional Outbox (Work Package C)
+# --------------------------------------------------------------------------
+
+@api_router.post("/admin/assignment-groups/{group_id}/fission")
+async def admin_fission_assignment_group(
+    group_id: str,
+    payload: AssignmentGroupFissionInput,
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    group = await db.assignment_groups.find_one({"_id": id_query(group_id)})
+    if not group:
+        raise HTTPException(status_code=404, detail="Grup penugasan tidak ditemukan")
+
+    if group.get("status") == "quarantined":
+        raise HTTPException(status_code=409, detail="Grup penugasan sedang dalam karantina (quarantined)")
+
+    target_instance_ids = group.get("target_instance_ids") or []
+    # Corruption checks (TX-14): duplicate instance IDs or count mismatch
+    if len(set(target_instance_ids)) != len(target_instance_ids) or group.get("instance_count") != len(target_instance_ids):
+        quarantine_reason = "Inkonsistensi data array target_instance_ids atau instance_count mismatch"
+        await db.assignment_groups.update_one(
+            {"_id": group["_id"]},
+            {"$set": {"status": "quarantined", "quarantine_reason": quarantine_reason, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        raise HTTPException(status_code=422, detail="Inkonsistensi data terdeteksi pada grup penugasan. Grup telah dikarantina.")
+
+    if payload.target_instance_id not in target_instance_ids:
+        raise HTTPException(status_code=404, detail="Instance ID tidak ditemukan dalam grup penugasan ini")
+
+    now = datetime.now(timezone.utc).isoformat()
+    new_ids = [x for x in target_instance_ids if x != payload.target_instance_id]
+    new_count = len(new_ids)
+
+    child_gid = payload.child_group_id or str(uuid.uuid4())[:12]
+    child_group_doc = {
+        "group_number": f"GRP-{child_gid}",
+        "parent_group_id": str(group.get("_id") or group_id),
+        "worker_id": payload.child_worker_id,
+        "target_instance_ids": [payload.target_instance_id],
+        "instance_count": 1,
+        "recovery_generation": 1,
+        "recovery_lock": None,
+        "status": "active",
+        "notes": (payload.notes or "").strip(),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    async def _do_fission(session):
+        ins_kw = {"session": session} if session else {}
+        res = await db.assignment_groups.update_one(
+            {"_id": group["_id"], "target_instance_ids": target_instance_ids},
+            {"$set": {
+                "target_instance_ids": new_ids,
+                "instance_count": new_count,
+                "updated_at": now,
+            }},
+            **ins_kw
+        )
+        if res.modified_count == 0:
+            raise HTTPException(status_code=409, detail="Konflik konkurensi saat pemisahan grup penugasan")
+
+        await db.assignment_groups.insert_one(child_group_doc, **ins_kw)
+        await db.item_instances.update_one(
+            {"instance_id": payload.target_instance_id},
+            {"$set": {
+                "assignment_group_id": child_gid,
+                "assigned_worker_id": payload.child_worker_id,
+                "updated_at": now,
+            }, "$inc": {"claim_generation": 1}},
+            **ins_kw
+        )
+        await create_outbox_event(
+            event_type="assignment_group.fissioned",
+            aggregate_type="assignment_group",
+            aggregate_id=str(group.get("_id") or group_id),
+            payload={
+                "parent_group_id": str(group.get("_id") or group_id),
+                "child_group_id": child_gid,
+                "target_instance_id": payload.target_instance_id,
+                "child_worker_id": payload.child_worker_id,
+                "new_parent_count": new_count,
+            },
+            session=session
+        )
+
+    session = None
+    try:
+        session = await client.start_session()
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError):
+        session = None
+
+    if session is not None:
+        async with session:
+            async with session.start_transaction():
+                await _do_fission(session)
+    else:
+        await _do_fission(None)
+
+    parent_fresh = await db.assignment_groups.find_one({"_id": group["_id"]})
+    return {
+        "parent_group": clean(parent_fresh),
+        "child_group": clean(child_group_doc),
+    }
+
+@api_router.post("/admin/assignment-groups/{group_id}/recover")
+async def admin_recover_assignment_group(
+    group_id: str,
+    payload: AssignmentGroupRecoverInput,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    group = await db.assignment_groups.find_one({"_id": id_query(group_id)})
+    if not group:
+        raise HTTPException(status_code=404, detail="Grup penugasan tidak ditemukan")
+
+    curr_gen = group.get("recovery_generation", 1)
+    if curr_gen != payload.expected_generation:
+        raise HTTPException(status_code=409, detail=f"Konflik recovery_generation: diharapkan {payload.expected_generation}, ditemukan {curr_gen}")
+
+    gid_str = str(group.get("_id") or group_id)
+    # Check linked wage obligations (TX-08, TX-09)
+    linked_obs = await db.wage_obligations.find({
+        "$or": [
+            {"assignment_group_id": gid_str},
+            {"work_assignment_id": {"$in": group.get("assignment_ids", [])}},
+        ]
+    }).to_list(500)
+
+    for ob in linked_obs:
+        if ob.get("status") == "voided":
+            # TX-09: Fail closed to quarantine
+            quarantine_reason = f"Encountered voided obligation {ob.get('obligation_number')} without explicit directive"
+            await db.assignment_groups.update_one(
+                {"_id": group["_id"]},
+                {"$set": {"status": "quarantined", "quarantine_reason": quarantine_reason, "updated_at": datetime.now(timezone.utc).isoformat()}}
+            )
+            raise HTTPException(status_code=422, detail="Kewajiban upah dalam status 'voided' terdeteksi. Grup dialihkan ke karantina untuk review manual.")
+        if payload.action == "rollback" and (ob.get("status") == "paid" or _num(ob.get("paid_amount_le")) > 0):
+            # TX-08: Paid obligations cannot be rolled back
+            raise HTTPException(status_code=400, detail="Kewajiban upah sudah terbayar tidak dapat dibatalkan atau di-rollback (Immutability violation)")
+
+    target_instance_ids = group.get("target_instance_ids") or []
+    if len(set(target_instance_ids)) != len(target_instance_ids):
+        # TX-14: Duplicate instance IDs detected
+        quarantine_reason = "Duplicate instance IDs detected in assignment group"
+        await db.assignment_groups.update_one(
+            {"_id": group["_id"]},
+            {"$set": {"status": "quarantined", "quarantine_reason": quarantine_reason, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        raise HTTPException(status_code=422, detail="Duplikasi ID instance terdeteksi. Grup dikarantina.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    next_gen = curr_gen + 1
+
+    async def _do_recover(session):
+        ins_kw = {"session": session} if session else {}
+        if payload.action == "repair_forward":
+            # TX-14: Sync instance_count from len(target_instance_ids)
+            await db.assignment_groups.update_one(
+                {"_id": group["_id"], "recovery_generation": curr_gen},
+                {"$set": {
+                    "instance_count": len(target_instance_ids),
+                    "recovery_generation": next_gen,
+                    "recovery_lock": None,
+                    "status": "active",
+                    "updated_at": now,
+                }},
+                **ins_kw
+            )
+            await create_outbox_event(
+                event_type="assignment_group.repaired_forward",
+                aggregate_type="assignment_group",
+                aggregate_id=gid_str,
+                payload={"group_id": gid_str, "generation": next_gen, "count": len(target_instance_ids)},
+                session=session
+            )
+        elif payload.action == "rollback":
+            # TX-06: In-place tombstone transition for staged/accruing obligations
+            for ob in linked_obs:
+                if ob.get("status") in ("accruing", "staged"):
+                    await db.wage_obligations.update_one(
+                        {"_id": ob["_id"]},
+                        {"$set": {
+                            "status": "tombstone_aborted",
+                            "total_amount_le": 0.0,
+                            "updated_at": now,
+                        }},
+                        **ins_kw
+                    )
+            await db.assignment_groups.update_one(
+                {"_id": group["_id"], "recovery_generation": curr_gen},
+                {"$set": {
+                    "status": "rolled_back",
+                    "recovery_generation": next_gen,
+                    "recovery_lock": None,
+                    "updated_at": now,
+                }},
+                **ins_kw
+            )
+            await create_outbox_event(
+                event_type="assignment_group.rolled_back",
+                aggregate_type="assignment_group",
+                aggregate_id=gid_str,
+                payload={"group_id": gid_str, "generation": next_gen},
+                session=session
+            )
+
+    session = None
+    try:
+        session = await client.start_session()
+    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError):
+        session = None
+
+    if session is not None:
+        async with session:
+            async with session.start_transaction():
+                await _do_recover(session)
+    else:
+        await _do_recover(None)
+
+    fresh = await db.assignment_groups.find_one({"_id": group["_id"]})
+    return clean(fresh)
+
+@api_router.post("/admin/assignment-groups/{group_id}/quarantine")
+async def admin_quarantine_assignment_group(
+    group_id: str,
+    payload: Dict[str, Any],
+    admin: dict = Depends(require_perm("manage_orders"))
+):
+    group = await db.assignment_groups.find_one({"_id": id_query(group_id)})
+    if not group:
+        raise HTTPException(status_code=404, detail="Grup penugasan tidak ditemukan")
+
+    reason = str(payload.get("reason", "Manual administrative quarantine")).strip()
+    now = datetime.now(timezone.utc).isoformat()
+    await db.assignment_groups.update_one(
+        {"_id": group["_id"]},
+        {"$set": {
+            "status": "quarantined",
+            "quarantine_reason": reason,
+            "quarantined_by_id": admin.get("id"),
+            "quarantined_at": now,
+            "updated_at": now,
+        }}
+    )
+    fresh = await db.assignment_groups.find_one({"_id": group["_id"]})
+    return clean(fresh)
+
+@api_router.get("/admin/assignment-groups/{group_id}")
+async def admin_get_assignment_group(
+    group_id: str,
+    admin: dict = Depends(get_current_admin)
+):
+    group = await db.assignment_groups.find_one({"_id": id_query(group_id)})
+    if not group:
+        raise HTTPException(status_code=404, detail="Grup penugasan tidak ditemukan")
+    return clean(group)
+
+@api_router.get("/admin/outbox/pending")
+async def admin_get_pending_outbox_events(
+    limit: int = 100,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    docs = await db.outbox_events.find({"status": "pending"}).sort("created_at", 1).limit(limit).to_list(limit)
+    return [clean(d) for d in docs]
+
+@api_router.post("/admin/outbox/{event_id}/dispatch")
+async def admin_dispatch_outbox_event(
+    event_id: str,
+    payload: OutboxEventDispatchInput,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    doc = await db.outbox_events.find_one({"event_id": event_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Outbox event tidak ditemukan")
+
+    if doc.get("status") == "dispatched":
+        # Deduplication (TX-16): cleanly deduplicate without error
+        return {"status": "already_dispatched", "event": clean(doc)}
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.outbox_events.update_one(
+        {"event_id": event_id},
+        {"$set": {
+            "status": "dispatched",
+            "dispatched_at": now,
+            "deduplication_token": payload.deduplication_token,
+            "updated_at": now,
+        }}
+    )
+    updated = await db.outbox_events.find_one({"event_id": event_id})
+    return {"status": "dispatched", "event": clean(updated)}
+
+@api_router.get("/admin/outbox/metrics")
+async def admin_get_outbox_metrics_endpoint(
+    admin: dict = Depends(require_finance_or_owner())
+):
+    role = admin.get("role")
+    perms = admin.get("permissions") or {}
+    if role != "owner" and not perms.get("access_finance"):
+        raise HTTPException(status_code=403, detail="Akses ditolak: Membutuhkan akses keuangan atau owner")
+    if not get_outbox_metrics:
+        raise HTTPException(status_code=501, detail="Outbox worker module tidak tersedia")
+    try:
+        metrics = await get_outbox_metrics(db)
+        return metrics
+    except Exception as e:
+        logger.error(f"Error fetching outbox metrics: {e}")
+        raise HTTPException(status_code=500, detail="Gagal mengambil metrik outbox")
+
+@api_router.post("/admin/outbox/{event_id}/replay")
+async def admin_replay_outbox_event_endpoint(
+    event_id: str,
+    payload: OutboxEventReplayInput,
+    admin: dict = Depends(require_finance_or_owner())
+):
+    role = admin.get("role")
+    perms = admin.get("permissions") or {}
+    if role != "owner" and not perms.get("access_finance"):
+        raise HTTPException(status_code=403, detail="Akses ditolak: Membutuhkan akses keuangan atau owner")
+    if not replay_dead_letter_event:
+        raise HTTPException(status_code=501, detail="Outbox worker module tidak tersedia")
+    admin_id = str(admin.get("id") or admin.get("_id") or "")
+    admin_name = str(admin.get("name") or "Admin")
+    res = await replay_dead_letter_event(
+        db=db,
+        event_id=event_id,
+        admin_id=admin_id,
+        admin_name=admin_name,
+        reason=payload.reason or ""
+    )
+    if not res.get("success"):
+        raise HTTPException(status_code=res.get("status_code", 400), detail=res.get("detail", "Gagal me-replay outbox event"))
+
+    await record_audit_log(
+        action="outbox_event_replay",
+        entity_type="outbox_event",
+        entity_id=event_id,
+        entity_identifier=event_id,
+        admin=admin,
+        metadata={"reason": payload.reason, "replayed_at": res["event"].get("replayed_at")}
+    )
+    return {"status": "replayed", "event": clean(res["event"])}
 
 @api_router.get("/admin/workers/{worker_id}/pending-wages")
 async def admin_get_worker_pending_wages(
@@ -4124,20 +4651,28 @@ async def admin_create_wage_settlement(
     if payment_method not in ("cash", "bank_transfer", "other"):
         payment_method = "cash"
 
+    input_payload_hash = compute_payload_hash(payload)
     idem_key = (payload.idempotency_key or "").strip() or None
     if idem_key:
         winning = await db.wage_settlements.find_one({"idempotency_key": idem_key})
         if winning:
-            if (
-                str(winning.get("worker_id")) != worker_id or
-                round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or
-                winning.get("payment_method") != payment_method or
-                (winning.get("payout_currency") or "EGP") != payment_currency
-            ):
+            winning_hash = winning.get("payload_hash")
+            if winning_hash and winning_hash != input_payload_hash:
                 raise HTTPException(
                     status_code=409,
                     detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
                 )
+            if not winning_hash:
+                if (
+                    str(winning.get("worker_id")) != worker_id or
+                    round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or
+                    winning.get("payment_method") != payment_method or
+                    (winning.get("payout_currency") or "EGP") != payment_currency
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
+                    )
             return clean(winning)
 
     # Fetch eligible pending obligations for this worker
@@ -4392,6 +4927,7 @@ async def admin_create_wage_settlement(
         "finance_transaction_id": None,
         "status": "recorded",
         "idempotency_key": idem_key,
+        "payload_hash": input_payload_hash,
         "created_by_id": admin.get("id"),
         "created_by_name": admin.get("name", "Admin"),
         "created_at": now_iso,
@@ -4497,6 +5033,24 @@ async def admin_create_wage_settlement(
                 session=session
             )
 
+        # 7. Create transactional outbox event
+        await create_outbox_event(
+            event_type="wage.settled",
+            aggregate_type="wage_settlement",
+            aggregate_id=settlement_id,
+            payload={
+                "settlement_id": settlement_id,
+                "settlement_number": settlement_num,
+                "worker_id": worker_id,
+                "amount_le": disbursed_amount,
+                "payout_amount": actual_payout_amount,
+                "payout_currency": payment_currency,
+                "finance_transaction_id": txn_id,
+                "payload_hash": input_payload_hash,
+            },
+            session=session
+        )
+
         return settlement_id
 
     created_id = None
@@ -4504,7 +5058,7 @@ async def admin_create_wage_settlement(
     try:
         try:
             session = await client.start_session()
-        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
             if not is_standalone_fallback_permitted():
                 logger.error(f"Transaction capability unavailable for wage settlement in mode {get_environment_mode()!r}: {sess_err}")
                 raise HTTPException(
@@ -4559,17 +5113,24 @@ async def admin_create_wage_settlement(
         if idem_key and ("uniq_wage_settlements_idempotency" in err_msg or idem_key in err_msg):
             winning = await db.wage_settlements.find_one({"idempotency_key": idem_key})
             if winning:
-                if (
-                    str(winning.get("worker_id")) != worker_id or
-                    round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or
-                    winning.get("payment_method") != payment_method or
-                    (winning.get("payout_currency") or "EGP") != payment_currency or
-                    round(float(winning.get("payout_amount", 0))) != round(float(actual_payout_amount))
-                ):
+                winning_hash = winning.get("payload_hash")
+                if winning_hash and winning_hash != input_payload_hash:
                     raise HTTPException(
                         status_code=409,
                         detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
                     )
+                if not winning_hash:
+                    if (
+                        str(winning.get("worker_id")) != worker_id or
+                        round(float(winning.get("amount_le", 0)), 2) != disbursed_amount or
+                        winning.get("payment_method") != payment_method or
+                        (winning.get("payout_currency") or "EGP") != payment_currency or
+                        round(float(winning.get("payout_amount", 0))) != round(float(actual_payout_amount))
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Kunci idempotensi telah digunakan untuk pembayaran upah dengan parameter berbeda."
+                        )
                 return clean(winning)
         raise HTTPException(status_code=409, detail=f"Konflik data terdeteksi: {dke}")
     except HTTPException:
@@ -4719,11 +5280,26 @@ async def admin_void_wage_settlement(
             # 4. Remove from employee_wages mirror
             await db.employee_wages.delete_many({"transaction_id": txn_id}, **ins_kw)
 
+        # 5. Outbox event
+        await create_outbox_event(
+            event_type="wage_settlement.voided",
+            aggregate_type="wage_settlement",
+            aggregate_id=sid_str,
+            payload={
+                "settlement_id": sid_str,
+                "settlement_number": st.get("settlement_number"),
+                "worker_id": st.get("worker_id"),
+                "amount_le": st.get("amount_le"),
+                "void_reason": reason,
+            },
+            session=session
+        )
+
     session = None
     try:
         try:
             session = await client.start_session()
-        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError) as sess_err:
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
             if not is_standalone_fallback_permitted():
                 raise HTTPException(
                     status_code=503,
@@ -9592,60 +10168,100 @@ RAK_TYPE_B_PRICES = {
     "120_2": 830, "120_3": 1180, "120_4": 1530, "120_5": 1875, "120_6": 2255, "120_7": 2570,
 }
 
-class CriticalFinanceIndexError(RuntimeError):
-    """Raised when a critical unique financial integrity index fails to be created/verified."""
-    def __init__(self, collection_name: str, index_name: str, reason: str):
-        self.collection_name = collection_name
-        self.index_name = index_name
-        self.reason = reason
-        super().__init__(f"Failed to create critical financial integrity index '{index_name}' on collection '{collection_name}': {reason}")
+try:
+    from backend.index_provisioner import (
+        CriticalFinanceIndexError,
+        verify_required_indexes,
+        REQUIRED_INDEX_SPECS,
+    )
+except ImportError:
+    try:
+        from index_provisioner import (
+            CriticalFinanceIndexError,
+            verify_required_indexes,
+            REQUIRED_INDEX_SPECS,
+        )
+    except ImportError:
+        class CriticalFinanceIndexError(RuntimeError):
+            """Raised when a critical unique financial integrity index fails to be created/verified."""
+            def __init__(self, collection_name: str, index_name: str, reason: str):
+                self.collection_name = collection_name
+                self.index_name = index_name
+                self.reason = reason
+                super().__init__(f"Failed to create critical financial integrity index '{index_name}' on collection '{collection_name}': {reason}")
+        verify_required_indexes = None
+        REQUIRED_INDEX_SPECS = []
 
-async def seed():
+
+class OperationalConfigurationError(RuntimeError):
+    """Raised when required operational configuration is missing during fail-closed startup verification."""
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Operational configuration verification failed: {reason}")
+
+
+async def verify_baseline_data(target_db=None, fail_closed: bool = True) -> Dict[str, Any]:
+    """Read-only check that essential operational configuration is present.
+    Does NOT mutate any database documents.
+    """
+    use_db = target_db if target_db is not None else db
+    errors = []
+
+    # 1. Verify owner admin exists (use find_one for mock compatibility)
+    owner_doc = await use_db.admins.find_one({"role": "owner"})
+    if not owner_doc:
+        errors.append("No administrator account with role 'owner' exists in 'admins' collection.")
+
+    # 2. Verify essential operational settings
+    essential_keys = ["store_name", "exchange_rate_idr_per_le"]
+    missing_settings = []
+    for k in essential_keys:
+        if await use_db.settings.find_one({"key": k}) is None:
+            missing_settings.append(k)
+    if missing_settings:
+        errors.append(f"Essential store settings missing in 'settings' collection: {missing_settings}")
+
+    is_valid = len(errors) == 0
+    if not is_valid and fail_closed:
+        err_msg = "; ".join(errors)
+        logger.error(f"STARTUP CONFIGURATION VERIFICATION FAILED: {err_msg}")
+        raise OperationalConfigurationError(err_msg)
+
+    return {
+        "valid": is_valid,
+        "owner_present": bool(owner_doc),
+        "missing_settings": missing_settings,
+        "errors": errors,
+    }
+
+
+async def seed_baseline_data_only(target_db=None):
+    """Initializes missing baseline/default data for development and testing.
+    SAFETY GUARANTEE: Never overwrites existing product names, prices, or user-managed settings.
+    """
+    use_db = target_db if target_db is not None else db
     admin_email = os.environ.get("ADMIN_EMAIL", "sogil.furniture@gmail.com").lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.admins.find_one({"email": admin_email})
-    if not existing:
-        await db.admins.insert_one({"email": admin_email, "password_hash": hash_password(admin_password),
-                                    "name": "Owner Sogil", "role": "owner", "permissions": default_permissions("owner"),
-                                    "created_at": datetime.now(timezone.utc).isoformat()})
-    else:
-        # NEVER reset/overwrite an existing Owner's password — manual changes must persist
-        # across restarts/deploys. Seed only creates the Owner when none exists.
-        upd = {}
-        if existing.get("role") != "owner":
-            upd["role"] = "owner"; upd["permissions"] = default_permissions("owner")
-        if upd:
-            await db.admins.update_one({"_id": existing["_id"]}, {"$set": upd})
 
-    await db.admins.create_index("email", unique=True)
-    await db.products.create_index("slug", unique=True)
-    # Focused indexes to keep order/customer queries responsive as data grows.
-    for spec in ["customer_id", "order_number", "order_status", "payment_status", "referral.code"]:
-        await db.orders.create_index(spec)
-    await db.orders.create_index([("created_at", -1)])
-    await db.customers.create_index("phone")
-    await db.customers.create_index("username")
-    await db.point_transactions.create_index("customer_id")
-    await db.point_transactions.create_index("order_id")
-    await db.finance_transactions.create_index("related_order_id")
-    await db.referrals.create_index("code")
-    # Invoices indexes
-    await db.invoices.create_index("invoice_number", unique=True)
-    await db.invoices.create_index("status")
-    await db.invoices.create_index("order_id")
-    await db.invoices.create_index("source.custom_request_id")
-    await db.invoices.create_index([("created_at", -1)])
-    await db.invoices.create_index("customer.whatsapp")
-    await db.invoices.create_index("customer.name")
-    await db.invoices.create_index("claim.claimed_by_customer_id", sparse=True)
-    await db.invoices.create_index([("claim.claimed_by_customer_id", 1), ("created_at", -1)])
-    await db.claim_attempts.create_index("created_at", expireAfterSeconds=900)
-    await db.claim_attempts.create_index([("ip", 1), ("created_at", -1)])
-    await db.claim_attempts.create_index([("customer_id", 1), ("created_at", -1)])
-    # Audit logs indexes
-    await db.audit_logs.create_index([("entity_type", 1), ("entity_id", 1)])
-    await db.audit_logs.create_index("entity_identifier")
-    await db.audit_logs.create_index([("timestamp", -1)])
+    # Only insert initial owner if no owner admin exists at all
+    owner_doc = await use_db.admins.find_one({"role": "owner"})
+    if not owner_doc:
+        existing = await use_db.admins.find_one({"email": admin_email})
+        if not existing:
+            await use_db.admins.insert_one({
+                "email": admin_email,
+                "password_hash": hash_password(admin_password),
+                "name": "Owner Sogil",
+                "role": "owner",
+                "permissions": default_permissions("owner"),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        else:
+            if existing.get("role") != "owner":
+                await use_db.admins.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {"role": "owner", "permissions": default_permissions("owner")}}
+                )
 
     defaults = {
         "store_name": "Sogil Furniture",
@@ -9659,16 +10275,22 @@ async def seed():
         "referral_program_enabled": True, "point_redeem_max_pct": 50,
     }
     for k, v in defaults.items():
-        if await db.settings.find_one({"key": k}) is None:
-            await set_setting(k, v)
+        if await use_db.settings.find_one({"key": k}) is None:
+            await use_db.settings.update_one(
+                {"key": k},
+                {"$set": {"key": k, "value": v, "updated_at": datetime.now(timezone.utc).isoformat()}},
+                upsert=True
+            )
 
-    if await db.delivery_zones.count_documents({}) == 0:
+    if await use_db.delivery_zones.count_documents({}) == 0:
         for name, fee in [("Darasah", 150), ("Gamaliyah", 200), ("Buuts", 250), ("Hay Sadis", 500),
                           ("Hay Sabi", 500), ("Hay Tsamin", 500), ("Hay Asyir", 600)]:
-            await db.delivery_zones.insert_one({"name": name, "fee_le": float(fee), "active": True,
-                                                "created_at": datetime.now(timezone.utc).isoformat()})
+            await use_db.delivery_zones.insert_one({
+                "name": name, "fee_le": float(fee), "active": True,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
 
-    if await db.products.count_documents({}) == 0:
+    if await use_db.products.count_documents({}) == 0:
         now = datetime.now(timezone.utc).isoformat()
         rak_pricing = {
             "lengths": ["60", "80", "120"], "levels": ["2", "3", "4", "5", "6", "7"],
@@ -9704,60 +10326,9 @@ async def seed():
         ]
         for p in products:
             p.update({"image_url": "", "active": True, "photos": [], "representative_photo_id": None, "created_at": now, "updated_at": now})
-            await db.products.insert_one(p)
+            await use_db.products.insert_one(p)
 
-    # Migration: Rak Type B base prices (idempotent via flag)
-    if await db.settings.find_one({"key": "migration_rak_typeB_v2"}) is None:
-        rak = await db.products.find_one({"category": "rak"})
-        if rak:
-            pricing = rak.get("pricing", {}) or {}
-            pricing["base_prices"] = dict(RAK_TYPE_B_PRICES)
-            await db.products.update_one({"_id": rak["_id"]}, {"$set": {"pricing": pricing, "starting_price_le": RAK_TYPE_B_PRICES["60_2"]}})
-        await set_setting("migration_rak_typeB_v2", True)
-
-    # Migration: Papan Tulis small sizes (30x50, 40x60, 50x70) (idempotent via flag)
-    if await db.settings.find_one({"key": "migration_papan_tulis_small_sizes_v1"}) is None:
-        pt = await db.products.find_one({"slug": "papan-tulis"})
-        if pt:
-            pricing = pt.get("pricing", {}) or {}
-            groups = pricing.get("groups", []) or []
-            # Ensure size options are ordered from smallest to largest
-            for g in groups:
-                if g.get("key") == "size":
-                    current_options = g.get("options", [])
-                    new_sizes = ["30x50 cm", "40x60 cm", "50x70 cm"]
-                    combined = [s for s in new_sizes if s not in current_options] + current_options
-                    # Sort canonically: small sizes first, then existing sizes in exact specified order
-                    canonical_order = [
-                        "30x50 cm", "40x60 cm", "50x70 cm",
-                        "80x60 cm", "120x60 cm", "120x80 cm",
-                        "180x80 cm", "180x120 cm", "240x120 cm"
-                    ]
-                    g["options"] = [s for s in canonical_order if s in combined]
-            # Add base prices for Gantung small sizes without altering existing base prices
-            base_prices = pricing.get("base_prices", {}) or {}
-            base_prices["Gantung | 30x50 cm"] = 300
-            base_prices["Gantung | 40x60 cm"] = 350
-            base_prices["Gantung | 50x70 cm"] = 400
-            pricing["groups"] = groups
-            pricing["base_prices"] = base_prices
-            await db.products.update_one(
-                {"_id": pt["_id"]},
-                {"$set": {"pricing": pricing, "starting_price_le": 300}}
-            )
-        await set_setting("migration_papan_tulis_small_sizes_v1", True)
-
-    # Ensure types in pricing do not contain deprecated A+ and B+
-    await db.products.update_many(
-        {"pricing.types": {"$in": ["A+", "B+"]}},
-        {"$pull": {"pricing.types": {"$in": ["A+", "B+"]}}}
-    )
-
-    # Ensure photos field exists on all products
-    await db.products.update_many({"photos": {"$exists": False}}, {"$set": {"photos": [], "representative_photo_id": None}})
-
-    # Seed default categories if not present
-    if await db.categories.count_documents({}) == 0:
+    if await use_db.categories.count_documents({}) == 0:
         now = datetime.now(timezone.utc).isoformat()
         default_cats = [
             {"key": "rak", "name": "Rak", "description": "Rapikan kitab, buku, dan barang dengan lebih teratur.", "sort_order": 1, "active": True, "created_at": now, "updated_at": now},
@@ -9768,129 +10339,278 @@ async def seed():
             {"key": "gantungan_baju", "name": "Gantungan Baju", "description": "Gantungan baju kokoh dan hemat tempat.", "sort_order": 6, "active": True, "created_at": now, "updated_at": now},
             {"key": "custom", "name": "Koleksi Custom", "description": "Kumpulan karya dan desain custom pilihan dari Sogil Furniture.", "sort_order": 7, "active": True, "created_at": now, "updated_at": now},
         ]
-        await db.categories.insert_many(default_cats)
+        await use_db.categories.insert_many(default_cats)
 
-    await db.products.update_many(
-        {"category": "custom"},
-        {"$set": {"name": "Koleksi Custom"}}
-    )
+
+# Backward compatibility alias
+seed_data_only = seed_baseline_data_only
+
+
+class _SafeIndexColWrapper:
+    def __init__(self, col):
+        self._col = col
+
+    def create_index(self, *args, **kwargs):
+        res = self._col.create_index(*args, **kwargs)
+        if inspect.isawaitable(res):
+            return res
+        async def _dummy():
+            return res
+        return _dummy()
+
+    def __getattr__(self, name):
+        return getattr(self._col, name)
+
+
+class _SafeIndexDbWrapper:
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name):
+        val = getattr(self._target, name)
+        if hasattr(val, "create_index"):
+            return _SafeIndexColWrapper(val)
+        return val
+
+    def __getitem__(self, name):
+        return self.__getattr__(name)
+
+
+async def seed(target_db=None):
+    raw_db = target_db if target_db is not None else db
+    await seed_data_only(raw_db)
+    use_db = _SafeIndexDbWrapper(raw_db)
+
+    # Critical & required unique constraints with fail-closed error handling
+    try:
+        await use_db.admins.create_index("email", unique=True)
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: admins 'email' unique index creation failed: {e}")
+        raise CriticalFinanceIndexError("admins", "email_1", str(e))
+
+    try:
+        await use_db.products.create_index("slug", unique=True)
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: products 'slug' unique index creation failed: {e}")
+        raise CriticalFinanceIndexError("products", "slug_1", str(e))
+
+    # Focused indexes to keep order/customer queries responsive as data grows.
+    try:
+        for spec in ["customer_id", "order_number", "order_status", "payment_status", "referral.code"]:
+            await use_db.orders.create_index(spec)
+        await use_db.orders.create_index([("created_at", -1)])
+        await use_db.customers.create_index("phone")
+        await use_db.customers.create_index("username")
+        await use_db.point_transactions.create_index("customer_id")
+        await use_db.point_transactions.create_index("order_id")
+        await use_db.finance_transactions.create_index("related_order_id")
+        await use_db.referrals.create_index("code")
+    except Exception as e:
+        logger.warning(f"Non-critical query index provisioning warning: {e}")
+
+    # Invoices indexes
+    try:
+        await use_db.invoices.create_index("invoice_number", unique=True)
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: invoices 'invoice_number' unique index creation failed: {e}")
+        raise CriticalFinanceIndexError("invoices", "invoice_number_1", str(e))
+
+    try:
+        await use_db.invoices.create_index("status")
+        await use_db.invoices.create_index("order_id")
+        await use_db.invoices.create_index("source.custom_request_id")
+        await use_db.invoices.create_index([("created_at", -1)])
+        await use_db.invoices.create_index("customer.whatsapp")
+        await use_db.invoices.create_index("customer.name")
+        await use_db.invoices.create_index("claim.claimed_by_customer_id", sparse=True)
+        await use_db.invoices.create_index([("claim.claimed_by_customer_id", 1), ("created_at", -1)])
+        await use_db.claim_attempts.create_index("created_at", expireAfterSeconds=900)
+        await use_db.claim_attempts.create_index([("ip", 1), ("created_at", -1)])
+        await use_db.claim_attempts.create_index([("customer_id", 1), ("created_at", -1)])
+        # Audit logs indexes
+        await use_db.audit_logs.create_index([("entity_type", 1), ("entity_id", 1)])
+        await use_db.audit_logs.create_index("entity_identifier")
+        await use_db.audit_logs.create_index([("timestamp", -1)])
+    except Exception as e:
+        logger.warning(f"Non-critical invoice/claim/audit index provisioning warning: {e}")
 
     # Ensure indexes for materials
     try:
-        await db.materials.create_index(
+        await use_db.materials.create_index(
             [("name_normalized", 1), ("specs_normalized", 1)],
             unique=True,
             name="uniq_material_name_specs"
         )
-    except Exception:
-        pass
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: materials 'uniq_material_name_specs' creation failed: {e}")
+        raise CriticalFinanceIndexError("materials", "uniq_material_name_specs", str(e))
 
     # Ensure indexes for material_purchases
     try:
-        await db.material_purchases.create_index(
+        await use_db.material_purchases.create_index(
             [("purchase_number", 1)],
             unique=True,
             name="uniq_purchase_number"
         )
-        await db.material_purchases.create_index(
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: material_purchases 'uniq_purchase_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("material_purchases", "uniq_purchase_number", str(e))
+
+    try:
+        await use_db.material_purchases.create_index(
             [("material_id", 1), ("purchase_date", -1)],
             name="idx_mat_purchase_date"
         )
-        await db.material_purchases.create_index(
+        await use_db.material_purchases.create_index(
             [("purchase_date", -1)],
             name="idx_purchase_date"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical material_purchases index provisioning warning: {e}")
 
     # Ensure indexes for material_stocks (Phase 3)
     try:
-        await db.material_stocks.create_index(
+        await use_db.material_stocks.create_index(
             [("movement_number", 1)],
             unique=True,
             name="uniq_movement_number"
         )
-        await db.material_stocks.create_index(
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: material_stocks 'uniq_movement_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("material_stocks", "uniq_movement_number", str(e))
+
+    try:
+        await use_db.material_stocks.create_index(
             [("material_id", 1), ("movement_date", -1), ("created_at", -1)],
             name="idx_stock_material_date"
         )
+    except Exception as e:
+        logger.warning(f"Non-critical material_stocks index provisioning warning: {e}")
+
+    try:
         # Inspect existing index definition without dropping or mutating
         legacy_incompatible_index = False
         try:
-            cur_indexes = await db.material_stocks.index_information()
-            if "uniq_purchase_stock_movement" in cur_indexes:
-                idx_def = cur_indexes["uniq_purchase_stock_movement"]
-                # Incompatible if it has legacy sparse=True or is missing partialFilterExpression
-                if idx_def.get("sparse") or not idx_def.get("partialFilterExpression"):
-                    legacy_incompatible_index = True
-                    logger.warning(
-                        "INCOMPATIBLE INDEX DETECTED: 'uniq_purchase_stock_movement' on material_stocks has legacy sparse=True "
-                        "options instead of partialFilterExpression. Automated drop on startup is disabled per production safety policy. "
-                        "Run the explicit migration script 'scripts/migrate_purchase_stock_movement_index.py' to safely migrate the index."
-                    )
+            cur_indexes_fn = getattr(use_db.material_stocks, "index_information", None)
+            if callable(cur_indexes_fn):
+                cur_indexes_res = cur_indexes_fn()
+                cur_indexes = await cur_indexes_res if inspect.isawaitable(cur_indexes_res) else cur_indexes_res
+                if cur_indexes and "uniq_purchase_stock_movement" in cur_indexes:
+                    idx_def = cur_indexes["uniq_purchase_stock_movement"]
+                    # Incompatible if it has legacy sparse=True or is missing partialFilterExpression
+                    if idx_def.get("sparse") or not idx_def.get("partialFilterExpression"):
+                        legacy_incompatible_index = True
+                        logger.warning(
+                            "INCOMPATIBLE INDEX DETECTED: 'uniq_purchase_stock_movement' on material_stocks has legacy sparse=True "
+                            "options instead of partialFilterExpression. Automated drop on startup is disabled per production safety policy. "
+                            "Run the explicit migration script 'scripts/migrate_purchase_stock_movement_index.py' to safely migrate the index."
+                        )
         except Exception as e:
             logger.warning(f"Unable to inspect material_stocks index information: {e}")
 
         # Only attempt create_index if no incompatible legacy index was detected
         if not legacy_incompatible_index:
-            await db.material_stocks.create_index(
+            await use_db.material_stocks.create_index(
                 [("related_purchase_id", 1), ("movement_type", 1)],
                 unique=True,
                 partialFilterExpression={"related_purchase_id": {"$type": "string"}},
                 name="uniq_purchase_stock_movement"
             )
-    except Exception:
-        pass
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: material_stocks 'uniq_purchase_stock_movement' creation failed: {e}")
+        raise CriticalFinanceIndexError("material_stocks", "uniq_purchase_stock_movement", str(e))
 
     # Ensure indexes for finance_transactions material purchase references (Phase 4)
     try:
-        await db.finance_transactions.create_index(
+        await use_db.finance_transactions.create_index(
             [("reference_id", 1), ("reference_type", 1), ("type", 1)],
             unique=True,
             partialFilterExpression={"reference_type": "material_purchase", "type": "expense"},
             name="uniq_purchase_finance_expense"
         )
-        await db.finance_transactions.create_index(
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: finance_transactions 'uniq_purchase_finance_expense' creation failed: {e}")
+        raise CriticalFinanceIndexError("finance_transactions", "uniq_purchase_finance_expense", str(e))
+
+    try:
+        await use_db.finance_transactions.create_index(
             [("reference_id", 1), ("is_reversal", 1)],
             unique=True,
             partialFilterExpression={"reference_type": "material_purchase", "is_reversal": True},
             name="uniq_purchase_finance_reversal"
         )
-    except Exception:
-        pass
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: finance_transactions 'uniq_purchase_finance_reversal' creation failed: {e}")
+        raise CriticalFinanceIndexError("finance_transactions", "uniq_purchase_finance_reversal", str(e))
 
     # Ensure indexes for stock_forms and stock_transformations (Phase 5)
     try:
-        await db.stock_forms.create_index(
+        await use_db.stock_forms.create_index(
             [("material_id", 1), ("form_type", 1), ("width", 1), ("length", 1), ("thickness", 1), ("dimension_unit", 1), ("stock_unit", 1), ("label", 1)],
             unique=True,
             name="uniq_stock_form_spec"
         )
-        await db.stock_forms.create_index(
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: stock_forms 'uniq_stock_form_spec' creation failed: {e}")
+        raise CriticalFinanceIndexError("stock_forms", "uniq_stock_form_spec", str(e))
+
+    try:
+        await use_db.stock_forms.create_index(
             [("material_id", 1), ("is_active", 1)],
             name="idx_stock_form_material"
         )
-        await db.stock_transformations.create_index(
+    except Exception as e:
+        logger.warning(f"Non-critical stock_forms index provisioning warning: {e}")
+
+    try:
+        await use_db.stock_transformations.create_index(
             [("transformation_number", 1)],
             unique=True,
             name="uniq_transformation_number"
         )
-        await db.stock_transformations.create_index(
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: stock_transformations 'uniq_transformation_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("stock_transformations", "uniq_transformation_number", str(e))
+
+    try:
+        await use_db.stock_transformations.create_index(
             [("material_id", 1), ("transformation_date", -1), ("created_at", -1)],
             name="idx_transformation_material_date"
         )
-        await db.stock_transformations.create_index(
+        await use_db.stock_transformations.create_index(
             [("related_purchase_id", 1)],
             sparse=True,
             name="idx_transformation_purchase"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical stock_transformations index provisioning warning: {e}")
 
     # Ensure indexes for payments (Phase 1)
     # Critical unique indexes: uniq_payment_number, uniq_payments_idempotency
     try:
-        await db.payments.create_index(
+        await use_db.payments.create_index(
             [("payment_number", 1)],
             unique=True,
             name="uniq_payment_number"
@@ -9900,7 +10620,7 @@ async def seed():
         raise CriticalFinanceIndexError("payments", "uniq_payment_number", str(e))
 
     try:
-        await db.payments.create_index(
+        await use_db.payments.create_index(
             [("idempotency_key", 1)],
             unique=True,
             partialFilterExpression={"idempotency_key": {"$type": "string"}},
@@ -9912,11 +10632,11 @@ async def seed():
 
     # Non-critical reporting/lookup indexes for payments
     try:
-        await db.payments.create_index(
+        await use_db.payments.create_index(
             [("order_id", 1), ("status", 1)],
             name="idx_payments_order_status"
         )
-        await db.payments.create_index(
+        await use_db.payments.create_index(
             [("finance_transaction_id", 1)],
             name="idx_payments_finance_txn"
         )
@@ -9925,38 +10645,45 @@ async def seed():
 
     # Ensure indexes for Phase 2: wage_rules, work_assignments, wage_obligations
     try:
-        await db.wage_rules.create_index(
+        await use_db.wage_rules.create_index(
             [("task_category", 1), ("pricing_basis", 1)],
             name="idx_wage_rules_category_basis"
         )
-        await db.wage_rules.create_index(
+        await use_db.wage_rules.create_index(
             [("active", 1)],
             name="idx_wage_rules_active"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical wage_rules index provisioning warning: {e}")
 
     try:
-        await db.work_assignments.create_index(
+        await use_db.work_assignments.create_index(
             [("order_id", 1), ("order_item_id", 1)],
             name="idx_work_assignments_order_item"
         )
-        await db.work_assignments.create_index(
+        await use_db.work_assignments.create_index(
             [("worker_id", 1), ("status", 1)],
             name="idx_work_assignments_worker_status"
         )
+    except Exception as e:
+        logger.warning(f"Non-critical work_assignments index provisioning warning: {e}")
+
+    try:
         # Unique active assignment per (order_item_id, worker_id, task_category)
-        await db.work_assignments.create_index(
+        await use_db.work_assignments.create_index(
             [("order_item_id", 1), ("worker_id", 1), ("task_category", 1)],
             unique=True,
             partialFilterExpression={"status": {"$in": ["assigned", "in_progress", "ready_for_review", "accruing"]}},
             name="uniq_active_worker_task_per_item"
         )
-    except Exception:
-        pass
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: work_assignments 'uniq_active_worker_task_per_item' creation failed: {e}")
+        raise CriticalFinanceIndexError("work_assignments", "uniq_active_worker_task_per_item", str(e))
 
     try:
-        await db.wage_obligations.create_index(
+        await use_db.wage_obligations.create_index(
             [("accrual_event_key", 1)],
             unique=True,
             name="uniq_wage_obligation_accrual_event"
@@ -9966,7 +10693,7 @@ async def seed():
         raise CriticalFinanceIndexError("wage_obligations", "uniq_wage_obligation_accrual_event", str(e))
 
     try:
-        await db.wage_obligations.create_index(
+        await use_db.wage_obligations.create_index(
             [("obligation_number", 1)],
             unique=True,
             name="uniq_obligation_number"
@@ -9976,23 +10703,23 @@ async def seed():
         raise CriticalFinanceIndexError("wage_obligations", "uniq_obligation_number", str(e))
 
     try:
-        await db.wage_obligations.create_index(
+        await use_db.wage_obligations.create_index(
             [("work_assignment_id", 1)],
             name="idx_wage_obligations_assignment"
         )
-        await db.wage_obligations.create_index(
+        await use_db.wage_obligations.create_index(
             [("worker_id", 1), ("status", 1)],
             name="idx_wage_obligations_worker_status"
         )
-        await db.wage_obligations.create_index(
+        await use_db.wage_obligations.create_index(
             [("order_id", 1), ("order_item_id", 1)],
             name="idx_wage_obligations_order_item"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical wage_obligations index provisioning warning: {e}")
 
     try:
-        await db.wage_settlements.create_index(
+        await use_db.wage_settlements.create_index(
             [("settlement_number", 1)],
             unique=True,
             name="uniq_settlement_number"
@@ -10002,7 +10729,7 @@ async def seed():
         raise CriticalFinanceIndexError("wage_settlements", "uniq_settlement_number", str(e))
 
     try:
-        await db.wage_settlements.create_index(
+        await use_db.wage_settlements.create_index(
             [("idempotency_key", 1)],
             unique=True,
             partialFilterExpression={"idempotency_key": {"$type": "string"}},
@@ -10013,21 +10740,76 @@ async def seed():
         raise CriticalFinanceIndexError("wage_settlements", "uniq_wage_settlements_idempotency", str(e))
 
     try:
-        await db.wage_settlements.create_index(
+        await use_db.wage_settlements.create_index(
             [("worker_id", 1), ("settlement_date", -1)],
             name="idx_wage_settlements_worker_date"
         )
-        await db.wage_settlements.create_index(
+        await use_db.wage_settlements.create_index(
             [("finance_transaction_id", 1)],
             name="idx_wage_settlements_finance_txn"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Non-critical wage_settlements index provisioning warning: {e}")
+
+    # Phase 3B: Outbox events & Assignment Groups indexes
+    try:
+        await use_db.outbox_events.create_index(
+            [("event_id", 1)],
+            unique=True,
+            name="uniq_outbox_event_id"
+        )
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: outbox_events 'uniq_outbox_event_id' creation failed: {e}")
+        raise CriticalFinanceIndexError("outbox_events", "uniq_outbox_event_id", str(e))
+
+    try:
+        await use_db.outbox_events.create_index(
+            [("status", 1), ("created_at", 1)],
+            name="idx_outbox_status_created"
+        )
+        await use_db.outbox_events.create_index(
+            [("aggregate_type", 1), ("aggregate_id", 1)],
+            name="idx_outbox_aggregate"
+        )
+        await use_db.outbox_events.create_index(
+            [("status", 1), ("next_retry_at", 1), ("lease_expires_at", 1)],
+            name="idx_outbox_claim"
+        )
+        await use_db.outbox_events.create_index(
+            [("claim_token", 1)],
+            sparse=True,
+            name="idx_outbox_claim_token"
+        )
+    except Exception as e:
+        logger.warning(f"Non-critical outbox_events index provisioning warning: {e}")
+
+    try:
+        await use_db.assignment_groups.create_index(
+            [("group_number", 1)],
+            unique=True,
+            partialFilterExpression={"group_number": {"$type": "string"}},
+            name="uniq_assignment_group_number"
+        )
+    except CriticalFinanceIndexError:
+        raise
+    except Exception as e:
+        logger.error(f"CRITICAL INDEX FAILURE: assignment_groups 'uniq_assignment_group_number' creation failed: {e}")
+        raise CriticalFinanceIndexError("assignment_groups", "uniq_assignment_group_number", str(e))
+
+    try:
+        await use_db.assignment_groups.create_index(
+            [("status", 1)],
+            name="idx_assignment_groups_status"
+        )
+    except Exception as e:
+        logger.warning(f"Non-critical assignment_groups index provisioning warning: {e}")
 
     # Ensure indexes for customer_credit_events (Phase 3.B.2)
     # Critical unique indexes: uniq_credit_event_number, uniq_credit_event_source_payment, uniq_credit_events_idempotency
     try:
-        await db.customer_credit_events.create_index(
+        await use_db.customer_credit_events.create_index(
             [("event_number", 1)],
             unique=True,
             name="uniq_credit_event_number"
@@ -10037,7 +10819,7 @@ async def seed():
         raise CriticalFinanceIndexError("customer_credit_events", "uniq_credit_event_number", str(e))
 
     try:
-        await db.customer_credit_events.create_index(
+        await use_db.customer_credit_events.create_index(
             [("source_payment_id", 1), ("event_type", 1)],
             unique=True,
             partialFilterExpression={"source_payment_id": {"$type": "string"}},
@@ -10048,7 +10830,7 @@ async def seed():
         raise CriticalFinanceIndexError("customer_credit_events", "uniq_credit_event_source_payment", str(e))
 
     try:
-        await db.customer_credit_events.create_index(
+        await use_db.customer_credit_events.create_index(
             [("idempotency_key", 1)],
             unique=True,
             partialFilterExpression={"idempotency_key": {"$type": "string"}},
@@ -10060,11 +10842,11 @@ async def seed():
 
     # Non-critical reporting/lookup indexes for customer_credit_events
     try:
-        await db.customer_credit_events.create_index(
+        await use_db.customer_credit_events.create_index(
             [("customer_id", 1), ("currency", 1)],
             name="idx_credit_events_customer_currency"
         )
-        await db.customer_credit_events.create_index(
+        await use_db.customer_credit_events.create_index(
             [("source_order_id", 1)],
             name="idx_credit_events_source_order"
         )
@@ -10074,7 +10856,7 @@ async def seed():
     # Ensure indexes for finance_adjustments (Phase 3.B.6)
     # Critical unique indexes: uniq_adjustment_id, uniq_adjustments_idempotency
     try:
-        await db.finance_adjustments.create_index(
+        await use_db.finance_adjustments.create_index(
             [("adjustment_id", 1)],
             unique=True,
             name="uniq_adjustment_id"
@@ -10084,7 +10866,7 @@ async def seed():
         raise CriticalFinanceIndexError("finance_adjustments", "uniq_adjustment_id", str(e))
 
     try:
-        await db.finance_adjustments.create_index(
+        await use_db.finance_adjustments.create_index(
             [("idempotency_key", 1)],
             unique=True,
             partialFilterExpression={"idempotency_key": {"$type": "string"}},
@@ -10096,11 +10878,11 @@ async def seed():
 
     # Non-critical reporting/lookup indexes for finance_adjustments
     try:
-        await db.finance_adjustments.create_index(
+        await use_db.finance_adjustments.create_index(
             [("order_id", 1), ("is_void", 1), ("created_at", -1)],
             name="idx_adjustments_order_lookup"
         )
-        await db.finance_adjustments.create_index(
+        await use_db.finance_adjustments.create_index(
             [("currency", 1), ("is_void", 1), ("created_at", -1)],
             name="idx_adjustments_period_reporting"
         )
@@ -10109,7 +10891,7 @@ async def seed():
 
     # Phase 3.F.4.1: Delivery Trips and Delivery Wage Indexes
     try:
-        dt_idx = db.delivery_trips.create_index(
+        dt_idx = use_db.delivery_trips.create_index(
             [("trip_number", 1)],
             unique=True,
             name="uniq_delivery_trip_number"
@@ -10123,19 +10905,19 @@ async def seed():
         raise CriticalFinanceIndexError("delivery_trips", "uniq_delivery_trip_number", str(e))
 
     try:
-        res1 = db.delivery_trips.create_index(
+        res1 = use_db.delivery_trips.create_index(
             [("scheduled_date", 1), ("status", 1)],
             name="idx_delivery_trips_date_status"
         )
         if inspect.isawaitable(res1):
             await res1
-        res2 = db.delivery_trips.create_index(
+        res2 = use_db.delivery_trips.create_index(
             [("stops.order_id", 1)],
             name="idx_delivery_trips_stops_order"
         )
         if inspect.isawaitable(res2):
             await res2
-        res3 = db.orders.create_index(
+        res3 = use_db.orders.create_index(
             [("active_delivery_trip_id", 1)],
             name="idx_orders_active_delivery_trip"
         )
@@ -10146,10 +10928,10 @@ async def seed():
 
     # Phase 3.F.4.1: Partial Unique Index for delivery wage obligations with pre-migration verification
     try:
-        mig_res = verify_delivery_wage_indexes_pre_migration(db)
+        mig_res = verify_delivery_wage_indexes_pre_migration(use_db)
         if inspect.isawaitable(mig_res):
             await mig_res
-        wo_idx = db.wage_obligations.create_index(
+        wo_idx = use_db.wage_obligations.create_index(
             [("order_id", 1), ("worker_id", 1), ("task_category", 1)],
             unique=True,
             partialFilterExpression={"task_category": "delivery"},
@@ -10164,7 +10946,7 @@ async def seed():
         raise CriticalFinanceIndexError("wage_obligations", "uniq_delivery_wage_order_worker", str(e))
 
     # Provision probe infrastructure
-    await ensure_probe_infrastructure(db)
+    await ensure_probe_infrastructure(use_db)
 
 async def ensure_probe_infrastructure(db_inst) -> bool:
     for col_name in ["_system_probe_assignments", "_system_probe_obligations"]:
@@ -10230,13 +11012,80 @@ async def run_transaction_probe(mongo_client: AsyncIOMotorClient, db_name: str) 
 
 @app.on_event("startup")
 async def startup():
-    await seed()
-    try:
-        db_name = os.environ.get("DB_NAME", "sogil")
-        supports_txn = await run_transaction_probe(client, db_name)
-        logger.info(f"Phase 2 Transaction Probe capability status: {supports_txn}")
-    except Exception as e:
-        logger.warning(f"Transaction probe startup evaluation: {e}")
+    env_mode = get_environment_mode()
+    is_prod_or_strict = (env_mode not in ("development", "test"))
+
+    idx_mode = os.environ.get("INDEX_PROVISIONING_MODE", "verify").lower().strip()
+    data_mode = os.environ.get("STARTUP_DATA_MODE", "verify").lower().strip()
+
+    # 1. Validate environment configuration modes against allowed values (fail-closed)
+    valid_data_modes = {"verify", "verify_only", "seed", "seed_baseline", "none", "auto"}
+    if not data_mode or data_mode not in valid_data_modes:
+        raise OperationalConfigurationError(
+            f"Invalid or missing STARTUP_DATA_MODE: '{data_mode}'. Allowed modes: 'verify', 'seed', 'none'."
+        )
+
+    valid_idx_modes = {"verify", "verify_only", "auto"}
+    if not idx_mode or idx_mode not in valid_idx_modes:
+        raise CriticalFinanceIndexError(
+            "startup", "all",
+            f"Invalid or missing INDEX_PROVISIONING_MODE: '{idx_mode}'. Allowed modes: 'verify', 'auto'."
+        )
+
+    # 2. Production safety gates: strictly forbid seeding and runtime index creation in production
+    if is_prod_or_strict:
+        if data_mode in ("seed", "seed_baseline", "auto"):
+            raise OperationalConfigurationError(
+                f"Data seeding mode '{data_mode}' is strictly forbidden in production or non-development environments."
+            )
+        if idx_mode == "auto":
+            raise CriticalFinanceIndexError(
+                "startup", "all",
+                "Automatic runtime index provisioning ('auto') is strictly forbidden in production environments. "
+                "Use scripts/provision_indexes.py for explicit provisioning."
+            )
+
+    # 3. Data lifecycle handling
+    # INVARIANT: In production/strict environments, baseline configuration verification CANNOT be bypassed.
+    # Disabling seeding in production must never bypass baseline verification of owner account and store settings.
+    if is_prod_or_strict:
+        if data_mode == "none":
+            logger.warning(
+                "STARTUP_DATA_MODE='none' specified in production: seeding is disabled, "
+                "but baseline configuration verification is mandatory and will be enforced."
+            )
+        await verify_baseline_data(db, fail_closed=True)
+    else:
+        # Development or test environment
+        if data_mode in ("seed", "seed_baseline", "auto"):
+            await seed_baseline_data_only()
+        elif data_mode in ("verify", "verify_only"):
+            await verify_baseline_data(db, fail_closed=True)
+        elif data_mode == "none":
+            logger.info("Startup data mode is 'none'; skipping baseline verification and seeds in dev/test.")
+
+    # 4. Index lifecycle handling
+    if idx_mode == "auto":
+        await seed()
+    else:
+        if verify_required_indexes is None:
+            raise CriticalFinanceIndexError(
+                "startup", "all",
+                "Required index verification module 'backend.index_provisioner' could not be loaded."
+            )
+        await verify_required_indexes(db, fail_closed=True)
+
+    # 5. Transaction probe capability check
+    probe_enabled = os.environ.get("TRANSACTION_PROBE_ENABLED", "true").lower().strip() != "false"
+    if probe_enabled:
+        try:
+            db_name = os.environ.get("DB_NAME", "sogil")
+            supports_txn = await run_transaction_probe(client, db_name)
+            logger.info(f"Phase 2 Transaction Probe capability status: {supports_txn}")
+        except Exception as e:
+            logger.warning(f"Transaction probe startup evaluation: {e}")
+    else:
+        logger.info("Transaction probe skipped (TRANSACTION_PROBE_ENABLED=false).")
 
 @app.on_event("shutdown")
 async def shutdown():
