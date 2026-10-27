@@ -133,8 +133,9 @@ function Layout() {
           <Route path="finance/statistik" element={<AdminFinanceStats />} />
           <Route path="finance/statistics" element={<QueryRedirect to="/admin/finance/statistik" />} />
           <Route path="statistik" element={<QueryRedirect to="/admin/finance/statistik" />} />
-          <Route path="wages/pending" element={<AdminWorkerPendingWages />} />
-          <Route path="wages" element={<Navigate to="/admin/wages/pending" replace />} />
+          <Route path="pending-payments" element={<AdminWorkerPendingWages />} />
+          <Route path="wages/pending" element={<Navigate to="/admin/pending-payments" replace />} />
+          <Route path="wages" element={<Navigate to="/admin/pending-payments" replace />} />
           <Route path="delivery-wage-settings" element={<AdminDeliveryWageSettings />} />
           <Route path="export" element={<AdminExport />} />
           <Route path="discounts" element={<AdminDiscounts />} />

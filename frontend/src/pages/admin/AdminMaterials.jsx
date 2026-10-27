@@ -85,6 +85,10 @@ const INITIAL_PURCHASE_FORM = {
   enable_precut: false,
   processed_quantity: "",
   precut_outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT }],
+  has_buyer_wage: false,
+  buyer_worker_id: "",
+  buyer_wage_amount: "",
+  buyer_wage_notes: "",
 };
 
 const INITIAL_ADJUSTMENT_FORM = {
@@ -122,6 +126,7 @@ export default function AdminMaterials() {
   const [materials, setMaterials] = useState([]);
   const [purchases, setPurchases] = useState([]);
   const [stockSummary, setStockSummary] = useState([]);
+  const [workers, setWorkers] = useState([]);
   const [loading, setLoading] = useState(true);
 
   // Materials filter & search
@@ -248,11 +253,22 @@ export default function AdminMaterials() {
     }
   };
 
+  const loadWorkers = async () => {
+    try {
+      const res = await api.get("/admin/workers");
+      setWorkers(Array.isArray(res.data) ? res.data : []);
+    } catch (err) {
+      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") return;
+      console.error("Error loading workers:", err);
+    }
+  };
+
   useEffect(() => {
     loadMaterials();
     loadPurchases();
     loadStockSummary();
     loadTransformations();
+    loadWorkers();
   }, []);
 
   const openAddModal = () => {
@@ -362,7 +378,14 @@ export default function AdminMaterials() {
       enable_precut: false,
       processed_quantity: "",
       precut_outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: presetMaterial?.unit || "pcs" }],
+      has_buyer_wage: false,
+      buyer_worker_id: "",
+      buyer_wage_amount: "",
+      buyer_wage_notes: "",
     });
+    if (workers.length === 0) {
+      loadWorkers();
+    }
     setPurchaseModalOpen(true);
   };
 
@@ -372,6 +395,15 @@ export default function AdminMaterials() {
     if (!purchaseForm.purchase_date) return toast.error("Tanggal pembelian wajib diisi");
     if (!purchaseForm.quantity || Number(purchaseForm.quantity) <= 0) return toast.error("Jumlah (quantity) harus lebih besar dari 0");
     if (purchaseForm.unit_price === "" || Number(purchaseForm.unit_price) < 0) return toast.error("Harga satuan tidak valid");
+
+    if (purchaseForm.has_buyer_wage) {
+      if (!purchaseForm.buyer_worker_id) {
+        return toast.error("Pekerja pembeli wajib dipilih jika upah diaktifkan");
+      }
+      if (!purchaseForm.buyer_wage_amount || Number(purchaseForm.buyer_wage_amount) <= 0) {
+        return toast.error("Nominal upah pembelian bahan harus lebih besar dari 0");
+      }
+    }
 
     if (purchaseForm.enable_precut) {
       const procQ = Number(purchaseForm.processed_quantity || 0);
@@ -399,6 +431,14 @@ export default function AdminMaterials() {
         supplier_name: purchaseForm.supplier_name.trim(),
         notes: purchaseForm.notes.trim(),
       };
+
+      if (purchaseForm.has_buyer_wage && purchaseForm.buyer_worker_id && Number(purchaseForm.buyer_wage_amount) > 0) {
+        payload.buyer_worker_id = purchaseForm.buyer_worker_id;
+        payload.buyer_wage_amount = Number(purchaseForm.buyer_wage_amount);
+        if (purchaseForm.buyer_wage_notes?.trim()) {
+          payload.buyer_wage_notes = purchaseForm.buyer_wage_notes.trim();
+        }
+      }
 
       if (purchaseForm.enable_precut && Number(purchaseForm.processed_quantity) > 0) {
         payload.stock_processing = {
@@ -1545,7 +1585,12 @@ export default function AdminMaterials() {
                             {p.total_amount} {p.currency}
                           </td>
                           <td className="px-4 py-3 text-xs text-[#5C4A3D]">
-                            {p.supplier_name || "-"}
+                            <div>{p.supplier_name || "-"}</div>
+                            {p.buyer_worker_name && (
+                              <div className="text-[11px] text-amber-800 font-medium mt-0.5" title={`No. Kewajiban: ${p.buyer_wage_obligation_number || "-"}`}>
+                                Upah: {p.buyer_worker_name} ({p.buyer_wage_amount} LE)
+                              </div>
+                            )}
                           </td>
                           <td className="px-4 py-3">
                             <Badge
@@ -2142,6 +2187,76 @@ export default function AdminMaterials() {
                   data-testid="purchase-form-supplier"
                   className="bg-white text-xs"
                 />
+              </div>
+
+              {/* UPAH PEKERJA PEMBELI (Phase Wage Recovery) */}
+              <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-3 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="enable-buyer-wage"
+                      checked={purchaseForm.has_buyer_wage || false}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setPurchaseForm({
+                          ...purchaseForm,
+                          has_buyer_wage: checked,
+                          buyer_worker_id: checked ? (purchaseForm.buyer_worker_id || workers[0]?.id || "") : "",
+                          buyer_wage_amount: checked ? purchaseForm.buyer_wage_amount : "",
+                        });
+                      }}
+                      className="rounded border-[#C8B89E] text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
+                      data-testid="purchase-form-enable-wage"
+                    />
+                    <Label htmlFor="enable-buyer-wage" className="text-xs font-semibold text-[#5C4A3D] cursor-pointer">
+                      Catat Upah Belanja / Pengambilan Bahan untuk Pekerja
+                    </Label>
+                  </div>
+                </div>
+
+                {purchaseForm.has_buyer_wage && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-amber-200/60">
+                    <div>
+                      <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                        Pilih Pekerja Pembeli <span className="text-red-500">*</span>
+                      </Label>
+                      <Select
+                        value={purchaseForm.buyer_worker_id}
+                        onValueChange={(val) => setPurchaseForm({ ...purchaseForm, buyer_worker_id: val })}
+                      >
+                        <SelectTrigger className="bg-white text-xs" data-testid="purchase-form-buyer-worker">
+                          <SelectValue placeholder="-- Pilih Pekerja --" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {workers.map((w) => (
+                            <SelectItem key={w.id} value={w.id}>
+                              {w.name} ({w.role})
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div>
+                      <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
+                        Nominal Upah (LE / EGP) <span className="text-red-500">*</span>
+                      </Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        min="0.01"
+                        placeholder="Contoh: 50"
+                        value={purchaseForm.buyer_wage_amount}
+                        onChange={(e) => setPurchaseForm({ ...purchaseForm, buyer_wage_amount: e.target.value })}
+                        data-testid="purchase-form-buyer-wage-amount"
+                        className="bg-white text-xs"
+                      />
+                      <span className="text-[10px] text-[#8B7355] mt-0.5 block">
+                        Otomatis masuk ke rekap Upah Pekerja dan dicairkan via menu Upah Pekerja.
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div>

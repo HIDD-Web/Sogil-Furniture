@@ -21,7 +21,11 @@ import {
   RotateCcw,
   Users,
   Coins,
-  Receipt
+  Receipt,
+  Layers,
+  Package,
+  Truck,
+  Scissors
 } from "lucide-react";
 
 export const generateUUID = () => {
@@ -35,10 +39,54 @@ export const generateUUID = () => {
   });
 };
 
+export const getCategoryBadge = (taskCategory) => {
+  const cat = (taskCategory || "").toLowerCase();
+  if (cat === "material_purchase") {
+    return {
+      label: "Belanja Bahan",
+      className: "bg-amber-100 text-amber-900 border-amber-300",
+      type: "material_purchase",
+    };
+  }
+  if (cat === "delivery") {
+    return {
+      label: "Upah Pengiriman",
+      className: "bg-purple-100 text-purple-900 border-purple-300",
+      type: "delivery",
+    };
+  }
+  if (cat === "custom" || cat === "helper") {
+    return {
+      label: "Upah Helper / Pesanan",
+      className: "bg-orange-100 text-orange-900 border-orange-300",
+      type: "custom",
+    };
+  }
+  return {
+    label: "Upah Produksi",
+    className: "bg-blue-100 text-blue-900 border-blue-300",
+    type: "production",
+  };
+};
+
+export const getStatusBadge = (status) => {
+  switch (status) {
+    case "paid":
+      return { label: "Lunas", className: "bg-emerald-100 text-emerald-800 border-emerald-300" };
+    case "partially_paid":
+      return { label: "Sebagian", className: "bg-blue-100 text-blue-800 border-blue-300" };
+    case "voided":
+      return { label: "Dibatalkan", className: "bg-gray-100 text-gray-700 border-gray-300" };
+    case "accrued":
+    default:
+      return { label: "Terutang", className: "bg-amber-100 text-amber-800 border-amber-300" };
+  }
+};
+
 const money = (v) => formatMoney(v, "EGP");
 
-export default function AdminWorkerPendingWages() {
-  const [activeTab, setActiveTab] = useState("workers"); // "workers" | "obligations" | "settlements"
+export default function AdminWorkerPendingWages({ defaultTab = "obligations" }) {
+  const [activeTab, setActiveTab] = useState(defaultTab); // "obligations" | "workers" | "supplier" | "settlements"
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -50,8 +98,13 @@ export default function AdminWorkerPendingWages() {
 
   // Filter states
   const [selectedWorkerFilter, setSelectedWorkerFilter] = useState("all");
+  const [categoryFilter, setCategoryFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("pending");
   const [searchQuery, setSearchQuery] = useState("");
+
+  // Obligation Detail Modal state
+  const [selectedObligation, setSelectedObligation] = useState(null);
+  const [obligationDetailModalOpen, setObligationDetailModalOpen] = useState(false);
 
   // Settlement Modal state
   const [settleModalOpen, setSettleModalOpen] = useState(false);
@@ -90,7 +143,8 @@ export default function AdminWorkerPendingWages() {
           params: {
             worker_id: selectedWorkerFilter !== "all" ? selectedWorkerFilter : undefined,
             status: statusFilter,
-            limit: 200,
+            task_category: categoryFilter !== "all" ? categoryFilter : undefined,
+            limit: 300,
           }
         }),
         api.get("/admin/wages/settlements", {
@@ -115,7 +169,7 @@ export default function AdminWorkerPendingWages() {
 
   useEffect(() => {
     loadData();
-  }, [selectedWorkerFilter, statusFilter]);
+  }, [selectedWorkerFilter, statusFilter, categoryFilter]);
 
   const openSettleModal = async (worker) => {
     setSettleWorker(worker);
@@ -270,16 +324,50 @@ export default function AdminWorkerPendingWages() {
     }
   };
 
+  const openObligationDetail = (ob) => {
+    setSelectedObligation(ob);
+    setObligationDetailModalOpen(true);
+  };
+
   // Filtered obligations for table
   const filteredObligations = obligations.filter((o) => {
-    if (!searchQuery) return true;
-    const q = searchQuery.toLowerCase();
-    return (
-      (o.worker_name || "").toLowerCase().includes(q) ||
-      (o.obligation_number || "").toLowerCase().includes(q) ||
-      (o.order_number || "").toLowerCase().includes(q) ||
-      (o.task_category || "").toLowerCase().includes(q)
-    );
+    // 1. Category Filter
+    if (categoryFilter !== "all") {
+      const cat = (o.task_category || "").toLowerCase();
+      if (categoryFilter === "material_purchase" && cat !== "material_purchase") return false;
+      if (categoryFilter === "delivery" && cat !== "delivery") return false;
+      if (categoryFilter === "custom" && cat !== "custom" && cat !== "helper") return false;
+      if (categoryFilter === "production" && (cat === "material_purchase" || cat === "delivery" || cat === "custom" || cat === "helper")) return false;
+    }
+
+    // 2. Worker Filter
+    if (selectedWorkerFilter !== "all") {
+      if (String(o.worker_id) !== String(selectedWorkerFilter)) return false;
+    }
+
+    // 3. Status Filter
+    if (statusFilter === "pending") {
+      if (o.status !== "accrued" && o.status !== "partially_paid") return false;
+      if (Number(o.remaining_amount_le || 0) <= 0) return false;
+    } else if (statusFilter !== "all") {
+      if (o.status !== statusFilter) return false;
+    }
+
+    // 4. Search Filter
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      const match =
+        (o.worker_name || "").toLowerCase().includes(q) ||
+        (o.obligation_number || "").toLowerCase().includes(q) ||
+        (o.order_number || "").toLowerCase().includes(q) ||
+        (o.purchase_number || "").toLowerCase().includes(q) ||
+        (o.material_name || "").toLowerCase().includes(q) ||
+        (o.notes || "").toLowerCase().includes(q) ||
+        (o.task_category || "").toLowerCase().includes(q);
+      if (!match) return false;
+    }
+
+    return true;
   });
 
   return (
@@ -287,11 +375,16 @@ export default function AdminWorkerPendingWages() {
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="font-heading text-xl sm:text-2xl font-bold text-[#2C1E16]">
-            Upah Pekerja & Kewajiban Terutang
-          </h1>
+          <div className="flex items-center gap-2">
+            <h1 className="font-heading text-xl sm:text-2xl font-bold text-[#2C1E16]">
+              Pending Payment
+            </h1>
+            <span className="rounded-full bg-amber-100 border border-amber-300 px-2.5 py-0.5 text-[10px] font-bold text-amber-900 uppercase tracking-wide">
+              Terpadu
+            </span>
+          </div>
           <p className="mt-0.5 text-xs sm:text-sm text-[#8B7355]">
-            Rekapitulasi hak upah pekerja produksi, status pelunasan, dan pencatatan kas keluar.
+            Pusat pemantauan seluruh kewajiban pembayaran terutang, rincian per kategori/pekerja, dan pencatatan pelunasan kas.
           </p>
         </div>
         <Button
@@ -308,7 +401,7 @@ export default function AdminWorkerPendingWages() {
       <div className="grid grid-cols-2 gap-2.5 sm:gap-4 lg:grid-cols-4" data-testid="wages-summary-cards">
         <div className="rounded-xl sm:rounded-2xl border border-amber-200 bg-amber-50/60 p-3.5 sm:p-5 shadow-xs">
           <div className="flex items-center justify-between">
-            <span className="text-xs sm:text-sm font-medium text-amber-900">Total Upah Terutang</span>
+            <span className="text-xs sm:text-sm font-medium text-amber-900">Total Kewajiban Terutang</span>
             <Clock size={16} className="text-amber-700" />
           </div>
           <div className="mt-2 font-heading text-lg sm:text-2xl font-bold text-amber-950 truncate" data-testid="total-pending-wages">
@@ -360,11 +453,22 @@ export default function AdminWorkerPendingWages() {
       </div>
 
       {/* Tabs Control */}
-      <div className="flex border-b border-[#E5DCC5] text-xs sm:text-sm">
+      <div className="flex border-b border-[#E5DCC5] text-xs sm:text-sm overflow-x-auto">
+        <button
+          onClick={() => setActiveTab("obligations")}
+          data-testid="tab-obligations"
+          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px shrink-0 ${
+            activeTab === "obligations"
+              ? "border-[#8B5A2B] text-[#8B5A2B] font-bold"
+              : "border-transparent text-[#5C4A3D] hover:text-[#2C1E16]"
+          }`}
+        >
+          Semua Kewajiban
+        </button>
         <button
           onClick={() => setActiveTab("workers")}
           data-testid="tab-workers"
-          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px ${
+          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px shrink-0 ${
             activeTab === "workers"
               ? "border-[#8B5A2B] text-[#8B5A2B] font-bold"
               : "border-transparent text-[#5C4A3D] hover:text-[#2C1E16]"
@@ -373,26 +477,26 @@ export default function AdminWorkerPendingWages() {
           Ringkasan per Pekerja
         </button>
         <button
-          onClick={() => setActiveTab("obligations")}
-          data-testid="tab-obligations"
-          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px ${
-            activeTab === "obligations"
+          onClick={() => setActiveTab("supplier")}
+          data-testid="tab-supplier"
+          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px shrink-0 ${
+            activeTab === "supplier"
               ? "border-[#8B5A2B] text-[#8B5A2B] font-bold"
               : "border-transparent text-[#5C4A3D] hover:text-[#2C1E16]"
           }`}
         >
-          Daftar Seluruh Kewajiban
+          Utang Supplier <span className="ml-1 text-[10px] text-amber-800 bg-amber-100 border border-amber-200 px-1.5 py-0.2 rounded-full font-normal">Fase 2</span>
         </button>
         <button
           onClick={() => setActiveTab("settlements")}
           data-testid="tab-settlements"
-          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px ${
+          className={`px-4 py-2.5 font-medium transition-colors border-b-2 -mb-px shrink-0 ${
             activeTab === "settlements"
               ? "border-[#8B5A2B] text-[#8B5A2B] font-bold"
               : "border-transparent text-[#5C4A3D] hover:text-[#2C1E16]"
           }`}
         >
-          Riwayat Pelunasan (Settlement)
+          Riwayat Pembayaran
         </button>
       </div>
 
@@ -404,7 +508,184 @@ export default function AdminWorkerPendingWages() {
         </div>
       )}
 
-      {/* TAB 1: WORKERS SUMMARY */}
+      {/* TAB 1: ALL OBLIGATIONS (SEMUA KEWAJIBAN TERPADU) */}
+      {activeTab === "obligations" && (
+        <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 shadow-xs" data-testid="all-obligations-card">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2 w-full">
+              {/* Search */}
+              <div className="relative flex-1 min-w-[200px] sm:max-w-xs">
+                <Search size={14} className="absolute left-3 top-2.5 text-[#8B7355]" />
+                <Input
+                  placeholder="Cari no. kewajiban, pekerja, pesanan, bahan..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-8 text-xs bg-white border-[#E5DCC5]"
+                  data-testid="search-obligations-input"
+                />
+              </div>
+
+              {/* Category Filter */}
+              <Select value={categoryFilter} onValueChange={setCategoryFilter}>
+                <SelectTrigger className="w-44 text-xs bg-white border-[#E5DCC5]" data-testid="category-filter-select">
+                  <SelectValue placeholder="Semua Kategori" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Semua Kategori</SelectItem>
+                  <SelectItem value="production">Upah Produksi</SelectItem>
+                  <SelectItem value="delivery">Upah Pengiriman</SelectItem>
+                  <SelectItem value="custom">Upah Helper / Pesanan</SelectItem>
+                  <SelectItem value="material_purchase">Belanja Bahan</SelectItem>
+                </SelectContent>
+              </Select>
+
+              {/* Worker Filter */}
+              <Select value={selectedWorkerFilter} onValueChange={setSelectedWorkerFilter}>
+                <SelectTrigger className="w-40 text-xs bg-white border-[#E5DCC5]" data-testid="worker-filter-select">
+                  <SelectValue placeholder="Semua Pekerja" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">Semua Pekerja</SelectItem>
+                  {workersList.map((w) => (
+                    <SelectItem key={w.id || w._id} value={w.id || w._id}>
+                      {w.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              {/* Status Filter */}
+              <Select value={statusFilter} onValueChange={setStatusFilter}>
+                <SelectTrigger className="w-36 text-xs bg-white border-[#E5DCC5]" data-testid="status-filter-select">
+                  <SelectValue placeholder="Status" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="pending">Terutang (Aktif)</SelectItem>
+                  <SelectItem value="accrued">Belum Dibayar</SelectItem>
+                  <SelectItem value="partially_paid">Sebagian Lunas</SelectItem>
+                  <SelectItem value="paid">Lunas</SelectItem>
+                  <SelectItem value="all">Semua Status</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="py-8 text-center text-xs text-[#8B7355]">Memuat daftar kewajiban pembayaran...</div>
+          ) : filteredObligations.length === 0 ? (
+            <div className="py-8 text-center text-xs sm:text-sm text-[#8B7355]" data-testid="empty-obligations-msg">
+              Tidak ada data kewajiban pembayaran yang cocok dengan kriteria filter.
+            </div>
+          ) : (
+            <div className="overflow-x-auto -mx-1 sm:mx-0">
+              <table className="w-full text-xs sm:text-sm min-w-[920px]">
+                <thead className="text-left text-xs uppercase text-[#8B7355] border-b border-[#F1EBE0]">
+                  <tr>
+                    <th className="py-2.5">Tanggal</th>
+                    <th>No. Kewajiban</th>
+                    <th>Kategori</th>
+                    <th>Pekerja</th>
+                    <th>Dokumen Sumber</th>
+                    <th className="text-right">Total Akru</th>
+                    <th className="text-right">Dibayar</th>
+                    <th className="text-right">Sisa Terutang</th>
+                    <th className="text-center">Status</th>
+                    <th className="text-center w-28">Aksi</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredObligations.map((o) => {
+                    const catBadge = getCategoryBadge(o.task_category);
+                    const statBadge = getStatusBadge(o.status);
+                    return (
+                      <tr
+                        key={o.id || o.obligation_number}
+                        className="border-b border-[#F1EBE0] hover:bg-[#FBF9F4] transition-colors"
+                        data-testid={`obligation-row-${o.id || o.obligation_number}`}
+                      >
+                        <td className="py-3 text-[11px] text-[#8B7355]">
+                          {o.created_at ? o.created_at.slice(0, 10) : "—"}
+                        </td>
+                        <td>
+                          <div className="font-semibold text-[#8B5A2B]">{o.obligation_number}</div>
+                          {o.notes && (
+                            <div className="text-[10px] text-[#8B7355] truncate max-w-[140px]" title={o.notes}>
+                              {o.notes}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold border ${catBadge.className}`}>
+                            {catBadge.label}
+                          </span>
+                        </td>
+                        <td className="font-medium text-[#2C1E16]">{o.worker_name}</td>
+                        <td>
+                          {o.task_category === "material_purchase" ? (
+                            <div className="flex flex-col">
+                              <span className="font-mono text-xs text-amber-900 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 inline-block w-fit">
+                                {o.purchase_number || "—"}
+                              </span>
+                              {o.material_name && (
+                                <span className="text-[10px] text-[#8B7355] mt-0.5 truncate max-w-[120px]" title={o.material_name}>
+                                  {o.material_name}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="font-mono text-xs text-[#5C4A3D]">
+                              {o.order_number || (o.trip_id ? `Trip:${String(o.trip_id).slice(-4)}` : "—")}
+                            </span>
+                          )}
+                        </td>
+                        <td className="text-right text-[#5C4A3D]">{money(o.total_amount_le)}</td>
+                        <td className="text-right text-emerald-700">{money(o.paid_amount_le)}</td>
+                        <td className="text-right font-bold text-amber-900">{money(o.remaining_amount_le)}</td>
+                        <td className="text-center">
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase border ${statBadge.className}`}>
+                            {statBadge.label}
+                          </span>
+                        </td>
+                        <td className="text-center">
+                          <div className="flex items-center justify-center gap-1.5">
+                            <button
+                              onClick={() => openObligationDetail(o)}
+                              className="p-1 text-[#8B5A2B] hover:text-[#6D4522] rounded hover:bg-[#F1EBE0]"
+                              title="Lihat Detail Sumber"
+                              data-testid={`detail-ob-btn-${o.id || o.obligation_number}`}
+                            >
+                              <Eye size={14} />
+                            </button>
+                            {Number(o.remaining_amount_le || 0) > 0 && o.status !== "voided" && (
+                              <Button
+                                size="sm"
+                                onClick={() => {
+                                  const workerObj = summary?.workers_summary?.find((w) => w.worker_id === o.worker_id) || {
+                                    worker_id: o.worker_id,
+                                    worker_name: o.worker_name,
+                                    total_le: o.remaining_amount_le,
+                                  };
+                                  openSettleModal(workerObj);
+                                }}
+                                data-testid={`settle-btn-${o.worker_id || o.id}`}
+                                className="rounded bg-[#8B5A2B] text-white hover:bg-[#6D4522] text-[11px] h-7 px-2"
+                              >
+                                Bayar
+                              </Button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: WORKERS SUMMARY */}
       {activeTab === "workers" && (
         <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 shadow-xs" data-testid="workers-summary-card">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
@@ -413,7 +694,7 @@ export default function AdminWorkerPendingWages() {
                 Daftar Akun Pekerja & Saldo Terutang
               </h2>
               <p className="text-xs text-[#8B7355] mt-0.5">
-                Pilih pekerja untuk melihat kewajiban yang siap dilunasi.
+                Pilih pekerja untuk melihat kewajiban yang siap dilunasi secara batch.
               </p>
             </div>
           </div>
@@ -471,107 +752,42 @@ export default function AdminWorkerPendingWages() {
         </div>
       )}
 
-      {/* TAB 2: ALL OBLIGATIONS */}
-      {activeTab === "obligations" && (
-        <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-4 sm:p-5 shadow-xs" data-testid="all-obligations-card">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-              {/* Search */}
-              <div className="relative flex-1 sm:w-56">
-                <Search size={14} className="absolute left-3 top-2.5 text-[#8B7355]" />
-                <Input
-                  placeholder="Cari pekerja / pesanan..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-8 text-xs bg-white border-[#E5DCC5]"
-                  data-testid="search-obligations-input"
-                />
+      {/* TAB 3: SUPPLIER PAYABLES (PLACEHOLDER FASE 2) */}
+      {activeTab === "supplier" && (
+        <div className="rounded-xl sm:rounded-2xl border border-[#E5DCC5] bg-white p-5 sm:p-6 shadow-xs" data-testid="supplier-payable-placeholder">
+          <div className="max-w-xl mx-auto text-center py-6 sm:py-8 space-y-4">
+            <div className="mx-auto w-12 h-12 rounded-2xl bg-amber-100 flex items-center justify-center text-amber-800">
+              <Layers size={24} />
+            </div>
+            <div>
+              <div className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-200 uppercase tracking-wider mb-2">
+                Rencana Rilis Tahap 2
               </div>
+              <h2 className="font-heading font-bold text-[#2C1E16] text-lg sm:text-xl">
+                Kewajiban Supplier (Bahan Baku Tempo)
+              </h2>
+              <p className="text-xs sm:text-sm text-[#8B7355] mt-1.5 leading-relaxed">
+                Modul pencatatan tagihan dan utang supplier tempo sedang dipersiapkan untuk rilis tahap kedua sistem Pending Payment.
+              </p>
+            </div>
 
-              {/* Status Filter */}
-              <Select value={statusFilter} onValueChange={setStatusFilter}>
-                <SelectTrigger className="w-36 text-xs bg-white border-[#E5DCC5]" data-testid="status-filter-select">
-                  <SelectValue placeholder="Status" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="pending">Terutang (Aktif)</SelectItem>
-                  <SelectItem value="accrued">Belum Dibayar</SelectItem>
-                  <SelectItem value="partially_paid">Sebagian Lunas</SelectItem>
-                  <SelectItem value="paid">Lunas</SelectItem>
-                  <SelectItem value="all">Semua Status</SelectItem>
-                </SelectContent>
-              </Select>
+            <div className="text-left rounded-xl bg-[#FBF9F4] border border-[#E5DCC5] p-4 text-xs text-[#5C4A3D] space-y-2">
+              <div className="font-semibold text-[#2C1E16] flex items-center gap-1.5">
+                <CheckCircle2 size={14} className="text-amber-700" /> Status Arsitektur Saat Ini:
+              </div>
+              <p className="text-[#8B7355]">
+                Seluruh pembelian bahan baku di menu <span className="font-semibold text-[#2C1E16]">Bahan</span> saat ini dicatat sebagai transaksi kas tunai seketika ke modul Keuangan.
+              </p>
+              <div className="font-semibold text-[#2C1E16] flex items-center gap-1.5 pt-1">
+                <ArrowRight size={14} className="text-amber-700" /> Pada Rilis Tahap 2:
+              </div>
+              <ul className="list-disc list-inside space-y-1 text-[#8B7355] pl-1">
+                <li>Opsi pembelian tempo / utang supplier akan diaktifkan di form pembelian bahan.</li>
+                <li>Tagihan supplier yang belum dibayar akan muncul otomatis di tab ini.</li>
+                <li>Pelunasan utang supplier dapat dicairkan bertahap dan memotong kas Finance saat pembayaran riil terjadi.</li>
+              </ul>
             </div>
           </div>
-
-          {loading ? (
-            <div className="py-8 text-center text-xs text-[#8B7355]">Memuat daftar kewajiban...</div>
-          ) : filteredObligations.length === 0 ? (
-            <div className="py-8 text-center text-xs sm:text-sm text-[#8B7355]" data-testid="empty-obligations-msg">
-              Tidak ada data kewajiban upah yang cocok dengan filter.
-            </div>
-          ) : (
-            <div className="overflow-x-auto -mx-1 sm:mx-0">
-              <table className="w-full text-xs sm:text-sm min-w-[800px]">
-                <thead className="text-left text-xs uppercase text-[#8B7355] border-b border-[#F1EBE0]">
-                  <tr>
-                    <th className="py-2.5">No. Kewajiban</th>
-                    <th>Pekerja</th>
-                    <th>Pesanan</th>
-                    <th>Tugas</th>
-                    <th className="text-center">Basis</th>
-                    <th className="text-right">Total Akru</th>
-                    <th className="text-right">Dibayar</th>
-                    <th className="text-right">Sisa Saldo</th>
-                    <th className="text-center">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredObligations.map((o) => (
-                    <tr
-                      key={o.id || o.obligation_number}
-                      className="border-b border-[#F1EBE0] hover:bg-[#FBF9F4] transition-colors"
-                      data-testid={`obligation-row-${o.id}`}
-                    >
-                      <td className="py-3 font-semibold text-[#8B5A2B]">{o.obligation_number}</td>
-                      <td className="font-medium text-[#2C1E16]">{o.worker_name}</td>
-                      <td>
-                        <span className="font-mono text-xs">{o.order_number || "—"}</span>
-                      </td>
-                      <td className="capitalize text-[#5C4A3D]">{o.task_category || "—"}</td>
-                      <td className="text-center text-xs text-[#8B7355]">
-                        {o.pricing_basis === "lump_sum" ? "Borongan" : "Per Unit"}
-                      </td>
-                      <td className="text-right text-[#5C4A3D]">{money(o.total_amount_le)}</td>
-                      <td className="text-right text-emerald-700">{money(o.paid_amount_le)}</td>
-                      <td className="text-right font-bold text-amber-900">{money(o.remaining_amount_le)}</td>
-                      <td className="text-center">
-                        <span
-                          className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase ${
-                            o.status === "paid"
-                              ? "bg-emerald-100 text-emerald-800"
-                              : o.status === "partially_paid"
-                              ? "bg-blue-100 text-blue-800"
-                              : o.status === "voided"
-                              ? "bg-gray-100 text-gray-700"
-                              : "bg-amber-100 text-amber-800"
-                          }`}
-                        >
-                          {o.status === "paid"
-                            ? "Lunas"
-                            : o.status === "partially_paid"
-                            ? "Sebagian"
-                            : o.status === "voided"
-                            ? "Void"
-                            : "Terutang"}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
         </div>
       )}
 
@@ -1208,6 +1424,220 @@ export default function AdminWorkerPendingWages() {
                 <span className="font-semibold">Pembayaran Dibatalkan:</span> {selectedSettlement.void_reason || "Tidak ada alasan tercatat."}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* OBLIGATION DETAIL MODAL (GATE 3) */}
+      {obligationDetailModalOpen && selectedObligation && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
+          onClick={() => setObligationDetailModalOpen(false)}
+          data-testid="obligation-detail-modal"
+        >
+          <div
+            className="relative w-full max-w-lg sm:max-w-xl max-h-[90vh] overflow-y-auto rounded-2xl border border-[#E5DCC5] bg-white p-5 sm:p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-[#F1EBE0] pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-heading text-lg font-bold text-[#2C1E16]">
+                    Rincian Sumber Kewajiban
+                  </h3>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold border ${getCategoryBadge(selectedObligation.task_category).className}`}>
+                    {getCategoryBadge(selectedObligation.task_category).label}
+                  </span>
+                </div>
+                <p className="text-xs text-[#8B7355] mt-0.5 font-mono">
+                  {selectedObligation.obligation_number}
+                </p>
+              </div>
+              <button
+                onClick={() => setObligationDetailModalOpen(false)}
+                className="p-1.5 text-[#8B7355] hover:text-[#2C1E16] rounded-lg hover:bg-[#FBF9F4]"
+                data-testid="close-obligation-detail-btn"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Financial Overview */}
+            <div className="mt-4 grid grid-cols-3 gap-2 rounded-xl bg-[#FBF9F4] p-3 border border-[#E5DCC5] text-center">
+              <div>
+                <span className="text-[11px] text-[#8B7355]">Total Akrual</span>
+                <div className="font-heading font-bold text-[#2C1E16] text-sm sm:text-base">
+                  {money(selectedObligation.total_amount_le)}
+                </div>
+              </div>
+              <div>
+                <span className="text-[11px] text-[#8B7355]">Telah Dibayar</span>
+                <div className="font-heading font-bold text-emerald-700 text-sm sm:text-base">
+                  {money(selectedObligation.paid_amount_le)}
+                </div>
+              </div>
+              <div>
+                <span className="text-[11px] text-[#8B7355]">Sisa Terutang</span>
+                <div className="font-heading font-bold text-amber-950 text-sm sm:text-base" data-testid="detail-modal-remaining-amount">
+                  {money(selectedObligation.remaining_amount_le)}
+                </div>
+              </div>
+            </div>
+
+            {/* Penerima & Status */}
+            <div className="mt-4 space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-3 py-2 border-b border-[#F1EBE0]">
+                <div>
+                  <span className="text-[#8B7355] block">Pekerja Penerima</span>
+                  <span className="font-semibold text-[#2C1E16] text-sm" data-testid="detail-modal-worker-name">{selectedObligation.worker_name}</span>
+                  <span className="text-[10px] text-[#8B7355] block font-mono">ID: {selectedObligation.worker_id}</span>
+                </div>
+                <div>
+                  <span className="text-[#8B7355] block">Status Kewajiban</span>
+                  <span className={`inline-block mt-0.5 rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase border ${getStatusBadge(selectedObligation.status).className}`}>
+                    {getStatusBadge(selectedObligation.status).label}
+                  </span>
+                </div>
+              </div>
+
+              {/* Basis & Tarif */}
+              <div className="grid grid-cols-3 gap-2 py-2 border-b border-[#F1EBE0]">
+                <div>
+                  <span className="text-[#8B7355] block">Basis Perhitungan</span>
+                  <span className="font-medium text-[#2C1E16] capitalize">
+                    {selectedObligation.pricing_basis === "lump_sum" ? "Borongan" : selectedObligation.pricing_basis === "tiered" ? "Bertingkat" : "Per Unit"}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[#8B7355] block">Tarif Satuan</span>
+                  <span className="font-medium text-[#2C1E16]">{selectedObligation.rate_le} LE</span>
+                </div>
+                <div>
+                  <span className="text-[#8B7355] block">Jumlah Unit</span>
+                  <span className="font-medium text-[#2C1E16]">{selectedObligation.accepted_quantity || 1}</span>
+                </div>
+              </div>
+
+              {/* DETAIL SUMBER KONTEKSTUAL */}
+              <div className="py-2 border-b border-[#F1EBE0] space-y-1.5" data-testid="detail-modal-source-section">
+                <span className="text-[11px] font-bold text-[#8B5A2B] uppercase tracking-wider block">
+                  Referensi Dokumen Sumber
+                </span>
+
+                {selectedObligation.task_category === "material_purchase" ? (
+                  <div className="rounded-lg bg-amber-50/60 p-2.5 border border-amber-200 text-xs space-y-1">
+                    <div className="flex justify-between">
+                      <span className="text-amber-900 font-medium">No. Pembelian Bahan:</span>
+                      <span className="font-mono font-bold text-amber-950" data-testid="detail-modal-ref-number">{selectedObligation.purchase_number || "—"}</span>
+                    </div>
+                    {selectedObligation.material_name && (
+                      <div className="flex justify-between">
+                        <span className="text-amber-900 font-medium">Bahan Terkait:</span>
+                        <span className="text-amber-950 font-semibold">{selectedObligation.material_name}</span>
+                      </div>
+                    )}
+                    {selectedObligation.material_purchase_id && (
+                      <div className="flex justify-between text-[11px]">
+                        <span className="text-amber-800">ID Pembelian:</span>
+                        <span className="font-mono text-amber-900">{selectedObligation.material_purchase_id}</span>
+                      </div>
+                    )}
+                  </div>
+                ) : selectedObligation.task_category === "delivery" ? (
+                  <div className="rounded-lg bg-purple-50/60 p-2.5 border border-purple-200 text-xs space-y-1">
+                    <div className="flex justify-between">
+                      <span className="text-purple-900 font-medium">No. Pesanan Logistik:</span>
+                      <span className="font-mono font-bold text-purple-950" data-testid="detail-modal-ref-number">{selectedObligation.order_number || "—"}</span>
+                    </div>
+                    {selectedObligation.trip_id && (
+                      <div className="flex justify-between">
+                        <span className="text-purple-900 font-medium">ID Trip Logistik:</span>
+                        <span className="font-mono text-purple-950">{selectedObligation.trip_id}</span>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="rounded-lg bg-blue-50/60 p-2.5 border border-blue-200 text-xs space-y-1">
+                    <div className="flex justify-between">
+                      <span className="text-blue-900 font-medium">No. Pesanan / SPK:</span>
+                      <span className="font-mono font-bold text-blue-950" data-testid="detail-modal-ref-number">{selectedObligation.order_number || "—"}</span>
+                    </div>
+                    {selectedObligation.work_assignment_id && (
+                      <div className="flex justify-between">
+                        <span className="text-blue-900 font-medium">ID Penugasan Kerja:</span>
+                        <span className="font-mono text-blue-950">{selectedObligation.work_assignment_id}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* RIWAYAT ALOKASI SETTLEMENT */}
+              {selectedObligation.settlement_allocations && selectedObligation.settlement_allocations.length > 0 && (
+                <div className="py-2 border-b border-[#F1EBE0]">
+                  <span className="text-[11px] font-bold text-[#8B5A2B] uppercase tracking-wider block mb-1.5">
+                    Riwayat Pencairan Upah (Settlement)
+                  </span>
+                  <div className="space-y-1">
+                    {selectedObligation.settlement_allocations.map((alloc, aidx) => (
+                      <div key={aidx} className="flex justify-between items-center bg-[#FBF9F4] p-2 rounded border border-[#E5DCC5]">
+                        <div>
+                          <span className="font-mono font-semibold text-[#8B5A2B]">{alloc.settlement_number}</span>
+                          <span className="text-[10px] text-[#8B7355] block">{alloc.date || alloc.created_at?.slice(0, 10)}</span>
+                        </div>
+                        <span className="font-bold text-emerald-800">{money(alloc.amount_le)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* CATATAN & AUDIT */}
+              <div className="py-1 text-[11px] text-[#8B7355] space-y-1">
+                {selectedObligation.notes && (
+                  <div>
+                    <span className="font-semibold text-[#5C4A3D]">Catatan: </span>
+                    <span>{selectedObligation.notes}</span>
+                  </div>
+                )}
+                <div>
+                  <span>Dibuat: {selectedObligation.created_at ? new Date(selectedObligation.created_at).toLocaleString("id-ID") : "—"}</span>
+                  {selectedObligation.verified_by_name && (
+                    <span> • Diverifikasi oleh: {selectedObligation.verified_by_name}</span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer Buttons */}
+            <div className="mt-5 flex justify-end gap-2 border-t border-[#F1EBE0] pt-3">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setObligationDetailModalOpen(false)}
+                className="rounded-lg text-xs"
+              >
+                Tutup
+              </Button>
+              {Number(selectedObligation.remaining_amount_le || 0) > 0 && selectedObligation.status !== "voided" && (
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setObligationDetailModalOpen(false);
+                    const workerObj = summary?.workers_summary?.find((w) => w.worker_id === selectedObligation.worker_id) || {
+                      worker_id: selectedObligation.worker_id,
+                      worker_name: selectedObligation.worker_name,
+                      total_le: selectedObligation.remaining_amount_le,
+                    };
+                    openSettleModal(workerObj);
+                  }}
+                  className="rounded-lg bg-[#8B5A2B] text-white hover:bg-[#6D4522] text-xs"
+                  data-testid="detail-modal-settle-btn"
+                >
+                  <Coins size={13} className="mr-1" /> Bayar Upah Pekerja Ini
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       )}

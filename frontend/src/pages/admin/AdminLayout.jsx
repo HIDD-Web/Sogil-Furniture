@@ -34,7 +34,7 @@ export default function AdminLayout() {
     { to: "/admin/products", label: "Produk", icon: Package, show: perms.modify_products || isOwner },
     { to: "/admin/materials", label: "Bahan", icon: Layers, show: perms.modify_products || perms.access_finance || isOwner },
     { to: "/admin/finance", label: "Keuangan", icon: Wallet, show: perms.access_finance || isOwner },
-    { to: "/admin/wages/pending", label: "Upah Pekerja", icon: CircleDollarSign, show: perms.access_finance || isOwner },
+    { to: "/admin/pending-payments", label: "Pending Payment", icon: Clock, show: perms.access_finance || isOwner },
     { to: "/admin/delivery-wage-settings", label: "Upah Kirim", icon: Coins, show: perms.access_finance || isOwner },
     { to: "/admin/export", label: "Export Data", icon: Wallet, show: perms.access_finance || perms.manage_orders || isOwner },
     { to: "/admin/discounts", label: "Diskon", icon: Ticket, show: perms.manage_settings || isOwner },

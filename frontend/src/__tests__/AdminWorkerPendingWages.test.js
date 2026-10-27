@@ -66,14 +66,62 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
     {
       id: "ob_1",
       obligation_number: "WOB-202610-0001",
+      worker_id: "w_1",
       worker_name: "Ahmed Tukang",
       order_number: "ORD-101",
-      task_category: "frame",
+      task_category: "production",
       pricing_basis: "per_unit",
       total_amount_le: 300.0,
       paid_amount_le: 100.0,
       remaining_amount_le: 200.0,
       status: "partially_paid",
+      created_at: "2026-10-25T10:00:00Z",
+    },
+    {
+      id: "ob_2",
+      obligation_number: "WOB-202610-0002",
+      worker_id: "w_2",
+      worker_name: "Budi Helper",
+      order_number: "ORD-102",
+      trip_id: "trip_99",
+      task_category: "delivery",
+      pricing_basis: "tiered",
+      total_amount_le: 50.0,
+      paid_amount_le: 0.0,
+      remaining_amount_le: 50.0,
+      status: "accrued",
+      created_at: "2026-10-26T11:00:00Z",
+    },
+    {
+      id: "ob_3",
+      obligation_number: "WOB-202610-0003",
+      worker_id: "w_1",
+      worker_name: "Ahmed Tukang",
+      order_number: "ORD-103",
+      work_assignment_id: "asgn_01",
+      task_category: "custom",
+      pricing_basis: "lump_sum",
+      total_amount_le: 150.0,
+      paid_amount_le: 0.0,
+      remaining_amount_le: 150.0,
+      status: "accrued",
+      created_at: "2026-10-26T12:00:00Z",
+    },
+    {
+      id: "ob_4",
+      obligation_number: "WOB-202610-0004",
+      worker_id: "w_1",
+      worker_name: "Ahmed Tukang",
+      purchase_number: "PB-202610-0001",
+      material_purchase_id: "pb_01",
+      material_name: "Kayu Jati",
+      task_category: "material_purchase",
+      pricing_basis: "lump_sum",
+      total_amount_le: 75.0,
+      paid_amount_le: 0.0,
+      remaining_amount_le: 75.0,
+      status: "accrued",
+      created_at: "2026-10-27T08:00:00Z",
     },
   ];
 
@@ -174,6 +222,12 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
   test("renders workers summary table row with Bayar Upah button", async () => {
     await act(async () => {
       root.render(<AdminWorkerPendingWages />);
+    });
+
+    const tabWorkers = container.querySelector('[data-testid="tab-workers"]');
+    expect(tabWorkers).not.toBeNull();
+    await act(async () => {
+      tabWorkers.click();
     });
 
     const row = container.querySelector('[data-testid="worker-summary-row-w_1"]');
@@ -618,5 +672,84 @@ describe("AdminWorkerPendingWages - Unit & Component Mount Tests", () => {
     // 4. Modal remains open and inputs preserved without auto-submitting
     expect(container.querySelector('[data-testid="settle-wage-modal"]')).not.toBeNull();
     expect(submitBtn.disabled).toBe(false);
+  });
+
+  test("13. renders all 4 wage categories together in Tab 1 (Semua Kewajiban)", async () => {
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    // Check Tab 1 is active and card exists
+    const allObligationsCard = container.querySelector('[data-testid="all-obligations-card"]');
+    expect(allObligationsCard).not.toBeNull();
+
+    // Verify all 4 categories are represented in the table
+    const row1 = container.querySelector('[data-testid="obligation-row-ob_1"]');
+    const row2 = container.querySelector('[data-testid="obligation-row-ob_2"]');
+    const row3 = container.querySelector('[data-testid="obligation-row-ob_3"]');
+    const row4 = container.querySelector('[data-testid="obligation-row-ob_4"]');
+
+    expect(row1).not.toBeNull();
+    expect(row2).not.toBeNull();
+    expect(row3).not.toBeNull();
+    expect(row4).not.toBeNull();
+
+    // Check category labels
+    expect(row1.textContent).toContain("Upah Produksi");
+    expect(row2.textContent).toContain("Upah Pengiriman");
+    expect(row3.textContent).toContain("Upah Helper / Pesanan");
+    expect(row4.textContent).toContain("Belanja Bahan");
+
+    // Check source references
+    expect(row1.textContent).toContain("ORD-101");
+    expect(row2.textContent).toContain("ORD-102");
+    expect(row3.textContent).toContain("ORD-103");
+    expect(row4.textContent).toContain("PB-202610-0001");
+    expect(row4.textContent).toContain("Kayu Jati");
+  });
+
+  test("14. clicking detail button opens ObligationDetailModal with canonical source data", async () => {
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const detailBtn4 = container.querySelector('[data-testid="detail-ob-btn-ob_4"]');
+    expect(detailBtn4).not.toBeNull();
+
+    await act(async () => {
+      detailBtn4.click();
+    });
+
+    const modal = container.querySelector('[data-testid="obligation-detail-modal"]');
+    expect(modal).not.toBeNull();
+    expect(modal.textContent).toContain("WOB-202610-0004");
+    expect(modal.textContent).toContain("Belanja Bahan");
+    expect(modal.textContent).toContain("PB-202610-0001");
+    expect(modal.textContent).toContain("Kayu Jati");
+
+    const closeBtn = container.querySelector('[data-testid="close-obligation-detail-btn"]');
+    expect(closeBtn).not.toBeNull();
+    await act(async () => {
+      closeBtn.click();
+    });
+    expect(container.querySelector('[data-testid="obligation-detail-modal"]')).toBeNull();
+  });
+
+  test("15. Tab 3 (Utang Supplier) renders phase 2 placeholder without fake data", async () => {
+    await act(async () => {
+      root.render(<AdminWorkerPendingWages />);
+    });
+
+    const tabSupplier = container.querySelector('[data-testid="tab-supplier"]');
+    expect(tabSupplier).not.toBeNull();
+
+    await act(async () => {
+      tabSupplier.click();
+    });
+
+    const placeholder = container.querySelector('[data-testid="supplier-payable-placeholder"]');
+    expect(placeholder).not.toBeNull();
+    expect(placeholder.textContent).toContain("Kewajiban Supplier (Bahan Baku Tempo)");
+    expect(placeholder.textContent).toContain("Rencana Rilis Tahap 2");
   });
 });
