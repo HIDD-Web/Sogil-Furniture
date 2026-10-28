@@ -421,7 +421,8 @@ class TestWagePolicyAPI:
             "default_wage_per_unit_le": 75.0,
             "unusual_amount_threshold_le": 150.0,
             "max_wage_per_unit_le": 400.0,
-            "enabled": True
+            "enabled": True,
+            "change_reason": "Konfigurasi awal upah produksi"
         })
         with patch("server.db", mdb), patch("server.record_audit_log", AsyncMock()) as mock_audit:
             res = await admin_update_wage_policy_endpoint("production", req, admin=owner_admin)
@@ -490,7 +491,8 @@ class TestWagePolicyAPI:
                 "unusual_amount_threshold_le": 100.0,
                 "max_wage_per_purchase_le": 300.0,
                 "max_buyers": 4,
-                "enabled": True
+                "enabled": True,
+                "change_reason": "Pengaturan awal belanja bahan"
             })
             res = await admin_update_wage_policy_endpoint("material_purchase", req, admin=owner_admin)
             assert res["is_configured"] is True
@@ -503,7 +505,8 @@ class TestWagePolicyAPI:
                 "unusual_amount_threshold_le": 100.0,
                 "max_wage_per_purchase_le": 300.0,
                 "max_buyers": 5,
-                "enabled": True
+                "enabled": True,
+                "change_reason": "Update batas buyer menjadi 5"
             })
             res5 = await admin_update_wage_policy_endpoint("material_purchase", req_boundary_5, admin=owner_admin)
             assert res5["max_buyers"] == 5
@@ -514,7 +517,8 @@ class TestWagePolicyAPI:
                 "unusual_amount_threshold_le": 100.0,
                 "max_wage_per_purchase_le": 300.0,
                 "max_buyers": 1,
-                "enabled": True
+                "enabled": True,
+                "change_reason": "Update batas buyer menjadi 1"
             })
             res1 = await admin_update_wage_policy_endpoint("material_purchase", req_boundary_1, admin=owner_admin)
             assert res1["max_buyers"] == 1
@@ -574,7 +578,8 @@ class TestWagePolicyAPI:
                 "default_recipient_id": admin_user_id,
                 "unusual_amount_threshold_le": 50.0,
                 "max_wage_per_order_le": 150.0,
-                "enabled": True
+                "enabled": True,
+                "change_reason": "Set upah admin dan penerima default Sarah"
             })
             res = await admin_update_wage_policy_endpoint("admin", req_valid, admin=owner_admin)
             assert res["is_configured"] is True
@@ -630,7 +635,8 @@ class TestWagePolicyAPI:
                 "base_wage_per_order_le": 70.0,
                 "unusual_amount_threshold_le": 140.0,
                 "max_helper_wage_per_order_le": 600.0,
-                "enabled": True
+                "enabled": True,
+                "change_reason": "Penyesuaian tarif pengiriman lewat endpoint baru"
             })
             new_put = await admin_update_wage_policy_endpoint("delivery", req_new, admin=owner_admin)
             assert new_put["base_wage_per_order_le"] == 70.0

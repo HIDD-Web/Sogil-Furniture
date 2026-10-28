@@ -6267,6 +6267,7 @@ class DeliveryWagePolicyInput(BaseModel):
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
     enabled: Optional[bool] = True
+    change_reason: Optional[str] = Field(None, max_length=500, description="Alasan perubahan kebijakan upah")
 
 class ProductionWagePolicyInput(BaseModel):
     default_wage_per_unit_le: float = Field(..., ge=0.0, description="Tarif dasar upah per unit produksi")
@@ -6275,6 +6276,7 @@ class ProductionWagePolicyInput(BaseModel):
     enabled: bool = True
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
+    change_reason: Optional[str] = Field(None, max_length=500, description="Alasan perubahan kebijakan upah")
 
 class MaterialPurchaseWagePolicyInput(BaseModel):
     default_wage_per_purchase_le: float = Field(..., ge=0.0, description="Tarif dasar upah belanja bahan per transaksi")
@@ -6284,6 +6286,7 @@ class MaterialPurchaseWagePolicyInput(BaseModel):
     enabled: bool = True
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
+    change_reason: Optional[str] = Field(None, max_length=500, description="Alasan perubahan kebijakan upah")
 
 class AdminWagePolicyInput(BaseModel):
     default_wage_per_order_le: float = Field(..., ge=0.0, description="Tarif upah admin per pesanan")
@@ -6293,6 +6296,7 @@ class AdminWagePolicyInput(BaseModel):
     enabled: bool = True
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
+    change_reason: Optional[str] = Field(None, max_length=500, description="Alasan perubahan kebijakan upah")
 
 class DeliveryWagePreviewInput(BaseModel):
     total_wage_le: Optional[float] = None
@@ -6406,6 +6410,7 @@ async def get_active_delivery_wage_policy(db_inst=None) -> dict:
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
+        "last_change_reason": val.get("last_change_reason"),
         "is_configured": is_configured
     }
 
@@ -6437,6 +6442,7 @@ async def get_active_production_wage_policy(db_inst=None) -> dict:
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
+        "last_change_reason": val.get("last_change_reason"),
         "is_configured": is_configured
     }
 
@@ -6469,6 +6475,7 @@ async def get_active_material_purchase_wage_policy(db_inst=None) -> dict:
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
+        "last_change_reason": val.get("last_change_reason"),
         "is_configured": is_configured
     }
 
@@ -6502,6 +6509,7 @@ async def get_active_admin_wage_policy(db_inst=None) -> dict:
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
+        "last_change_reason": val.get("last_change_reason"),
         "is_configured": is_configured
     }
 
@@ -7896,28 +7904,57 @@ async def admin_update_delivery_wage_policy(
     for k in ["base_wage_per_order_le", "unusual_amount_threshold_le", "max_helper_wage_per_order_le", "enabled"]:
         if old_policy.get(k) != new_policy_val.get(k):
             changed_keys.append(k)
+    if not old_policy.get("is_configured"):
+        changed_keys.append("is_configured")
 
-    await db.settings.update_one(
-        {"key": "delivery_wage_policy"},
-        {"$set": {"key": "delivery_wage_policy", "value": new_policy_val, "updated_at": now_iso}},
-        upsert=True
-    )
+    if not changed_keys:
+        res_noop = dict(old_policy)
+        res_noop["is_configured"] = True
+        res_noop["no_op"] = True
+        res_noop["message"] = "Tidak ada perubahan konfigurasi terdeteksi."
+        return clean(res_noop)
 
-    await record_audit_log(
-        action="update_delivery_wage_policy",
-        entity_type="delivery_wage_policy",
-        entity_id="delivery_wage_policy",
-        entity_identifier="delivery_wage_policy",
-        admin=admin,
-        metadata={
-            "previous": old_policy,
-            "new": new_policy_val,
-            "changed_fields": changed_keys
-        }
-    )
+    legacy_reason = (getattr(payload, "change_reason", None) or "").strip()
+    if legacy_reason:
+        if len(legacy_reason) < 3:
+            raise HTTPException(status_code=422, detail="Alasan perubahan kebijakan wajib diisi minimal 3 karakter.")
+        if len(legacy_reason) > 500:
+            raise HTTPException(status_code=422, detail="Alasan perubahan kebijakan maksimal 500 karakter.")
+    else:
+        legacy_reason = "Pembaruan kebijakan upah pengiriman (legacy endpoint)"
+
+    new_policy_val["last_change_reason"] = legacy_reason
+
+    client = getattr(db, "client", None)
+    async def _do_legacy_update(sess):
+        kw = {"session": sess} if sess else {}
+        await db.settings.update_one(
+            {"key": "delivery_wage_policy"},
+            {"$set": {"key": "delivery_wage_policy", "value": new_policy_val, "updated_at": now_iso}},
+            upsert=True,
+            **kw
+        )
+
+        await record_audit_log(
+            action="update_delivery_wage_policy",
+            entity_type="delivery_wage_policy",
+            entity_id="delivery_wage_policy",
+            entity_identifier="delivery_wage_policy",
+            admin=admin,
+            metadata={
+                "previous": old_policy,
+                "new": new_policy_val,
+                "changed_fields": changed_keys,
+                "change_reason": legacy_reason
+            },
+            session=sess
+        )
+
+    await execute_transaction_with_safety(client, _do_legacy_update)
 
     result_policy = dict(new_policy_val)
     result_policy["is_configured"] = True
+    result_policy["no_op"] = False
     return clean(result_policy)
 
 @api_router.get("/admin/wage-policies")
@@ -8129,30 +8166,63 @@ async def admin_update_wage_policy_endpoint(
         tracked_keys = ["default_wage_per_order_le", "default_recipient_id", "unusual_amount_threshold_le", "max_wage_per_order_le", "enabled"]
 
     changed_keys = [k for k in tracked_keys if old_policy.get(k) != new_policy_val.get(k)]
+    if not old_policy.get("is_configured"):
+        changed_keys.append("is_configured")
 
+    if not changed_keys:
+        res_noop = dict(old_policy)
+        res_noop["is_configured"] = True
+        res_noop["no_op"] = True
+        res_noop["message"] = "Tidak ada perubahan konfigurasi terdeteksi."
+        return clean(res_noop)
+
+    # Validate mandatory reason on genuine changes
+    change_reason = (body.get("change_reason") or getattr(payload, "change_reason", None) or "").strip()
+    if not change_reason or len(change_reason) < 3:
+        raise HTTPException(
+            status_code=422,
+            detail="Alasan perubahan kebijakan wajib diisi minimal 3 karakter."
+        )
+    if len(change_reason) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail="Alasan perubahan kebijakan maksimal 500 karakter."
+        )
+
+    new_policy_val["last_change_reason"] = change_reason
     setting_key = f"{category}_wage_policy"
-    await db.settings.update_one(
-        {"key": setting_key},
-        {"$set": {"key": setting_key, "value": new_policy_val, "updated_at": now_iso}},
-        upsert=True
-    )
 
-    await record_audit_log(
-        action=f"update_{category}_wage_policy",
-        entity_type=f"{category}_wage_policy",
-        entity_id=setting_key,
-        entity_identifier=setting_key,
-        admin=admin,
-        metadata={
-            "category": category,
-            "previous": old_policy,
-            "new": new_policy_val,
-            "changed_fields": changed_keys
-        }
-    )
+    client = getattr(db, "client", None)
+    async def _do_policy_update(sess):
+        kw = {"session": sess} if sess else {}
+        await db.settings.update_one(
+            {"key": setting_key},
+            {"$set": {"key": setting_key, "value": new_policy_val, "updated_at": now_iso}},
+            upsert=True,
+            **kw
+        )
+
+        await record_audit_log(
+            action=f"update_{category}_wage_policy",
+            entity_type=f"{category}_wage_policy",
+            entity_id=setting_key,
+            entity_identifier=setting_key,
+            admin=admin,
+            metadata={
+                "category": category,
+                "previous": old_policy,
+                "new": new_policy_val,
+                "changed_fields": changed_keys,
+                "change_reason": change_reason
+            },
+            session=sess
+        )
+
+    await execute_transaction_with_safety(client, _do_policy_update)
 
     result_policy = dict(new_policy_val)
     result_policy["is_configured"] = True
+    result_policy["no_op"] = False
     return clean(result_policy)
 
 @api_router.get("/admin/wage-policies/{category}/history")
