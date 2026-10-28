@@ -407,4 +407,109 @@ describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => 
       expect(amountInput.value).toBe("400");
     });
   });
+
+  describe("Phase 08.2 — Multi-Worker Production Wage Flow UI Tests", () => {
+    let container = null;
+    let root = null;
+
+    beforeEach(() => {
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+    });
+
+    afterEach(() => {
+      act(() => {
+        if (root) root.unmount();
+      });
+      if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
+      }
+      container = null;
+      root = null;
+      jest.clearAllMocks();
+    });
+
+    test("renders multi-worker assignment modal with capacity and wage preview", async () => {
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        payment_status: "dp",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 3,
+            category: "table",
+            subtotal_le: 1500,
+          },
+        ],
+        payments: [],
+      };
+
+      const dummyWorkers = [
+        { id: "w1", name: "Ahmad Tukang Kayu", role: "employee" },
+        { id: "w2", name: "Budi Finishing", role: "employee" },
+        { id: "w3", name: "Citra Assembling", role: "employee" },
+      ];
+
+      const dummyPolicy = {
+        default_wage_per_unit_le: 100.0,
+        unusual_amount_threshold_le: 200.0,
+        max_wage_per_unit_le: 500.0,
+        is_configured: true,
+        enabled: true,
+      };
+
+      const dummyAssignments = [
+        {
+          id: "asn_01",
+          order_item_id: "itm_001",
+          task_category: "whole_item",
+          worker_id: "w1",
+          worker_name: "Ahmad Tukang Kayu",
+          target_quantity: 1,
+          status: "in_progress",
+        },
+      ];
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: dummyAssignments });
+        if (url.includes("/workers")) return Promise.resolve({ data: dummyWorkers });
+        if (url.includes("/wage-policies/production")) return Promise.resolve({ data: dummyPolicy });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // Open assign modal
+      const assignBtn = container.querySelector('[data-testid="btn-assign-item-0"]');
+      expect(assignBtn).not.toBeNull();
+
+      await act(async () => {
+        assignBtn.click();
+      });
+
+      // Verify Capacity Display: Ordered: 3, Assigned: 1, Remaining: 2
+      expect(container.textContent).toContain("Dipesan");
+      expect(container.textContent).toContain("3 unit");
+      expect(container.textContent).toContain("Ditugaskan");
+      expect(container.textContent).toContain("1 unit");
+      expect(container.textContent).toContain("Sisa Tersedia");
+      expect(container.textContent).toContain("2 unit");
+
+      // Verify Worker Selection List: Ahmad, Budi, Citra
+      expect(container.textContent).toContain("Ahmad Tukang Kayu");
+      expect(container.textContent).toContain("Budi Finishing");
+      expect(container.textContent).toContain("Citra Assembling");
+
+      // Verify Wage Estimation Preview
+      expect(container.textContent).toContain("Estimasi Total Upah");
+    });
+  });
 });

@@ -42,6 +42,7 @@ import AdminFinance from "./pages/admin/AdminFinance";
 import AdminFinanceStats from "./pages/admin/AdminFinanceStats";
 import AdminWorkerPendingWages from "./pages/admin/AdminWorkerPendingWages";
 import AdminDeliveryWageSettings from "./pages/admin/AdminDeliveryWageSettings";
+import AdminWageSettings from "./pages/admin/AdminWageSettings";
 import AdminLogistics from "./pages/admin/AdminLogistics";
 import AdminExport from "./pages/admin/AdminExport";
 import AdminAdmins from "./pages/admin/AdminAdmins";
@@ -136,6 +137,7 @@ function Layout() {
           <Route path="pending-payments" element={<AdminWorkerPendingWages />} />
           <Route path="wages/pending" element={<Navigate to="/admin/pending-payments" replace />} />
           <Route path="wages" element={<Navigate to="/admin/pending-payments" replace />} />
+          <Route path="wage-settings" element={<AdminWageSettings />} />
           <Route path="delivery-wage-settings" element={<AdminDeliveryWageSettings />} />
           <Route path="export" element={<AdminExport />} />
           <Route path="discounts" element={<AdminDiscounts />} />

@@ -884,12 +884,13 @@ class WageRuleUpdate(BaseModel):
     active: Optional[bool] = None
 
 class WorkAssignmentCreateInput(BaseModel):
-    worker_id: str
+    worker_id: Optional[str] = None
+    worker_ids: Optional[List[str]] = None
     order_item_id: str
     task_category: str
-    pricing_basis: str  # "per_unit" | "lump_sum"
-    agreed_rate_le: float
-    target_quantity: int
+    pricing_basis: Optional[str] = "per_unit"  # "per_unit" | "lump_sum"
+    agreed_rate_le: Optional[float] = None
+    target_quantity: int = 1
     wage_rule_id: Optional[str] = None
     rate_override_reason: Optional[str] = None
     task_notes: Optional[str] = ""
@@ -3597,20 +3598,66 @@ async def admin_get_order_assignments(
     order_id_str = str(order.get("_id") or order.get("id"))
     assignments = await db.work_assignments.find({"order_id": order_id_str}).to_list(500)
 
-    # Enrich with worker name
-    worker_ids = list({a.get("worker_id") for a in assignments if a.get("worker_id")})
+    # Collect all worker IDs across assignments (multi-worker worker_ids and legacy worker_id)
+    all_worker_ids = set()
+    for a in assignments:
+        if a.get("worker_ids") and isinstance(a.get("worker_ids"), list):
+            all_worker_ids.update(str(w) for w in a.get("worker_ids") if w)
+        if a.get("worker_id"):
+            all_worker_ids.add(str(a.get("worker_id")))
+
     workers_map = {}
-    if worker_ids:
-        worker_docs = await db.admins.find({"_id": {"$in": [ObjectId(w) for w in worker_ids if ObjectId.is_valid(w)]}}).to_list(len(worker_ids))
+    if all_worker_ids:
+        worker_docs = await db.admins.find({"_id": {"$in": [id_query(w) for w in all_worker_ids]}}).to_list(len(all_worker_ids))
         for w in worker_docs:
             workers_map[str(w["_id"])] = w.get("name", "Worker")
 
     result = []
     for a in assignments:
         ca = clean(a)
-        ca["worker_name"] = workers_map.get(ca.get("worker_id"), ca.get("worker_name", "Worker"))
+        # Multi-worker formatting
+        wids = ca.get("worker_ids") or ([ca.get("worker_id")] if ca.get("worker_id") else [])
+        ca_workers = [
+            {"worker_id": wid, "worker_name": workers_map.get(wid, "Worker")}
+            for wid in wids
+        ]
+        ca["workers"] = ca_workers
+        if len(ca_workers) > 1:
+            ca["worker_name"] = ", ".join(w["worker_name"] for w in ca_workers)
+        elif len(ca_workers) == 1:
+            ca["worker_name"] = ca_workers[0]["worker_name"]
+        else:
+            ca["worker_name"] = workers_map.get(ca.get("worker_id"), ca.get("worker_name", "Worker"))
         result.append(ca)
     return result
+
+class LoopBoundLock:
+    """Asyncio Lock that binds lazily to the current running event loop.
+    Prevents Python 3.9 'attached to a different loop' errors when test runners create new loops per test.
+    """
+    def __init__(self):
+        self._locks = {}
+
+    def _get_lock(self) -> asyncio.Lock:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        key = id(loop) if loop else 0
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+
+    async def __aenter__(self):
+        return await self._get_lock().__aenter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await self._get_lock().__aexit__(exc_type, exc_val, exc_tb)
+
+_assignment_capacity_lock = LoopBoundLock()
+_assignment_verify_lock = LoopBoundLock()
+_wage_mutation_lock = LoopBoundLock()
+_assignment_cancel_lock = _wage_mutation_lock
 
 @api_router.post("/admin/orders/{order_id}/assignments", status_code=201)
 async def admin_create_work_assignment(
@@ -3630,109 +3677,244 @@ async def admin_create_work_assignment(
     if not matched_item:
         raise HTTPException(status_code=404, detail=f"Item pesanan dengan ID {payload.order_item_id} tidak ditemukan pada pesanan ini")
 
-    # 2. Validate Worker exists
-    worker = await db.admins.find_one({"_id": id_query(payload.worker_id)})
-    if not worker:
-        raise HTTPException(status_code=404, detail="Pekerja/Pengrajin tidak ditemukan dalam sistem")
+    ordered_qty = int(matched_item.get("quantity", 1))
+
+    # 2. Validate Multi-worker list (1-5 workers, C1)
+    if payload.worker_ids is not None:
+        raw_wids = payload.worker_ids
+    elif payload.worker_id:
+        raw_wids = [payload.worker_id]
+    else:
+        raise HTTPException(status_code=422, detail="Setidaknya satu pekerja wajib dipilih (1-5 pekerja).")
+
+    if not isinstance(raw_wids, list) or len(raw_wids) == 0:
+        raise HTTPException(status_code=422, detail="Setidaknya satu pekerja wajib dipilih (1-5 pekerja).")
+    if len(raw_wids) > 5:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Jumlah pekerja dalam satu penugasan tidak boleh melebihi 5 orang (diberikan: {len(raw_wids)})"
+        )
+
+    # Check for duplicate worker IDs
+    clean_wids = [str(w).strip() for w in raw_wids if str(w).strip()]
+    if len(clean_wids) != len(raw_wids):
+        raise HTTPException(status_code=422, detail="ID pekerja tidak valid atau kosong")
+    if len(set(clean_wids)) != len(clean_wids):
+        raise HTTPException(
+            status_code=422,
+            detail="Daftar pekerja memuat ID duplikat. Setiap pekerja hanya boleh didaftarkan satu kali per penugasan."
+        )
+
+    # Validate workers exist in db.admins and are active
+    workers_list = []
+    found_map = {}
+    for wid in clean_wids:
+        w_doc = await db.admins.find_one({"_id": id_query(wid)})
+        if not w_doc:
+            raise HTTPException(status_code=404, detail=f"Pekerja/Pengrajin dengan ID '{wid}' tidak ditemukan dalam sistem")
+        if w_doc.get("status") == "inactive":
+            raise HTTPException(status_code=422, detail=f"Pekerja '{w_doc.get('name', wid)}' berstatus tidak aktif dan tidak dapat ditugaskan")
+        found_map[wid] = w_doc
+        workers_list.append({"worker_id": wid, "worker_name": w_doc.get("name", "Worker")})
+
+    primary_worker_id = clean_wids[0]
+    primary_worker_name = workers_list[0]["worker_name"]
 
     # 3. Validate task category & pricing basis
     cat = (payload.task_category or "").strip()
     if cat not in CONTROLLED_TASK_CATEGORIES:
         raise HTTPException(status_code=422, detail=f"Kategori tugas {cat!r} tidak valid. Pilihan: {list(CONTROLLED_TASK_CATEGORIES)}")
-    basis = (payload.pricing_basis or "").strip().lower()
+    basis = (payload.pricing_basis or "per_unit").strip().lower()
     if basis not in ("per_unit", "lump_sum"):
         raise HTTPException(status_code=422, detail=f"Dasar tarif {basis!r} tidak valid. Pilihan: per_unit, lump_sum")
 
-    # 4. Validate agreed rate & quantity
-    dec_rate = validate_rate_precision(payload.agreed_rate_le)
-    rate_flt = float(dec_rate)
-    if payload.target_quantity <= 0:
+    # 4. Validate Target Quantity and Active Capacity Invariant (C3 & C4)
+    target_qty = int(payload.target_quantity)
+    if target_qty <= 0:
         raise HTTPException(status_code=422, detail="Kuantitas target harus lebih besar dari 0")
-    if payload.target_quantity > int(matched_item.get("quantity", 1)):
+    if target_qty > ordered_qty:
         raise HTTPException(status_code=422, detail="Kuantitas target penugasan tidak boleh melebihi kuantitas item pesanan")
 
-    # 5. Check duplicate active assignment for this worker on this item & category
-    existing_active = await db.work_assignments.find_one({
-        "order_item_id": payload.order_item_id,
-        "worker_id": payload.worker_id,
-        "task_category": cat,
-        "status": {"$in": ["assigned", "in_progress", "ready_for_review", "accruing"]}
-    })
-    if existing_active:
-        raise HTTPException(status_code=409, detail="Pekerja ini sudah memiliki penugasan aktif untuk kategori tugas pada item pesanan ini")
+    # 4. Concurrency Guard: Enforce Active Capacity Invariant under Serialization Lock (Audit 2)
+    async with _assignment_capacity_lock:
+        # Invariant: total_active_assigned_quantity + target_qty <= ordered_quantity for this task category
+        # Active assignments are those not cancelled: ["assigned", "in_progress", "ready_for_review", "accruing", "completed"]
+        existing_assignments_cursor = db.work_assignments.find({
+            "order_id": order_id_str,
+            "order_item_id": payload.order_item_id,
+            "task_category": cat,
+            "status": {"$in": ["assigned", "in_progress", "ready_for_review", "accruing", "completed"]}
+        })
+        to_list_fn = getattr(existing_assignments_cursor, "to_list", None)
+        existing_assignments = await to_list_fn(500) if callable(to_list_fn) else []
 
-    now = datetime.now(timezone.utc).isoformat()
-    doc = {
-        "order_id": order_id_str,
-        "order_number": order.get("order_number"),
-        "order_item_id": payload.order_item_id,
-        "worker_id": payload.worker_id,
-        "worker_name": worker.get("name", "Worker"),
-        "task_category": cat,
-        "pricing_basis": basis,
-        "agreed_rate_le": rate_flt,
-        "currency": "EGP",
-        "target_quantity": payload.target_quantity,
-        "reported_quantity": 0,
-        "accepted_quantity": 0,
-        "status": "assigned",
-        "wage_rule_id": payload.wage_rule_id or None,
-        "rate_override_reason": payload.rate_override_reason or None,
-        "task_notes": (payload.task_notes or "").strip(),
-        "assigned_by_id": admin.get("id"),
-        "assigned_by_name": admin.get("name", "Admin"),
-        "instance_ids": payload.instance_ids or [],
-        "assignment_group_id": payload.assignment_group_id or None,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    async def _do_create(sess):
-        ins_kw = {"session": sess} if sess else {}
-        if payload.instance_ids:
-            res_itm = db.item_instances.update_many(
-                {"instance_id": {"$in": payload.instance_ids}},
-                {"$set": {"status": "assigned", "assigned_worker_id": payload.worker_id, "updated_at": now}, "$inc": {"claim_generation": 1}},
-                **ins_kw
+        currently_assigned_qty = sum(int(a.get("target_quantity", 1)) for a in existing_assignments)
+        remaining_qty = max(0, ordered_qty - currently_assigned_qty)
+        if target_qty > remaining_qty:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Kuantitas target penugasan ({target_qty}) melebihi sisa kapasitas unit yang tersedia ({remaining_qty} dari total {ordered_qty} unit pesanan)"
             )
-            if inspect.isawaitable(res_itm):
-                await res_itm
-        res = db.work_assignments.insert_one(doc, **ins_kw)
-        if inspect.isawaitable(res):
-            res = await res
-        doc["_id"] = str(getattr(res, "inserted_id", res))
-        await create_outbox_event(
-            event_type="assignment.created",
-            aggregate_type="work_assignment",
-            aggregate_id=doc["_id"],
-            payload={
-                "assignment_id": doc["_id"],
-                "worker_id": payload.worker_id,
-                "order_id": order_id_str,
-                "order_item_id": payload.order_item_id,
-                "target_quantity": payload.target_quantity,
-                "agreed_rate_le": rate_flt,
-                "instance_ids": payload.instance_ids or [],
-            },
-            session=sess
-        )
 
-    session = None
-    try:
-        try:
-            session = await client.start_session()
-        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError):
-            session = None
+        # 5. Check duplicate active assignment for any assigned worker on this item & category
+        active_statuses = {"assigned", "in_progress", "ready_for_review", "accruing"}
+        for a in existing_assignments:
+            if a.get("status") in active_statuses and a.get("task_category") == cat:
+                a_wids = set(str(w) for w in (a.get("worker_ids") or []))
+                if a.get("worker_id"):
+                    a_wids.add(str(a.get("worker_id")))
+                for wid in clean_wids:
+                    if wid in a_wids:
+                        w_name = found_map.get(wid, {}).get("name", wid)
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Pekerja '{w_name}' sudah memiliki penugasan aktif untuk kategori tugas pada item pesanan ini"
+                        )
 
-        if session is not None:
-            async with session:
-                async with session.start_transaction():
-                    await _do_create(session)
+        # 6. Evaluate Rate from Production Wage Policy & Manual Override Semantics (C2 & C7)
+        prod_policy = await get_active_production_wage_policy(db_inst=db)
+        is_policy_active = bool(prod_policy.get("is_configured") and prod_policy.get("enabled"))
+
+        is_override = False
+        override_reason = None
+        rate_flt = None
+
+        if is_policy_active:
+            default_rate = _num(prod_policy.get("default_wage_per_unit_le"))
+            threshold = _num(prod_policy.get("unusual_amount_threshold_le"))
+            hard_cap = _num(prod_policy.get("max_wage_per_unit_le"))
+
+            if payload.agreed_rate_le is None:
+                rate_flt = default_rate
+            else:
+                dec_rate = validate_rate_precision(payload.agreed_rate_le)
+                rate_flt = float(dec_rate)
+                if rate_flt < 0:
+                    raise HTTPException(status_code=422, detail="Nominal tarif upah tidak boleh bernilai negatif")
+                if hard_cap is not None and rate_flt > hard_cap:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Tarif upah ({rate_flt} LE) melebihi batas maksimum keras ({hard_cap} LE) pada kebijakan produksi."
+                    )
+                if (default_rate is not None and rate_flt != default_rate) or (threshold is not None and rate_flt > threshold):
+                    is_override = True
+                    if admin.get("role") != "owner":
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Hanya Owner yang berwenang melakukan penyesuaian (override) tarif upah produksi di luar tarif standar."
+                        )
+                    reason = (payload.rate_override_reason or "").strip()
+                    if not reason or len(reason) < 3:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Alasan penyesuaian tarif manual wajib diisi minimal 3 karakter."
+                        )
+                    override_reason = reason
         else:
-            await _do_create(None)
-        return clean(doc)
-    except pymongo.errors.DuplicateKeyError:
-        raise HTTPException(status_code=409, detail="Penugasan serupa sudah terdaftar")
+            # Policy is NOT active / configured:
+            # If payload.agreed_rate_le is None OR this is a multi-worker assignment (Phase 08.2), fail-closed!
+            if payload.agreed_rate_le is None or payload.worker_ids is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Kebijakan upah produksi belum dikonfigurasi atau belum diaktifkan oleh Owner. Konfigurasikan kebijakan terlebih dahulu di Pengaturan Upah."
+                )
+            # Legacy single-worker fallback when rate is explicitly provided
+            dec_rate = validate_rate_precision(payload.agreed_rate_le)
+            rate_flt = float(dec_rate)
+            if rate_flt < 0:
+                raise HTTPException(status_code=422, detail="Nominal tarif upah tidak boleh bernilai negatif")
+            if payload.rate_override_reason:
+                is_override = True
+                override_reason = payload.rate_override_reason.strip()
+
+        now = datetime.now(timezone.utc).isoformat()
+        doc = {
+            "order_id": order_id_str,
+            "order_number": order.get("order_number"),
+            "order_item_id": payload.order_item_id,
+            "worker_id": primary_worker_id,
+            "worker_name": primary_worker_name,
+            "worker_ids": clean_wids,
+            "workers": workers_list,
+            "task_category": cat,
+            "pricing_basis": basis,
+            "agreed_rate_le": rate_flt,
+            "currency": "EGP",
+            "target_quantity": target_qty,
+            "reported_quantity": 0,
+            "accepted_quantity": 0,
+            "status": "assigned",
+            "wage_rule_id": payload.wage_rule_id or None,
+            "is_override": is_override,
+            "rate_override_reason": override_reason,
+            "task_notes": (payload.task_notes or "").strip(),
+            "assigned_by_id": admin.get("id"),
+            "assigned_by_name": admin.get("name", "Admin"),
+            "instance_ids": payload.instance_ids or [],
+            "assignment_group_id": payload.assignment_group_id or None,
+            "rate_policy_snapshot": {
+                "is_configured": prod_policy.get("is_configured", False),
+                "enabled": prod_policy.get("enabled", False),
+                "default_wage_per_unit_le": prod_policy.get("default_wage_per_unit_le"),
+                "unusual_amount_threshold_le": prod_policy.get("unusual_amount_threshold_le"),
+                "max_wage_per_unit_le": prod_policy.get("max_wage_per_unit_le"),
+                "applied_rate_le": rate_flt,
+                "worker_count": len(clean_wids),
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        async def _do_create(sess):
+            ins_kw = {"session": sess} if sess else {}
+            # Touch serialization guard on order document
+            now_touch = datetime.now(timezone.utc).isoformat()
+            await db.orders.update_one({"_id": order["_id"]}, {"$set": {"last_assignment_at": now_touch}}, **ins_kw)
+            if payload.instance_ids:
+                res_itm = db.item_instances.update_many(
+                    {"instance_id": {"$in": payload.instance_ids}},
+                    {"$set": {"status": "assigned", "assigned_worker_id": primary_worker_id, "updated_at": now}, "$inc": {"claim_generation": 1}},
+                    **ins_kw
+                )
+                if inspect.isawaitable(res_itm):
+                    await res_itm
+            res = db.work_assignments.insert_one(doc, **ins_kw)
+            if inspect.isawaitable(res):
+                res = await res
+            doc["_id"] = str(getattr(res, "inserted_id", res))
+            await create_outbox_event(
+                event_type="assignment.created",
+                aggregate_type="work_assignment",
+                aggregate_id=doc["_id"],
+                payload={
+                    "assignment_id": doc["_id"],
+                    "worker_id": primary_worker_id,
+                    "worker_ids": clean_wids,
+                    "order_id": order_id_str,
+                    "order_item_id": payload.order_item_id,
+                    "target_quantity": target_qty,
+                    "agreed_rate_le": rate_flt,
+                    "instance_ids": payload.instance_ids or [],
+                },
+                session=sess
+            )
+
+        session = None
+        try:
+            try:
+                session = await client.start_session()
+            except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError):
+                session = None
+
+            if session is not None:
+                async with session:
+                    async with session.start_transaction():
+                        await _do_create(session)
+            else:
+                await _do_create(None)
+            return clean(doc)
+        except pymongo.errors.DuplicateKeyError:
+            raise HTTPException(status_code=409, detail="Penugasan serupa sudah terdaftar")
 
 @api_router.patch("/admin/assignments/{assignment_id}/progress")
 async def admin_update_assignment_progress(
@@ -3802,156 +3984,435 @@ async def admin_verify_work_assignment(
     payload: WorkAssignmentVerifyInput,
     admin: dict = Depends(require_perm("manage_orders"))
 ):
-    assignment = await db.work_assignments.find_one({"_id": id_query(assignment_id)})
-    if not assignment:
-        raise HTTPException(status_code=404, detail="Penugasan kerja tidak ditemukan")
+    async with _assignment_verify_lock:
+        assignment = await db.work_assignments.find_one({"_id": id_query(assignment_id)})
+        if not assignment:
+            raise HTTPException(status_code=404, detail="Penugasan kerja tidak ditemukan")
 
-    aid_str = str(assignment.get("_id") or assignment.get("id"))
-    accrual_event_key = f"acc_{aid_str}"
+        aid_str = str(assignment.get("_id") or assignment.get("id"))
+        current_payload_dict = {
+            "accepted_quantity": payload.accepted_quantity,
+            "notes": (payload.notes or "").strip(),
+        }
+        current_payload_hash = compute_payload_hash(current_payload_dict)
 
-    current_payload_dict = {
-        "accepted_quantity": payload.accepted_quantity,
-        "notes": (payload.notes or "").strip(),
-    }
-    current_payload_hash = compute_payload_hash(current_payload_dict)
+        # Actor Separation & Decision E2: Owner-only self-approval exception (supports multi-worker)
+        admin_id = str(admin.get("id") or admin.get("_id") or "")
+        assigned_wids = assignment.get("worker_ids") or ([assignment.get("worker_id")] if assignment.get("worker_id") else [])
+        is_owner_bypass = False
 
-    # Check if already completed and obligation exists (Idempotent replay)
-    existing_wob = await db.wage_obligations.find_one({"accrual_event_key": accrual_event_key})
-    if existing_wob:
-        # Validate linkage
-        if existing_wob.get("work_assignment_id") != aid_str:
-            raise HTTPException(status_code=500, detail="Data collision on accrual_event_key")
-        if existing_wob.get("payload_hash") and existing_wob.get("payload_hash") != current_payload_hash:
-            raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) pada kunci idempotensi yang sama")
-        if assignment.get("status") == "completed":
-            clean_wob = clean(existing_wob)
-            clean_wob["assignment"] = clean(assignment)
-            return clean_wob
+        if admin_id and any(str(admin_id) == str(w) for w in assigned_wids):
+            if admin.get("role") != "owner":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Pemisahan tugas (Dual-Custody): Penugasan tidak dapat diverifikasi oleh pekerja yang sama, kecuali oleh Owner/CEO"
+                )
+            is_owner_bypass = True
 
-    if assignment.get("status") != "ready_for_review":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Penugasan harus berada dalam status 'ready_for_review' untuk verifikasi. Status saat ini: {assignment.get('status')}"
-        )
+        # Validate accepted quantity
+        target_qty = assignment.get("target_quantity", 1)
+        accepted_qty = payload.accepted_quantity
+        if accepted_qty <= 0:
+            raise HTTPException(status_code=422, detail="Kuantitas diterima harus lebih besar dari 0")
+        if accepted_qty > target_qty:
+            raise HTTPException(status_code=422, detail=f"Kuantitas diterima ({accepted_qty}) tidak boleh melebihi target ({target_qty})")
 
-    # Actor Separation & Decision E2: Owner-only self-approval exception
-    admin_id = str(admin.get("id") or admin.get("_id") or "")
-    worker_id = str(assignment.get("worker_id") or "")
-    is_owner_bypass = False
-
-    if admin_id and worker_id and admin_id == worker_id:
-        if admin.get("role") != "owner":
+        # Decision B-1: Lump-sum 100% all-or-nothing invariant
+        pricing_basis = assignment.get("pricing_basis", "per_unit")
+        if pricing_basis == "lump_sum" and accepted_qty < target_qty:
             raise HTTPException(
-                status_code=403,
-                detail="Pemisahan tugas (Dual-Custody): Penugasan tidak dapat diverifikasi oleh pekerja yang sama, kecuali oleh Owner/CEO"
+                status_code=422,
+                detail=f"Pekerjaan borongan (lump-sum) wajib diselesaikan 100% (target: {target_qty}, diterima: {accepted_qty})"
             )
-        is_owner_bypass = True
 
-    # Validate accepted quantity
-    target_qty = assignment.get("target_quantity", 1)
-    accepted_qty = payload.accepted_quantity
-    if accepted_qty <= 0:
-        raise HTTPException(status_code=422, detail="Kuantitas diterima harus lebih besar dari 0")
-    if accepted_qty > target_qty:
-        raise HTTPException(status_code=422, detail=f"Kuantitas diterima ({accepted_qty}) tidak boleh melebihi target ({target_qty})")
+        # Calculate obligation amount using Decimal ROUND_HALF_UP
+        rate_le = _num(assignment.get("agreed_rate_le"))
+        total_wage_le = calculate_wage_obligation_amount(rate_le, accepted_qty, pricing_basis)
 
-    # Decision B-1: Lump-sum 100% all-or-nothing invariant
-    pricing_basis = assignment.get("pricing_basis", "per_unit")
-    if pricing_basis == "lump_sum" and accepted_qty < target_qty:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Pekerjaan borongan (lump-sum) wajib diselesaikan 100% (target: {target_qty}, diterima: {accepted_qty})"
-        )
+        # Multi-worker allocation via shared integer piastre utility (distribute_wage_piastres)
+        raw_workers = assignment.get("workers")
+        if not raw_workers:
+            if assignment.get("worker_ids"):
+                raw_workers = [{"worker_id": wid} for wid in assignment.get("worker_ids")]
+            elif assignment.get("worker_id"):
+                raw_workers = [{"worker_id": assignment.get("worker_id"), "worker_name": assignment.get("worker_name", "Worker")}]
+            else:
+                raw_workers = []
 
-    # Calculate obligation amount using Decimal ROUND_HALF_UP
-    rate_le = _num(assignment.get("agreed_rate_le"))
-    oblig_amount_le = calculate_wage_obligation_amount(rate_le, accepted_qty, pricing_basis)
+        allocations = distribute_wage_piastres(total_wage_le, raw_workers)
 
-    now = datetime.now(timezone.utc).isoformat()
-    wob_num = await generate_obligation_number()
+        # Check existing obligations in database (Audit 3 reconciliation)
+        existing_wobs_cursor = db.wage_obligations.find({"work_assignment_id": aid_str})
+        to_list_fn = getattr(existing_wobs_cursor, "to_list", None)
+        existing_wobs = await to_list_fn(100) if callable(to_list_fn) else []
+        for wob in existing_wobs:
+            if wob.get("payload_hash") and wob.get("payload_hash") != current_payload_hash:
+                raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) pada kunci idempotensi yang sama")
 
-    obligation_doc = {
-        "obligation_number": wob_num,
-        "accrual_event_key": accrual_event_key,
-        "work_assignment_id": aid_str,
-        "worker_id": worker_id,
-        "worker_name": assignment.get("worker_name", "Worker"),
-        "order_id": assignment.get("order_id"),
-        "order_number": assignment.get("order_number"),
-        "order_item_id": assignment.get("order_item_id"),
-        "task_category": assignment.get("task_category"),
-        "pricing_basis": pricing_basis,
-        "rate_le": rate_le,
-        "accepted_quantity": accepted_qty,
-        "total_amount_le": oblig_amount_le,
-        "currency": "EGP",
-        "status": "accrued",
-        "paid_amount_le": 0.0,
-        "is_owner_bypass": is_owner_bypass,
-        "verified_by_id": admin_id,
-        "verified_by_name": admin.get("name", "Admin"),
-        "verification_notes": (payload.notes or "").strip(),
-        "payload_hash": current_payload_hash,
-        "created_at": now,
-        "updated_at": now,
-    }
+        # If already completed and ALL worker obligations exist: idempotent replay
+        if assignment.get("status") == "completed" and len(existing_wobs) == len(allocations):
+            clean_wobs = [clean(w) for w in existing_wobs]
+            res = dict(clean_wobs[0])
+            res["wage_obligations"] = clean_wobs
+            res["assignment"] = clean(assignment)
+            res["total_amount_le"] = round(sum(_num(w.get("total_amount_le")) for w in existing_wobs), 2)
+            res["rate_le"] = rate_le
+            return res
 
-    assignment_update = {
-        "status": "completed",
-        "accepted_quantity": accepted_qty,
-        "verified_by_id": admin_id,
-        "verified_by_name": admin.get("name", "Admin"),
-        "verified_at": now,
-        "is_owner_bypass": is_owner_bypass,
-        "accrual_event_key": accrual_event_key,
-        "wage_obligation_number": wob_num,
-        "verification_notes": (payload.notes or "").strip(),
-        "updated_at": now,
-    }
-
-    # Atomic Multi-Document Transaction Execution with Standalone Fallback
-    async def _do_verify(session):
-        ins_kw = {"session": session} if session else {}
-
-        # 1. Update assignment conditionally from ready_for_review -> completed
-        res_assign = await db.work_assignments.update_one(
-            {"_id": assignment["_id"], "status": "ready_for_review"},
-            {"$set": assignment_update},
-            **ins_kw
-        )
-        if res_assign.modified_count == 0:
+        if assignment.get("status") not in ("ready_for_review", "accruing", "completed"):
             raise HTTPException(
                 status_code=409,
-                detail="Status penugasan telah berubah oleh proses lain. Harap muat ulang."
+                detail=f"Penugasan harus berada dalam status 'ready_for_review' untuk verifikasi. Status saat ini: {assignment.get('status')}"
             )
 
-        # 2. Insert wage obligation
-        res_wob = await db.wage_obligations.insert_one(obligation_doc, **ins_kw)
-        obligation_doc["_id"] = str(res_wob.inserted_id)
+        existing_by_worker = {str(w.get("worker_id")): w for w in existing_wobs}
 
-        # 3. Create Outbox Event
-        await create_outbox_event(
-            event_type="assignment.verified",
-            aggregate_type="work_assignment",
-            aggregate_id=aid_str,
-            payload={
-                "assignment_id": aid_str,
-                "obligation_number": wob_num,
-                "worker_id": worker_id,
-                "total_amount_le": oblig_amount_le,
+        now = datetime.now(timezone.utc).isoformat()
+        obligation_docs = []
+        obligation_numbers = []
+        docs_to_insert = []
+
+        for alloc in allocations:
+            wid = str(alloc["worker_id"])
+            wname = alloc.get("worker_name") or "Worker"
+            event_key = f"acc_{aid_str}_{wid}" if len(allocations) > 1 else f"acc_{aid_str}"
+
+            if wid in existing_by_worker:
+                existing_doc = existing_by_worker[wid]
+                obligation_numbers.append(existing_doc.get("obligation_number"))
+                obligation_docs.append(existing_doc)
+            else:
+                wob_num = await generate_obligation_number()
+                obligation_numbers.append(wob_num)
+                new_doc = {
+                    "obligation_number": wob_num,
+                    "accrual_event_key": event_key,
+                    "work_assignment_id": aid_str,
+                    "worker_id": wid,
+                    "worker_name": wname,
+                    "order_id": assignment.get("order_id"),
+                    "order_number": assignment.get("order_number"),
+                    "order_item_id": assignment.get("order_item_id"),
+                    "task_category": assignment.get("task_category"),
+                    "pricing_basis": pricing_basis,
+                    "rate_le": rate_le,
+                    "accepted_quantity": accepted_qty,
+                    "total_amount_le": alloc["amount_le"],
+                    "amount_piastres": alloc["amount_piastres"],
+                    "currency": "EGP",
+                    "status": "accrued",
+                    "paid_amount_le": 0.0,
+                    "is_owner_bypass": is_owner_bypass,
+                    "verified_by_id": admin_id,
+                    "verified_by_name": admin.get("name", "Admin"),
+                    "verification_notes": (payload.notes or "").strip(),
+                    "payload_hash": current_payload_hash,
+                    "rate_policy_snapshot": {
+                        "total_assignment_wage_le": total_wage_le,
+                        "agreed_rate_le": rate_le,
+                        "workers_count": len(allocations),
+                        "allocated_amount_le": alloc["amount_le"],
+                        "allocated_piastres": alloc["amount_piastres"],
+                        "is_override": assignment.get("is_override", False),
+                        "rate_override_reason": assignment.get("rate_override_reason"),
+                    },
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                obligation_docs.append(new_doc)
+                docs_to_insert.append(new_doc)
+
+        primary_wob_num = obligation_numbers[0]
+        assignment_update = {
+            "status": "completed",
+            "accepted_quantity": accepted_qty,
+            "verified_by_id": admin_id,
+            "verified_by_name": admin.get("name", "Admin"),
+            "verified_at": now,
+            "is_owner_bypass": is_owner_bypass,
+            "accrual_event_key": obligation_docs[0]["accrual_event_key"],
+            "wage_obligation_numbers": obligation_numbers,
+            "wage_obligation_number": primary_wob_num,
+            "total_wage_recorded_le": total_wage_le,
+            "verification_notes": (payload.notes or "").strip(),
+            "updated_at": now,
+        }
+
+        # Atomic Multi-Document Transaction Execution with Standalone Fallback
+        async def _do_verify(session):
+            ins_kw = {"session": session} if session else {}
+
+            # 1. Update assignment conditionally
+            if assignment.get("status") != "completed":
+                res_assign = await db.work_assignments.update_one(
+                    {"_id": assignment["_id"], "status": {"$in": ["ready_for_review", "accruing"]}},
+                    {"$set": assignment_update},
+                    **ins_kw
+                )
+                if res_assign.modified_count == 0 and assignment.get("status") not in ("completed", "accruing"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Status penugasan telah berubah oleh proses lain. Harap muat ulang."
+                    )
+
+            # 2. Insert only missing wage obligations
+            for wob_doc in docs_to_insert:
+                res_wob = await db.wage_obligations.insert_one(wob_doc, **ins_kw)
+                wob_doc["_id"] = str(res_wob.inserted_id)
+
+            # 3. Create Outbox Event
+            await create_outbox_event(
+                event_type="assignment.verified",
+                aggregate_type="work_assignment",
+                aggregate_id=aid_str,
+                payload={
+                    "assignment_id": aid_str,
+                    "obligation_numbers": obligation_numbers,
+                    "obligation_number": primary_wob_num,
+                    "worker_ids": [o["worker_id"] for o in obligation_docs],
+                    "total_amount_le": total_wage_le,
+                    "accepted_quantity": accepted_qty,
+                    "payload_hash": current_payload_hash,
+                },
+                session=session
+            )
+
+        session = None
+        try:
+            try:
+                session = await client.start_session()
+            except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
+                if not is_standalone_fallback_permitted():
+                    logger.error(f"Transaction capability unavailable in mode {get_environment_mode()!r}: {sess_err}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                    )
+                session = None
+
+            if session is not None:
+                async with session:
+                    async with session.start_transaction():
+                        await _do_verify(session)
+            else:
+                # Standalone / test fallback
+                if assignment.get("status") != "completed":
+                    await db.work_assignments.update_one(
+                        {"_id": assignment["_id"], "status": {"$in": ["ready_for_review", "accruing"]}},
+                        {"$set": {"status": "accruing", "accrual_in_progress_at": now}}
+                    )
+
+                try:
+                    for wob_doc in docs_to_insert:
+                        res_wob = await db.wage_obligations.insert_one(wob_doc)
+                        wob_doc["_id"] = str(res_wob.inserted_id)
+
+                    await db.work_assignments.update_one(
+                        {"_id": assignment["_id"]},
+                        {"$set": assignment_update}
+                    )
+                    await create_outbox_event(
+                        event_type="assignment.verified",
+                        aggregate_type="work_assignment",
+                        aggregate_id=aid_str,
+                        payload={
+                            "assignment_id": aid_str,
+                            "obligation_numbers": obligation_numbers,
+                            "obligation_number": primary_wob_num,
+                            "worker_ids": [o["worker_id"] for o in obligation_docs],
+                            "total_amount_le": total_wage_le,
+                            "accepted_quantity": accepted_qty,
+                            "payload_hash": current_payload_hash,
+                        },
+                        session=None
+                    )
+                except Exception as e:
+                    # Compensating rollback: delete newly inserted obligations only
+                    for doc in docs_to_insert:
+                        if "_id" in doc:
+                            await db.wage_obligations.delete_one({"_id": id_query(doc["_id"])})
+                    await db.work_assignments.update_one(
+                        {"_id": assignment["_id"], "status": "accruing"},
+                        {"$set": {"status": "ready_for_review"}, "$unset": {"accrual_in_progress_at": ""}}
+                    )
+                    raise HTTPException(status_code=500, detail=f"Gagal memproses akrual kewajiban upah: {e}")
+        except (pymongo.errors.ConnectionFailure, pymongo.errors.ExecutionTimeout) as net_err:
+            reconciled_cursor = db.wage_obligations.find({"work_assignment_id": aid_str})
+            to_list_fn = getattr(reconciled_cursor, "to_list", None)
+            reconciled = await to_list_fn(100) if callable(to_list_fn) else []
+            if reconciled and len(reconciled) == len(allocations):
+                if any(w.get("payload_hash") and w.get("payload_hash") != current_payload_hash for w in reconciled):
+                    raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) terdeteksi saat rekonsiliasi transaksi")
+                fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
+                clean_recs = [clean(w) for w in reconciled]
+                clean_rec = dict(clean_recs[0])
+                clean_rec["wage_obligations"] = clean_recs
+                clean_rec["assignment"] = clean(fresh_assign)
+                clean_rec["total_amount_le"] = round(sum(_num(w.get("total_amount_le")) for w in reconciled), 2)
+                clean_rec["rate_le"] = rate_le
+                return clean_rec
+            raise HTTPException(status_code=503, detail=f"Koneksi terputus saat commit transaksi: {net_err}")
+        except pymongo.errors.DuplicateKeyError:
+            canonical_wobs_cursor = db.wage_obligations.find({"work_assignment_id": aid_str})
+            to_list_fn = getattr(canonical_wobs_cursor, "to_list", None)
+            canonical_wobs = await to_list_fn(100) if callable(to_list_fn) else []
+            if canonical_wobs and len(canonical_wobs) == len(allocations):
+                if any(w.get("payload_hash") and w.get("payload_hash") != current_payload_hash for w in canonical_wobs):
+                    raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) pada kunci idempotensi yang sama")
+                await db.work_assignments.update_one(
+                    {"_id": assignment["_id"]},
+                    {"$set": {"status": "completed", "updated_at": now}}
+                )
+                clean_cwobs = [clean(w) for w in canonical_wobs]
+                fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
+                clean_cwob = dict(clean_cwobs[0])
+                clean_cwob["wage_obligations"] = clean_cwobs
+                clean_cwob["assignment"] = clean(fresh_assign)
+                clean_cwob["total_amount_le"] = round(sum(_num(w.get("total_amount_le")) for w in canonical_wobs), 2)
+                clean_cwob["rate_le"] = rate_le
+                return clean_cwob
+            raise HTTPException(status_code=409, detail="Konflik penugasan serupa terdeteksi")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error during work assignment verification: {e}")
+            raise HTTPException(status_code=500, detail=f"Kesalahan sistem saat verifikasi penugasan: {e}")
+
+        # Record Audit Log
+        await record_audit_log(
+            action="WORK_ASSIGNMENT_VERIFIED",
+            entity_type="work_assignment",
+            entity_id=aid_str,
+            entity_identifier=f"{assignment.get('order_number')}:{assignment.get('task_category')}",
+            admin=admin,
+            metadata={
+                "obligation_numbers": obligation_numbers,
+                "obligation_number": primary_wob_num,
+                "total_amount_le": total_wage_le,
                 "accepted_quantity": accepted_qty,
-                "payload_hash": current_payload_hash,
-            },
-            session=session
+                "workers_count": len(obligation_docs),
+                "is_owner_bypass": is_owner_bypass,
+            }
         )
 
-    session = None
-    try:
+        clean_wobs = [clean(doc) for doc in obligation_docs]
+        fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
+        clean_res = dict(clean_wobs[0])
+        clean_res["wage_obligations"] = clean_wobs
+        clean_res["assignment"] = clean(fresh_assign)
+        clean_res["total_amount_le"] = total_wage_le
+        clean_res["rate_le"] = rate_le
+        return clean_res
+
+@api_router.post("/admin/assignments/{assignment_id}/cancel")
+async def admin_cancel_work_assignment(
+    assignment_id: str,
+    payload: WorkAssignmentCancelInput,
+    admin: dict = Depends(get_current_admin)
+):
+    async with _assignment_cancel_lock:
+        assignment = await db.work_assignments.find_one({"_id": id_query(assignment_id)})
+        if not assignment:
+            raise HTTPException(status_code=404, detail="Penugasan kerja tidak ditemukan")
+
+        curr_status = assignment.get("status")
+        if curr_status == "cancelled":
+            return clean(assignment)
+
+        aid_str = str(assignment.get("_id") or assignment.get("id"))
+        reason = (payload.reason or "").strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail="Alasan pembatalan wajib diisi")
+
+        perms = admin.get("permissions") or {}
+        role = admin.get("role")
+
+        # If completed, check permissions
+        if curr_status == "completed":
+            if role != "owner" and not perms.get("access_finance"):
+                raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat membatalkan penugasan yang sudah selesai")
+
+        # Scan all linked obligations in wage_obligations: reject if ANY obligation is partially or fully paid (Audit 4)
+        linked_wobs_cursor = db.wage_obligations.find({"work_assignment_id": aid_str})
+        to_list_fn = getattr(linked_wobs_cursor, "to_list", None)
+        linked_wobs = await to_list_fn(100) if callable(to_list_fn) else []
+        for linked_wob in linked_wobs:
+            if linked_wob.get("status") in ("paid", "partially_paid") or _num(linked_wob.get("paid_amount_le")) > 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Kewajiban upah sudah terbayar sebagian atau penuh. Penugasan tidak dapat dibatalkan."
+                )
+
+        now = datetime.now(timezone.utc).isoformat()
+        assign_upd = {
+            "status": "cancelled",
+            "cancelled_by_id": admin.get("id"),
+            "cancelled_by_name": admin.get("name", "Admin"),
+            "cancellation_reason": reason,
+            "cancelled_at": now,
+            "updated_at": now,
+        }
+
+        # Atomic cancel assignment & void obligation
+        async def _do_cancel(session):
+            ins_kw = {"session": session} if session else {}
+            # Guard against concurrent settlement: re-check linked obligations at DB level
+            cur_wobs_cursor = db.wage_obligations.find({"work_assignment_id": aid_str}, **ins_kw)
+            to_list_fn = getattr(cur_wobs_cursor, "to_list", None)
+            cur_wobs = await to_list_fn(100) if callable(to_list_fn) else []
+            if any(w.get("status") in ("paid", "partially_paid") or _num(w.get("paid_amount_le")) > 0 for w in cur_wobs):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Kewajiban upah sudah terbayar sebagian atau penuh. Penugasan tidak dapat dibatalkan."
+                )
+            if any(w.get("status") != "accrued" for w in cur_wobs):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Status kewajiban upah telah berubah oleh proses lain. Harap muat ulang."
+                )
+
+            res_asn = await db.work_assignments.update_one(
+                {"_id": assignment["_id"], "status": curr_status},
+                {"$set": assign_upd},
+                **ins_kw
+            )
+            if res_asn.matched_count == 0 and assignment.get("status") != "cancelled":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Status penugasan telah diubah oleh proses lain. Harap muat ulang."
+                )
+
+            await db.wage_obligations.update_many(
+                {"work_assignment_id": aid_str, "status": "accrued"},
+                {"$set": {
+                    "status": "voided",
+                    "void_reason": reason,
+                    "voided_by_id": admin.get("id"),
+                    "voided_by_name": admin.get("name", "Admin"),
+                    "voided_at": now,
+                    "updated_at": now,
+                }},
+                **ins_kw
+            )
+            await create_outbox_event(
+                event_type="assignment.cancelled",
+                aggregate_type="work_assignment",
+                aggregate_id=aid_str,
+                payload={
+                    "assignment_id": aid_str,
+                    "order_number": assignment.get("order_number"),
+                    "task_category": assignment.get("task_category"),
+                    "cancellation_reason": reason,
+                },
+                session=session
+            )
+
+        session = None
         try:
             session = await client.start_session()
         except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
             if not is_standalone_fallback_permitted():
-                logger.error(f"Transaction capability unavailable in mode {get_environment_mode()!r}: {sess_err}")
+                logger.error(f"Transaction capability unavailable for cancellation in mode {get_environment_mode()!r}: {sess_err}")
                 raise HTTPException(
                     status_code=503,
                     detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
@@ -3961,188 +4422,26 @@ async def admin_verify_work_assignment(
         if session is not None:
             async with session:
                 async with session.start_transaction():
-                    await _do_verify(session)
+                    await _do_cancel(session)
         else:
-            # Explicitly permitted standalone / test fallback
-            acc_trans = await db.work_assignments.update_one(
-                {"_id": assignment["_id"], "status": "ready_for_review"},
-                {"$set": {"status": "accruing", "accrual_in_progress_at": now}}
-            )
-            if acc_trans.modified_count == 0:
-                raise HTTPException(status_code=409, detail="Status penugasan telah berubah oleh proses lain")
-
+            # Standalone fallback with compensating rollback
             try:
-                res_wob = await db.wage_obligations.insert_one(obligation_doc)
-                obligation_doc["_id"] = str(res_wob.inserted_id)
+                await _do_cancel(None)
+            except HTTPException:
                 await db.work_assignments.update_one(
-                    {"_id": assignment["_id"], "status": "accruing"},
-                    {"$set": assignment_update}
+                    {"_id": assignment["_id"]},
+                    {"$set": {"status": curr_status, "updated_at": now}}
                 )
-                await create_outbox_event(
-                    event_type="assignment.verified",
-                    aggregate_type="work_assignment",
-                    aggregate_id=aid_str,
-                    payload={
-                        "assignment_id": aid_str,
-                        "obligation_number": wob_num,
-                        "worker_id": worker_id,
-                        "total_amount_le": oblig_amount_le,
-                        "accepted_quantity": accepted_qty,
-                        "payload_hash": current_payload_hash,
-                    },
-                    session=None
-                )
+                raise
             except Exception as e:
-                # Compensating rollback
                 await db.work_assignments.update_one(
-                    {"_id": assignment["_id"], "status": "accruing"},
-                    {"$set": {"status": "ready_for_review"}, "$unset": {"accrual_in_progress_at": ""}}
+                    {"_id": assignment["_id"]},
+                    {"$set": {"status": curr_status, "updated_at": now}}
                 )
-                await db.wage_obligations.delete_one({"accrual_event_key": accrual_event_key})
-                raise HTTPException(status_code=500, detail=f"Gagal memproses akrual kewajiban upah: {e}")
-    except (pymongo.errors.ConnectionFailure, pymongo.errors.ExecutionTimeout) as net_err:
-        reconciled = await db.wage_obligations.find_one({"accrual_event_key": accrual_event_key})
-        if reconciled:
-            if reconciled.get("payload_hash") and reconciled.get("payload_hash") != current_payload_hash:
-                raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) terdeteksi saat rekonsiliasi transaksi")
-            fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
-            clean_rec = clean(reconciled)
-            clean_rec["assignment"] = clean(fresh_assign)
-            return clean_rec
-        raise HTTPException(status_code=503, detail=f"Koneksi terputus saat commit transaksi: {net_err}")
-    except pymongo.errors.DuplicateKeyError:
-        # Re-fetch existing canonical obligation
-        canonical_wob = await db.wage_obligations.find_one({"accrual_event_key": accrual_event_key})
-        if canonical_wob:
-            if canonical_wob.get("payload_hash") and canonical_wob.get("payload_hash") != current_payload_hash:
-                raise HTTPException(status_code=409, detail="Konflik muatan (payload mismatch) pada kunci idempotensi yang sama")
-            clean_cwob = clean(canonical_wob)
-            fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
-            clean_cwob["assignment"] = clean(fresh_assign)
-            return clean_cwob
-        raise HTTPException(status_code=409, detail="Konflik penugasan serupa terdeteksi")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error during work assignment verification: {e}")
-        raise HTTPException(status_code=500, detail=f"Kesalahan sistem saat verifikasi penugasan: {e}")
+                raise HTTPException(status_code=500, detail=f"Gagal memproses pembatalan penugasan: {e}")
 
-    # Record Audit Log
-    await record_audit_log(
-        action="WORK_ASSIGNMENT_VERIFIED",
-        entity_type="work_assignment",
-        entity_id=aid_str,
-        entity_identifier=f"{assignment.get('order_number')}:{assignment.get('task_category')}",
-        admin=admin,
-        metadata={
-            "obligation_number": wob_num,
-            "total_amount_le": oblig_amount_le,
-            "accepted_quantity": accepted_qty,
-            "is_owner_bypass": is_owner_bypass,
-        }
-    )
-
-    clean_wob = clean(obligation_doc)
-    fresh_assign = await db.work_assignments.find_one({"_id": assignment["_id"]})
-    clean_wob["assignment"] = clean(fresh_assign)
-    return clean_wob
-
-@api_router.post("/admin/assignments/{assignment_id}/cancel")
-async def admin_cancel_work_assignment(
-    assignment_id: str,
-    payload: WorkAssignmentCancelInput,
-    admin: dict = Depends(get_current_admin)
-):
-    assignment = await db.work_assignments.find_one({"_id": id_query(assignment_id)})
-    if not assignment:
-        raise HTTPException(status_code=404, detail="Penugasan kerja tidak ditemukan")
-
-    curr_status = assignment.get("status")
-    if curr_status == "cancelled":
-        return clean(assignment)
-
-    aid_str = str(assignment.get("_id") or assignment.get("id"))
-    reason = (payload.reason or "").strip()
-    if not reason:
-        raise HTTPException(status_code=400, detail="Alasan pembatalan wajib diisi")
-
-    perms = admin.get("permissions") or {}
-    role = admin.get("role")
-
-    # If completed, check permissions & paid status
-    if curr_status == "completed":
-        if role != "owner" and not perms.get("access_finance"):
-            raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat membatalkan penugasan yang sudah selesai")
-
-        linked_wob = await db.wage_obligations.find_one({"work_assignment_id": aid_str})
-        if linked_wob:
-            if linked_wob.get("status") == "paid" or _num(linked_wob.get("paid_amount_le")) > 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Kewajiban upah sudah terbayar sebagian atau penuh. Penugasan tidak dapat dibatalkan."
-                )
-
-    now = datetime.now(timezone.utc).isoformat()
-    assign_upd = {
-        "status": "cancelled",
-        "cancelled_by_id": admin.get("id"),
-        "cancelled_by_name": admin.get("name", "Admin"),
-        "cancellation_reason": reason,
-        "cancelled_at": now,
-        "updated_at": now,
-    }
-
-    # Atomic cancel assignment & void obligation
-    async def _do_cancel(session):
-        ins_kw = {"session": session} if session else {}
-        await db.work_assignments.update_one({"_id": assignment["_id"]}, {"$set": assign_upd}, **ins_kw)
-        await db.wage_obligations.update_many(
-            {"work_assignment_id": aid_str, "status": "accrued"},
-            {"$set": {
-                "status": "voided",
-                "void_reason": reason,
-                "voided_by_id": admin.get("id"),
-                "voided_by_name": admin.get("name", "Admin"),
-                "voided_at": now,
-                "updated_at": now,
-            }},
-            **ins_kw
-        )
-        await create_outbox_event(
-            event_type="assignment.cancelled",
-            aggregate_type="work_assignment",
-            aggregate_id=aid_str,
-            payload={
-                "assignment_id": aid_str,
-                "order_number": assignment.get("order_number"),
-                "task_category": assignment.get("task_category"),
-                "cancellation_reason": reason,
-            },
-            session=session
-        )
-
-    session = None
-    try:
-        session = await client.start_session()
-    except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
-        if not is_standalone_fallback_permitted():
-            logger.error(f"Transaction capability unavailable for cancellation in mode {get_environment_mode()!r}: {sess_err}")
-            raise HTTPException(
-                status_code=503,
-                detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
-            )
-        session = None
-
-    if session is not None:
-        async with session:
-            async with session.start_transaction():
-                await _do_cancel(session)
-    else:
-        # Explicitly permitted standalone / test fallback
-        await _do_cancel(None)
-
-    updated = await db.work_assignments.find_one({"_id": assignment["_id"]})
-    return clean(updated)
+        updated = await db.work_assignments.find_one({"_id": assignment["_id"]})
+        return clean(updated)
 
 # --------------------------------------------------------------------------
 # Admin: Assignment Groups (Work Package B) & Transactional Outbox (Work Package C)
@@ -4651,6 +4950,13 @@ async def admin_create_wage_settlement(
     payload: WageSettlementCreateInput,
     admin: dict = Depends(require_finance_or_owner())
 ):
+    async with _wage_mutation_lock:
+        return await _create_wage_settlement_impl(payload, admin)
+
+async def _create_wage_settlement_impl(
+    payload: WageSettlementCreateInput,
+    admin: dict
+):
     worker_id = str(payload.worker_id or "").strip()
     if not worker_id:
         raise HTTPException(status_code=400, detail="worker_id wajib diisi")
@@ -4819,6 +5125,11 @@ async def admin_create_wage_settlement(
             )
 
     resolved_allocations = []
+    ob_by_id = {str(o.get("_id")): o for o in worker_obligations}
+    for o in worker_obligations:
+        if o.get("id"):
+            ob_by_id[str(o["id"])] = o
+
     if payload.allocations and len(payload.allocations) > 0:
         alloc_map = {}
         for item in payload.allocations:
@@ -4835,11 +5146,6 @@ async def admin_create_wage_settlement(
                 status_code=422,
                 detail=f"Total alokasi ({round(sum(alloc_map.values()), 2)} LE) harus sama persis dengan nominal pembayaran ({disbursed_amount} LE)"
             )
-
-        ob_by_id = {str(o.get("_id")): o for o in worker_obligations}
-        for o in worker_obligations:
-            if o.get("id"):
-                ob_by_id[str(o["id"])] = o
 
         for ob_id, alloc_amt in alloc_map.items():
             ob = ob_by_id.get(ob_id)
@@ -4994,6 +5300,14 @@ async def admin_create_wage_settlement(
         # 5. Mutate each wage obligation with optimistic concurrency check
         for a in resolved_allocations:
             ob_id = a["wage_obligation_id"]
+            ob = ob_by_id.get(ob_id)
+            if ob and ob.get("work_assignment_id"):
+                asn_check = await db.work_assignments.find_one({"_id": id_query(ob["work_assignment_id"])}, **ins_kw)
+                if asn_check and asn_check.get("status") == "cancelled":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Penugasan kerja ({asn_check.get('order_number')}) telah dibatalkan. Kewajiban upah tidak dapat dilunasi."
+                    )
             alloc_amt = a["amount_le"]
             prev_paid = a["previous_paid_amount_le"]
             new_paid = a["new_paid_amount_le"]
@@ -5952,6 +6266,33 @@ class DeliveryWagePolicyInput(BaseModel):
     max_helper_wage_per_order_le: Optional[float] = Field(None, gt=0.0, description="Batas maksimum keras upah (hard cap) per pesanan")
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
+    enabled: Optional[bool] = True
+
+class ProductionWagePolicyInput(BaseModel):
+    default_wage_per_unit_le: float = Field(..., ge=0.0, description="Tarif dasar upah per unit produksi")
+    unusual_amount_threshold_le: float = Field(..., gt=0.0, description="Batas konfirmasi nominal tidak wajar")
+    max_wage_per_unit_le: float = Field(..., gt=0.0, description="Batas maksimum keras upah per unit")
+    enabled: bool = True
+    currency: Optional[str] = "EGP"
+    rounding_policy: Optional[str] = "piastre_round_half_up"
+
+class MaterialPurchaseWagePolicyInput(BaseModel):
+    default_wage_per_purchase_le: float = Field(..., ge=0.0, description="Tarif dasar upah belanja bahan per transaksi")
+    unusual_amount_threshold_le: float = Field(..., gt=0.0, description="Batas konfirmasi nominal tidak wajar")
+    max_wage_per_purchase_le: float = Field(..., gt=0.0, description="Batas maksimum keras upah belanja bahan")
+    max_buyers: int = Field(5, ge=1, le=5, description="Batas maksimum pembeli bahan per transaksi (maksimal 5)")
+    enabled: bool = True
+    currency: Optional[str] = "EGP"
+    rounding_policy: Optional[str] = "piastre_round_half_up"
+
+class AdminWagePolicyInput(BaseModel):
+    default_wage_per_order_le: float = Field(..., ge=0.0, description="Tarif upah admin per pesanan")
+    default_recipient_id: Optional[str] = Field(None, description="ID penerima upah admin default dari db.admins")
+    unusual_amount_threshold_le: float = Field(..., gt=0.0, description="Batas konfirmasi nominal tidak wajar")
+    max_wage_per_order_le: float = Field(..., gt=0.0, description="Batas maksimum keras upah admin")
+    enabled: bool = True
+    currency: Optional[str] = "EGP"
+    rounding_policy: Optional[str] = "piastre_round_half_up"
 
 class DeliveryWagePreviewInput(BaseModel):
     total_wage_le: Optional[float] = None
@@ -6061,39 +6402,185 @@ async def get_active_delivery_wage_policy(db_inst=None) -> dict:
         "max_helper_wage_per_order_le": _num(val.get("max_helper_wage_per_order_le"), 500.0) if has_hard_cap else 500.0,
         "currency": val.get("currency", "EGP"),
         "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
+        "enabled": bool(val.get("enabled", True)),
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
         "is_configured": is_configured
     }
 
-def calculate_delivery_helper_wage_allocations(total_wage_le: float, helpers: list) -> list:
+async def get_active_production_wage_policy(db_inst=None) -> dict:
     """
-    Divides total_wage_le equally among helpers using smallest currency unit: one piastre (0.01 EGP).
-    Guarantees:
-    - Sum of all helper allocations always equals exactly total_wage_le (zero money lost or created).
-    - Residual piastres distributed deterministically to first r helpers.
-    - Uses exact integer arithmetic in piastres (no binary floating-point drift).
+    Returns active production wage policy from db.settings.
+    If not explicitly configured by Owner, returns is_configured: False and enabled: False
+    without guessing business rates.
     """
-    n = len(helpers)
-    if n == 0:
-        return []
+    d = db_inst if db_inst is not None else db
+    doc = None
+    if hasattr(d, "settings") and hasattr(d.settings, "find_one"):
+        res = d.settings.find_one({"key": "production_wage_policy"})
+        doc = await res if inspect.isawaitable(res) else res
 
-    d_wage = Decimal(str(total_wage_le)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    val = doc.get("value") if doc and isinstance(doc.get("value"), dict) else {}
+    has_hard_cap = "max_wage_per_unit_le" in val and val["max_wage_per_unit_le"] is not None
+    has_threshold = "unusual_amount_threshold_le" in val and val["unusual_amount_threshold_le"] is not None
+    has_default = "default_wage_per_unit_le" in val and val["default_wage_per_unit_le"] is not None
+    is_configured = bool(val and has_hard_cap and has_threshold and has_default)
+
+    return {
+        "default_wage_per_unit_le": _num(val.get("default_wage_per_unit_le"), None) if has_default else None,
+        "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), None) if has_threshold else None,
+        "max_wage_per_unit_le": _num(val.get("max_wage_per_unit_le"), None) if has_hard_cap else None,
+        "enabled": bool(val.get("enabled", False)) if is_configured else False,
+        "currency": val.get("currency", "EGP"),
+        "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
+        "updated_at": val.get("updated_at"),
+        "updated_by_id": val.get("updated_by_id"),
+        "updated_by_name": val.get("updated_by_name"),
+        "is_configured": is_configured
+    }
+
+async def get_active_material_purchase_wage_policy(db_inst=None) -> dict:
+    """
+    Returns active material purchase wage policy from db.settings.
+    If not explicitly configured by Owner, returns is_configured: False and enabled: False
+    without guessing business rates.
+    """
+    d = db_inst if db_inst is not None else db
+    doc = None
+    if hasattr(d, "settings") and hasattr(d.settings, "find_one"):
+        res = d.settings.find_one({"key": "material_purchase_wage_policy"})
+        doc = await res if inspect.isawaitable(res) else res
+
+    val = doc.get("value") if doc and isinstance(doc.get("value"), dict) else {}
+    has_hard_cap = "max_wage_per_purchase_le" in val and val["max_wage_per_purchase_le"] is not None
+    has_threshold = "unusual_amount_threshold_le" in val and val["unusual_amount_threshold_le"] is not None
+    has_default = "default_wage_per_purchase_le" in val and val["default_wage_per_purchase_le"] is not None
+    is_configured = bool(val and has_hard_cap and has_threshold and has_default)
+
+    return {
+        "default_wage_per_purchase_le": _num(val.get("default_wage_per_purchase_le"), None) if has_default else None,
+        "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), None) if has_threshold else None,
+        "max_wage_per_purchase_le": _num(val.get("max_wage_per_purchase_le"), None) if has_hard_cap else None,
+        "max_buyers": min(5, max(1, int(val.get("max_buyers", 5)))),
+        "enabled": bool(val.get("enabled", False)) if is_configured else False,
+        "currency": val.get("currency", "EGP"),
+        "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
+        "updated_at": val.get("updated_at"),
+        "updated_by_id": val.get("updated_by_id"),
+        "updated_by_name": val.get("updated_by_name"),
+        "is_configured": is_configured
+    }
+
+async def get_active_admin_wage_policy(db_inst=None) -> dict:
+    """
+    Returns active admin wage policy from db.settings.
+    If not explicitly configured by Owner, returns is_configured: False and enabled: False
+    without guessing business rates.
+    """
+    d = db_inst if db_inst is not None else db
+    doc = None
+    if hasattr(d, "settings") and hasattr(d.settings, "find_one"):
+        res = d.settings.find_one({"key": "admin_wage_policy"})
+        doc = await res if inspect.isawaitable(res) else res
+
+    val = doc.get("value") if doc and isinstance(doc.get("value"), dict) else {}
+    has_hard_cap = "max_wage_per_order_le" in val and val["max_wage_per_order_le"] is not None
+    has_threshold = "unusual_amount_threshold_le" in val and val["unusual_amount_threshold_le"] is not None
+    has_default = "default_wage_per_order_le" in val and val["default_wage_per_order_le"] is not None
+    is_configured = bool(val and has_hard_cap and has_threshold and has_default)
+
+    return {
+        "default_wage_per_order_le": _num(val.get("default_wage_per_order_le"), None) if has_default else None,
+        "default_recipient_id": val.get("default_recipient_id"),
+        "default_recipient_name": val.get("default_recipient_name"),
+        "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), None) if has_threshold else None,
+        "max_wage_per_order_le": _num(val.get("max_wage_per_order_le"), None) if has_hard_cap else None,
+        "enabled": bool(val.get("enabled", False)) if is_configured else False,
+        "currency": val.get("currency", "EGP"),
+        "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
+        "updated_at": val.get("updated_at"),
+        "updated_by_id": val.get("updated_by_id"),
+        "updated_by_name": val.get("updated_by_name"),
+        "is_configured": is_configured
+    }
+
+async def get_all_active_wage_policies(db_inst=None) -> dict:
+    return {
+        "production": await get_active_production_wage_policy(db_inst),
+        "delivery": await get_active_delivery_wage_policy(db_inst),
+        "material_purchase": await get_active_material_purchase_wage_policy(db_inst),
+        "admin": await get_active_admin_wage_policy(db_inst)
+    }
+
+def distribute_wage_piastres(total_amount_le: float, recipients: list) -> list:
+    """
+    Distributes total_amount_le equally among recipients using smallest currency unit: one piastre (0.01 EGP).
+    Guarantees:
+    - Sum of all recipient allocations always equals exactly total_amount_le (zero money lost or created).
+    - Residual piastres distributed deterministically to first r recipients.
+    - Uses exact integer arithmetic in piastres (ROUND_HALF_UP).
+    - Validates against negative amounts, non-numeric values, and duplicate recipient IDs.
+    - Rejects positive wage when recipients list is empty (fails-closed).
+    - Explicit zero nominal contract:
+      - 0.0 LE with empty recipients -> returns []
+      - 0.0 LE with n recipients -> returns n allocations with 0 piastres and 0.0 LE
+    """
+    if total_amount_le is None:
+        raise ValueError("Nominal upah tidak boleh None")
+
+    try:
+        d_wage = Decimal(str(total_amount_le)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        raise ValueError(f"Nominal upah tidak valid: {total_amount_le!r}")
+
+    if d_wage.is_nan() or d_wage.is_infinite():
+        raise ValueError(f"Nominal upah tidak valid: {total_amount_le!r}")
+
     total_piastres = int(d_wage * 100)
     if total_piastres < 0:
         raise ValueError("Nominal upah tidak boleh bernilai negatif")
+
+    # If nominal is positive, recipients list MUST NOT be empty!
+    if total_piastres > 0 and (recipients is None or len(recipients) == 0):
+        raise ValueError("Daftar penerima upah tidak boleh kosong jika nominal upah bernilai positif")
+
+    # If nominal is zero and recipients is empty, return []
+    if total_piastres == 0 and (recipients is None or len(recipients) == 0):
+        return []
+
+    n = len(recipients)
+
+    seen_ids = set()
+    cleaned_recipients = []
+    for r in recipients:
+        if isinstance(r, dict):
+            w_id = str(r.get("worker_id") or r.get("helper_id") or r.get("id") or "")
+            w_name = r.get("worker_name") or r.get("helper_name") or r.get("name") or ("Helper" if "helper_id" in r else "Pekerja")
+        elif isinstance(r, (str, ObjectId)):
+            w_id = str(r)
+            w_name = "Pekerja"
+        else:
+            w_id = str(r)
+            w_name = "Pekerja"
+
+        if not w_id:
+            raise ValueError("ID penerima upah tidak boleh kosong")
+        if w_id in seen_ids:
+            raise ValueError(f"Penerima upah duplikat terdeteksi: {w_id}")
+        seen_ids.add(w_id)
+        cleaned_recipients.append({"id": w_id, "name": w_name})
 
     quotient = total_piastres // n
     remainder = total_piastres % n
 
     allocations = []
-    for i, h in enumerate(helpers):
+    for i, r in enumerate(cleaned_recipients):
         h_piastres = quotient + 1 if i < remainder else quotient
         h_amount_le = float(Decimal(h_piastres) / Decimal(100))
         allocations.append({
-            "worker_id": str(h.get("helper_id") or h.get("worker_id") or h.get("id")),
-            "worker_name": h.get("helper_name") or h.get("worker_name") or h.get("name", "Helper"),
+            "worker_id": r["id"],
+            "worker_name": r["name"],
             "amount_piastres": h_piastres,
             "amount_le": h_amount_le,
         })
@@ -6101,6 +6588,19 @@ def calculate_delivery_helper_wage_allocations(total_wage_le: float, helpers: li
     total_allocated_piastres = sum(a["amount_piastres"] for a in allocations)
     assert total_allocated_piastres == total_piastres, f"Rounding invariant violation: {total_allocated_piastres} != {total_piastres}"
     return allocations
+
+def calculate_delivery_helper_wage_allocations(total_wage_le: float, helpers: list, allow_empty: bool = False) -> list:
+    """
+    Divides total_wage_le equally among helpers using smallest currency unit: one piastre (0.01 EGP).
+    Guarantees:
+    - Sum of all helper allocations always equals exactly total_wage_le (zero money lost or created).
+    - Residual piastres distributed deterministically to first r helpers.
+    - Uses exact integer arithmetic in piastres (no binary floating-point drift).
+    Delegates to shared distribute_wage_piastres utility.
+    """
+    if allow_empty and (helpers is None or len(helpers) == 0):
+        return []
+    return distribute_wage_piastres(total_wage_le, helpers)
 
 async def verify_delivery_wage_indexes_pre_migration(db_inst) -> dict:
     """
@@ -6876,7 +7376,15 @@ async def record_delivery_stop_handover_core(
 
     # 2. Multi-helper distribution with exact piastre precision
     helpers = trip.get("helpers", [])
-    allocations = calculate_delivery_helper_wage_allocations(total_wage, helpers)
+    if not helpers and total_wage > 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Trip pengiriman tidak memiliki helper terdaftar untuk menerima alokasi upah pengantaran."
+        )
+    try:
+        allocations = calculate_delivery_helper_wage_allocations(total_wage, helpers)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     # 3. Mutate Order document via centralized helper
     delivery_ctx = {
@@ -7376,6 +7884,7 @@ async def admin_update_delivery_wage_policy(
         "base_wage_per_order_le": float(payload.base_wage_per_order_le),
         "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
         "max_helper_wage_per_order_le": float(payload.max_helper_wage_per_order_le),
+        "enabled": getattr(payload, "enabled", True) if getattr(payload, "enabled", True) is not None else True,
         "currency": "EGP",
         "rounding_policy": "piastre_round_half_up",
         "updated_at": now_iso,
@@ -7384,7 +7893,7 @@ async def admin_update_delivery_wage_policy(
     }
 
     changed_keys = []
-    for k in ["base_wage_per_order_le", "unusual_amount_threshold_le", "max_helper_wage_per_order_le"]:
+    for k in ["base_wage_per_order_le", "unusual_amount_threshold_le", "max_helper_wage_per_order_le", "enabled"]:
         if old_policy.get(k) != new_policy_val.get(k):
             changed_keys.append(k)
 
@@ -7407,7 +7916,271 @@ async def admin_update_delivery_wage_policy(
         }
     )
 
-    return clean(new_policy_val)
+    result_policy = dict(new_policy_val)
+    result_policy["is_configured"] = True
+    return clean(result_policy)
+
+@api_router.get("/admin/wage-policies")
+async def admin_get_all_wage_policies_endpoint(
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    policies = await get_all_active_wage_policies(db_inst=db)
+    return clean(policies)
+
+@api_router.get("/admin/wage-policies/{category}")
+async def admin_get_wage_policy_by_category(
+    category: str,
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    if category == "production":
+        policy = await get_active_production_wage_policy(db_inst=db)
+    elif category == "delivery":
+        policy = await get_active_delivery_wage_policy(db_inst=db)
+    elif category == "material_purchase":
+        policy = await get_active_material_purchase_wage_policy(db_inst=db)
+    elif category == "admin":
+        policy = await get_active_admin_wage_policy(db_inst=db)
+    else:
+        raise HTTPException(status_code=404, detail=f"Kategori kebijakan '{category}' tidak valid. Pilihan: production, delivery, material_purchase, admin")
+    return clean(policy)
+
+@api_router.put("/admin/wage-policies/{category}")
+async def admin_update_wage_policy_endpoint(
+    category: str,
+    request: Request,
+    admin: dict = Depends(require_owner())
+):
+    if admin.get("role") != "owner":
+        raise HTTPException(status_code=403, detail="Hanya Owner/CEO yang dapat melakukan ini")
+
+    if category not in ["production", "delivery", "material_purchase", "admin"]:
+        raise HTTPException(status_code=404, detail=f"Kategori kebijakan '{category}' tidak valid. Pilihan: production, delivery, material_purchase, admin")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Format JSON tidak valid")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_id_str = str(admin.get("id") or admin.get("_id") or "")
+    admin_name_str = admin.get("name", "Owner")
+
+    if category == "delivery":
+        try:
+            payload = DeliveryWagePolicyInput(**body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Validasi gagal: {e}")
+
+        if payload.base_wage_per_order_le < 0:
+            raise HTTPException(status_code=422, detail="Tarif dasar upah tidak boleh negatif")
+        if payload.unusual_amount_threshold_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas konfirmasi nominal tidak wajar harus lebih besar dari 0")
+        if payload.max_helper_wage_per_order_le is None or payload.max_helper_wage_per_order_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas maksimum keras upah (hard cap) wajib diisi dan harus lebih besar dari 0")
+        if payload.base_wage_per_order_le > payload.unusual_amount_threshold_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) tidak boleh lebih kecil dari tarif dasar ({payload.base_wage_per_order_le} LE)"
+            )
+        if payload.unusual_amount_threshold_le >= payload.max_helper_wage_per_order_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) harus lebih kecil dari batas maksimum keras ({payload.max_helper_wage_per_order_le} LE)"
+            )
+
+        old_policy = await get_active_delivery_wage_policy(db_inst=db)
+        new_policy_val = {
+            "base_wage_per_order_le": float(payload.base_wage_per_order_le),
+            "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
+            "max_helper_wage_per_order_le": float(payload.max_helper_wage_per_order_le),
+            "enabled": getattr(payload, "enabled", True) if getattr(payload, "enabled", True) is not None else True,
+            "currency": "EGP",
+            "rounding_policy": "piastre_round_half_up",
+            "updated_at": now_iso,
+            "updated_by_id": admin_id_str,
+            "updated_by_name": admin_name_str
+        }
+        tracked_keys = ["base_wage_per_order_le", "unusual_amount_threshold_le", "max_helper_wage_per_order_le", "enabled"]
+
+    elif category == "production":
+        try:
+            payload = ProductionWagePolicyInput(**body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Validasi gagal: {e}")
+
+        if payload.default_wage_per_unit_le < 0:
+            raise HTTPException(status_code=422, detail="Tarif dasar upah produksi tidak boleh negatif")
+        if payload.unusual_amount_threshold_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas konfirmasi nominal tidak wajar harus lebih besar dari 0")
+        if payload.max_wage_per_unit_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas maksimum keras upah produksi wajib diisi dan harus lebih besar dari 0")
+        if payload.default_wage_per_unit_le > payload.unusual_amount_threshold_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) tidak boleh lebih kecil dari tarif dasar ({payload.default_wage_per_unit_le} LE)"
+            )
+        if payload.unusual_amount_threshold_le >= payload.max_wage_per_unit_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) harus lebih kecil dari batas maksimum keras ({payload.max_wage_per_unit_le} LE)"
+            )
+
+        old_policy = await get_active_production_wage_policy(db_inst=db)
+        new_policy_val = {
+            "default_wage_per_unit_le": float(payload.default_wage_per_unit_le),
+            "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
+            "max_wage_per_unit_le": float(payload.max_wage_per_unit_le),
+            "enabled": bool(payload.enabled),
+            "currency": "EGP",
+            "rounding_policy": "piastre_round_half_up",
+            "updated_at": now_iso,
+            "updated_by_id": admin_id_str,
+            "updated_by_name": admin_name_str
+        }
+        tracked_keys = ["default_wage_per_unit_le", "unusual_amount_threshold_le", "max_wage_per_unit_le", "enabled"]
+
+    elif category == "material_purchase":
+        try:
+            payload = MaterialPurchaseWagePolicyInput(**body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Validasi gagal: {e}")
+
+        if payload.default_wage_per_purchase_le < 0:
+            raise HTTPException(status_code=422, detail="Tarif dasar upah belanja bahan tidak boleh negatif")
+        if payload.unusual_amount_threshold_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas konfirmasi nominal tidak wajar harus lebih besar dari 0")
+        if payload.max_wage_per_purchase_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas maksimum keras upah belanja bahan wajib diisi dan harus lebih besar dari 0")
+        if payload.max_buyers < 1 or payload.max_buyers > 5:
+            raise HTTPException(status_code=422, detail="Batas maksimum pembeli bahan harus di antara 1 dan 5")
+        if payload.default_wage_per_purchase_le > payload.unusual_amount_threshold_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) tidak boleh lebih kecil dari tarif dasar ({payload.default_wage_per_purchase_le} LE)"
+            )
+        if payload.unusual_amount_threshold_le >= payload.max_wage_per_purchase_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) harus lebih kecil dari batas maksimum keras ({payload.max_wage_per_purchase_le} LE)"
+            )
+
+        old_policy = await get_active_material_purchase_wage_policy(db_inst=db)
+        new_policy_val = {
+            "default_wage_per_purchase_le": float(payload.default_wage_per_purchase_le),
+            "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
+            "max_wage_per_purchase_le": float(payload.max_wage_per_purchase_le),
+            "max_buyers": int(payload.max_buyers),
+            "enabled": bool(payload.enabled),
+            "currency": "EGP",
+            "rounding_policy": "piastre_round_half_up",
+            "updated_at": now_iso,
+            "updated_by_id": admin_id_str,
+            "updated_by_name": admin_name_str
+        }
+        tracked_keys = ["default_wage_per_purchase_le", "unusual_amount_threshold_le", "max_wage_per_purchase_le", "max_buyers", "enabled"]
+
+    elif category == "admin":
+        try:
+            payload = AdminWagePolicyInput(**body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Validasi gagal: {e}")
+
+        if payload.default_wage_per_order_le < 0:
+            raise HTTPException(status_code=422, detail="Tarif dasar upah admin tidak boleh negatif")
+        if payload.unusual_amount_threshold_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas konfirmasi nominal tidak wajar harus lebih besar dari 0")
+        if payload.max_wage_per_order_le <= 0:
+            raise HTTPException(status_code=422, detail="Batas maksimum keras upah admin wajib diisi dan harus lebih besar dari 0")
+        if payload.default_wage_per_order_le > payload.unusual_amount_threshold_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) tidak boleh lebih kecil dari tarif dasar ({payload.default_wage_per_order_le} LE)"
+            )
+        if payload.unusual_amount_threshold_le >= payload.max_wage_per_order_le:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Batas konfirmasi ({payload.unusual_amount_threshold_le} LE) harus lebih kecil dari batas maksimum keras ({payload.max_wage_per_order_le} LE)"
+            )
+
+        recipient_name = None
+        if payload.default_recipient_id:
+            recip = await db.admins.find_one({"_id": id_query(payload.default_recipient_id)})
+            if not recip:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Penerima upah admin default dengan ID '{payload.default_recipient_id}' tidak ditemukan dalam database akun tim"
+                )
+            recipient_name = recip.get("name", "Admin")
+
+        old_policy = await get_active_admin_wage_policy(db_inst=db)
+        new_policy_val = {
+            "default_wage_per_order_le": float(payload.default_wage_per_order_le),
+            "default_recipient_id": str(payload.default_recipient_id) if payload.default_recipient_id else None,
+            "default_recipient_name": recipient_name,
+            "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
+            "max_wage_per_order_le": float(payload.max_wage_per_order_le),
+            "enabled": bool(payload.enabled),
+            "currency": "EGP",
+            "rounding_policy": "piastre_round_half_up",
+            "updated_at": now_iso,
+            "updated_by_id": admin_id_str,
+            "updated_by_name": admin_name_str
+        }
+        tracked_keys = ["default_wage_per_order_le", "default_recipient_id", "unusual_amount_threshold_le", "max_wage_per_order_le", "enabled"]
+
+    changed_keys = [k for k in tracked_keys if old_policy.get(k) != new_policy_val.get(k)]
+
+    setting_key = f"{category}_wage_policy"
+    await db.settings.update_one(
+        {"key": setting_key},
+        {"$set": {"key": setting_key, "value": new_policy_val, "updated_at": now_iso}},
+        upsert=True
+    )
+
+    await record_audit_log(
+        action=f"update_{category}_wage_policy",
+        entity_type=f"{category}_wage_policy",
+        entity_id=setting_key,
+        entity_identifier=setting_key,
+        admin=admin,
+        metadata={
+            "category": category,
+            "previous": old_policy,
+            "new": new_policy_val,
+            "changed_fields": changed_keys
+        }
+    )
+
+    result_policy = dict(new_policy_val)
+    result_policy["is_configured"] = True
+    return clean(result_policy)
+
+@api_router.get("/admin/wage-policies/{category}/history")
+async def admin_get_wage_policy_history_endpoint(
+    category: str,
+    limit: int = 50,
+    admin: dict = Depends(require_perm("access_finance"))
+):
+    if category not in ["production", "delivery", "material_purchase", "admin"]:
+        raise HTTPException(status_code=404, detail=f"Kategori kebijakan '{category}' tidak valid. Pilihan: production, delivery, material_purchase, admin")
+
+    query = {
+        "$or": [
+            {"entity_type": f"{category}_wage_policy"},
+            {"action": f"update_{category}_wage_policy"}
+        ]
+    }
+    if category == "delivery":
+        query["$or"].append({"action": {"$in": ["delivery_wage_threshold_override", "delivery_wage_hard_cap_rejection"]}})
+
+    cursor = db.audit_logs.find(query).sort("timestamp", -1)
+    to_list_fn = getattr(cursor, "to_list", None)
+    if callable(to_list_fn):
+        res = to_list_fn(min(limit, 100))
+        logs = await res if inspect.isawaitable(res) else []
+    else:
+        logs = []
+    return [clean(l) for l in logs]
 
 @api_router.get("/admin/delivery-wage-policy/history")
 async def admin_get_delivery_wage_policy_history(
@@ -7445,7 +8218,7 @@ async def admin_preview_delivery_wage_allocation(
 
     exceeds_hard_cap = total_wage > hard_cap
     requires_confirmation = threshold < total_wage <= hard_cap
-    allocations = calculate_delivery_helper_wage_allocations(total_wage, payload.helpers)
+    allocations = calculate_delivery_helper_wage_allocations(total_wage, payload.helpers, allow_empty=True)
 
     return {
         "total_wage_le": total_wage,

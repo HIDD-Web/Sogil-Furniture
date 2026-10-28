@@ -120,6 +120,10 @@ describe("AdminLayout - Component Mount & Navigation Tests", () => {
     const pendingPaymentLink = container.querySelector('a[href="/admin/pending-payments"]');
     expect(pendingPaymentLink).not.toBeNull();
     expect(pendingPaymentLink.textContent).toContain("Pending Payment");
+
+    const wageSettingsLink = container.querySelector('a[href="/admin/wage-settings"]');
+    expect(wageSettingsLink).not.toBeNull();
+    expect(wageSettingsLink.textContent).toContain("Pengaturan Upah");
   });
 
   test("2. Pending Payment link is visible when user has access_finance permission", async () => {
@@ -141,6 +145,10 @@ describe("AdminLayout - Component Mount & Navigation Tests", () => {
     const pendingPaymentLink = container.querySelector('a[href="/admin/pending-payments"]');
     expect(pendingPaymentLink).not.toBeNull();
     expect(pendingPaymentLink.textContent).toContain("Pending Payment");
+
+    const wageSettingsLink = container.querySelector('a[href="/admin/wage-settings"]');
+    expect(wageSettingsLink).not.toBeNull();
+    expect(wageSettingsLink.textContent).toContain("Pengaturan Upah");
   });
 
   test("3. Pending Payment link is hidden when user lacks finance or owner permission", async () => {
@@ -161,6 +169,9 @@ describe("AdminLayout - Component Mount & Navigation Tests", () => {
 
     const pendingPaymentLink = container.querySelector('a[href="/admin/pending-payments"]');
     expect(pendingPaymentLink).toBeNull();
+
+    const wageSettingsLink = container.querySelector('a[href="/admin/wage-settings"]');
+    expect(wageSettingsLink).toBeNull();
   });
 
   test("4. Displays loading state when auth is not checked or user is null", async () => {
