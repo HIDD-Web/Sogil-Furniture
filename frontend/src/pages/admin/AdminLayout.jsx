@@ -3,7 +3,7 @@ import { NavLink, Outlet, useNavigate, Navigate } from "react-router-dom";
 import api from "../../lib/api";
 import { useAuth } from "../../context/AuthContext";
 import { Logo } from "../../components/Logo";
-import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone, CircleDollarSign, Truck, Coins } from "lucide-react";
+import { LayoutDashboard, ShoppingBag, FileText, Sparkles, Package, Layers, Settings, LogOut, Menu, X, BarChart3, Wallet, Users, Ticket, Gift, UserRound, Smartphone, CircleDollarSign, Truck, Coins, Clock } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import PwaInstallModal from "../../components/PwaInstallModal";
 
