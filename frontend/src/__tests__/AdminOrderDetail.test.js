@@ -35,6 +35,7 @@ jest.mock("sonner", () => ({
     success: jest.fn(),
     error: jest.fn(),
     info: jest.fn(),
+    warning: jest.fn(),
   },
 }));
 
@@ -577,6 +578,304 @@ describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => 
       expect(container.querySelector('[data-testid="admin-wage-override-card"]')).not.toBeNull();
       expect(container.textContent).toContain("Upah Admin Per Pesanan");
       expect(container.textContent).toContain("Owner Only");
+    });
+  });
+
+  describe("Phase 09.2 — Production Wage Recovery & UI Gating", () => {
+    let container = null;
+    let root = null;
+
+    beforeEach(() => {
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+    });
+
+    afterEach(() => {
+      act(() => {
+        if (root) root.unmount();
+      });
+      if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
+      }
+      container = null;
+      root = null;
+      jest.clearAllMocks();
+    });
+
+    test("1. Displays error alert and toast when loading assignments fails instead of silent clearing", async () => {
+      const { toast } = require("sonner");
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 1,
+            subtotal_le: 500,
+          },
+        ],
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) {
+          return Promise.reject({
+            response: { data: { detail: "Database connection failed" } },
+          });
+        }
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      const errorAlert = container.querySelector('[data-testid="assignments-error-alert"]');
+      expect(errorAlert).not.toBeNull();
+      expect(errorAlert.textContent).toContain("Database connection failed");
+      expect(errorAlert.textContent).toContain("Coba Lagi");
+      expect(toast.error).toHaveBeenCalledWith("Database connection failed");
+    });
+
+    test("2. Displays capacity-full badge and hides assign button when item capacity is exhausted", async () => {
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 1,
+            subtotal_le: 500,
+          },
+        ],
+      };
+
+      const dummyAssignments = [
+        {
+          id: "asn_01",
+          order_item_id: "itm_001",
+          task_category: "whole_item",
+          worker_id: "w1",
+          worker_name: "Ahmad Tukang Kayu",
+          target_quantity: 1,
+          status: "assigned",
+        },
+      ];
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: dummyAssignments });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // Assign button should be absent because capacity is exhausted (1/1)
+      expect(container.querySelector('[data-testid="btn-assign-item-0"]')).toBeNull();
+
+      // Capacity-full badge should be present
+      const capacityBadge = container.querySelector('[data-testid="badge-capacity-full-0"]');
+      expect(capacityBadge).not.toBeNull();
+      expect(capacityBadge.textContent).toContain("Kapasitas penuh — 1/1 unit sudah ditugaskan");
+    });
+
+    test("3. Displays informational lifecycle status explaining obligation will accrue upon verification", async () => {
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 1,
+            subtotal_le: 500,
+          },
+        ],
+      };
+
+      const dummyAssignments = [
+        {
+          id: "asn_01",
+          order_item_id: "itm_001",
+          task_category: "whole_item",
+          worker_id: "w1",
+          worker_name: "Ahmad Tukang Kayu",
+          target_quantity: 1,
+          status: "assigned",
+        },
+      ];
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: dummyAssignments });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      const lifecycleInfo = container.querySelector('[data-testid="asn-lifecycle-info-asn_01"]');
+      expect(lifecycleInfo).not.toBeNull();
+      expect(lifecycleInfo.textContent).toContain("Kewajiban upah akan terbit secara otomatis setelah verifikasi hasil kerja");
+      expect(container.textContent).not.toContain("No. Kewajiban:");
+    });
+
+    test("4. Existing assignments appear with real worker name, and available capacity allows assign button", async () => {
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 3,
+            subtotal_le: 1500,
+          },
+        ],
+      };
+
+      const dummyAssignments = [
+        {
+          id: "asn_01",
+          order_item_id: "itm_001",
+          task_category: "whole_item",
+          worker_id: "w1",
+          worker_name: "Ahmad Tukang Kayu",
+          target_quantity: 1,
+          status: "assigned",
+        },
+      ];
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: dummyAssignments });
+        if (url.includes("/workers")) return Promise.resolve({ data: [{ id: "w1", name: "Ahmad Tukang Kayu" }] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // Assignment list rendered with worker name
+      expect(container.textContent).toContain("Ahmad Tukang Kayu");
+      expect(container.textContent).toContain("Daftar Penugasan Kerja (1)");
+
+      // Remaining capacity is 2 of 3, so button is still available
+      const assignBtn = container.querySelector('[data-testid="btn-assign-item-0"]');
+      expect(assignBtn).not.toBeNull();
+      expect(container.querySelector('[data-testid="badge-capacity-full-0"]')).toBeNull();
+    });
+
+    test("5. Empty assignment response is distinguished from failed request", async () => {
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 1,
+            subtotal_le: 500,
+          },
+        ],
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: [] });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // No error alert
+      expect(container.querySelector('[data-testid="assignments-error-alert"]')).toBeNull();
+      // No assignment cards
+      expect(container.textContent).not.toContain("Daftar Penugasan Kerja");
+      // Assign button is active and visible
+      expect(container.querySelector('[data-testid="btn-assign-item-0"]')).not.toBeNull();
+    });
+
+    test("6. Successful assignment creation followed by a failed refresh warns user not to retry blindly", async () => {
+      const { toast } = require("sonner");
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        items: [
+          {
+            item_id: "itm_001",
+            product_name_snapshot: "Meja Kayu Jati",
+            quantity: 2,
+            subtotal_le: 1000,
+          },
+        ],
+      };
+
+      let assignmentsCallCount = 0;
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) {
+          assignmentsCallCount++;
+          if (assignmentsCallCount === 1) {
+            return Promise.resolve({ data: [] });
+          }
+          // Second call (refresh after creation) fails!
+          return Promise.reject({ response: { data: { detail: "Gateway timeout" } } });
+        }
+        if (url.includes("/workers")) return Promise.resolve({ data: [{ id: "w1", name: "Ahmad" }] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-policies/production")) return Promise.resolve({ data: { is_configured: true, enabled: true, default_wage_per_unit_le: 100 } });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      api.post.mockResolvedValueOnce({ data: { id: "asn_99", status: "assigned" } });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // Open assign modal
+      const assignBtn = container.querySelector('[data-testid="btn-assign-item-0"]');
+      await act(async () => {
+        assignBtn.click();
+      });
+
+      // Submit form
+      const form = container.querySelector("form");
+      await act(async () => {
+        form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      });
+
+      // Creation succeeded and post was called
+      expect(api.post).toHaveBeenCalled();
+      // Warning toast was called alerting the user that assignment was saved but refresh failed
+      expect(toast.warning).toHaveBeenCalledWith(
+        expect.stringContaining("tidak terjadi duplikasi")
+      );
     });
   });
 });

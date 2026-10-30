@@ -9,7 +9,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History, Wrench, UserCheck, ShieldCheck, CheckSquare } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History, Wrench, UserCheck, ShieldCheck, CheckSquare, Info } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
@@ -67,6 +67,8 @@ export default function AdminOrderDetail() {
 
   // Phase 2 & Phase 08.2 Work Assignments State
   const [assignments, setAssignments] = useState([]);
+  const [assignmentsLoading, setAssignmentsLoading] = useState(false);
+  const [assignmentsError, setAssignmentsError] = useState(null);
   const [workers, setWorkers] = useState([]);
   const [wageRules, setWageRules] = useState([]);
   const [productionWagePolicy, setProductionWagePolicy] = useState(null);
@@ -92,9 +94,22 @@ export default function AdminOrderDetail() {
   const [verifyLoading, setVerifyLoading] = useState(false);
 
   const loadAssignments = () => {
-    api.get(`/admin/orders/${id}/assignments`)
-      .then((r) => { setAssignments(r.data || []); })
-      .catch(() => {});
+    setAssignmentsLoading(true);
+    setAssignmentsError(null);
+    return api.get(`/admin/orders/${id}/assignments`)
+      .then((r) => {
+        setAssignments(r.data || []);
+        return r.data || [];
+      })
+      .catch((err) => {
+        const msg = err.response?.data?.detail || "Gagal memuat daftar penugasan kerja";
+        setAssignmentsError(msg);
+        toast.error(msg);
+        throw err;
+      })
+      .finally(() => {
+        setAssignmentsLoading(false);
+      });
   };
 
   const loadWorkersAndRules = () => {
@@ -124,7 +139,7 @@ export default function AdminOrderDetail() {
         toast.error(msg);
       });
     loadPayments();
-    loadAssignments();
+    loadAssignments().catch(() => {});
     api.get("/store-info")
       .then((r) => {
         if (r.data?.exchange_rate_idr_per_le) {
@@ -229,6 +244,7 @@ export default function AdminOrderDetail() {
     }
 
     setAssignLoading(true);
+    let created = false;
     try {
       const payload = {
         worker_ids: selectedWorkers,
@@ -242,11 +258,20 @@ export default function AdminOrderDetail() {
         task_notes: assignForm.task_notes.trim() || undefined,
       };
       await api.post(`/admin/orders/${id}/assignments`, payload);
-      toast.success("Penugasan kerja berhasil dibuat");
+      created = true;
       setAssignModalOpen(false);
-      loadAssignments();
+      try {
+        await loadAssignments();
+        toast.success("Penugasan kerja berhasil dibuat");
+      } catch (refreshErr) {
+        toast.warning(
+          "Penugasan telah berhasil disimpan, namun tampilan gagal dimuat ulang. Harap muat ulang halaman sebelum mencoba lagi agar tidak terjadi duplikasi."
+        );
+      }
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Gagal membuat penugasan kerja");
+      if (!created) {
+        toast.error(err.response?.data?.detail || "Gagal membuat penugasan kerja");
+      }
     } finally {
       setAssignLoading(false);
     }
@@ -256,7 +281,7 @@ export default function AdminOrderDetail() {
     try {
       await api.patch(`/admin/assignments/${asnId}/progress`, { status: newStatus });
       toast.success(`Status penugasan diubah ke ${newStatus}`);
-      loadAssignments();
+      loadAssignments().catch(() => {});
     } catch (err) {
       toast.error(err.response?.data?.detail || "Gagal memperbarui status penugasan");
     }
@@ -290,7 +315,7 @@ export default function AdminOrderDetail() {
       });
       toast.success("Penugasan berhasil diverifikasi dan upah terakru!");
       setVerifyModalOpen(false);
-      loadAssignments();
+      loadAssignments().catch(() => {});
     } catch (err) {
       toast.error(err.response?.data?.detail || "Gagal memverifikasi penugasan");
     } finally {
@@ -305,7 +330,7 @@ export default function AdminOrderDetail() {
     try {
       await api.post(`/admin/assignments/${asnId}/cancel`, { reason: reason.trim() });
       toast.success("Penugasan kerja berhasil dibatalkan");
-      loadAssignments();
+      loadAssignments().catch(() => {});
     } catch (err) {
       toast.error(err.response?.data?.detail || "Gagal membatalkan penugasan kerja");
     }
@@ -617,10 +642,33 @@ export default function AdminOrderDetail() {
         </Block>
 
         <Block title="Produk & Penugasan Pengrajin">
+          {assignmentsLoading && (
+            <div className="mb-2 text-xs text-[#8B7355] italic" data-testid="assignments-loading-indicator">
+              Memuat data penugasan kerja...
+            </div>
+          )}
+          {assignmentsError && (
+            <div className="mb-3 flex items-center justify-between rounded-xl border border-red-200 bg-red-50 p-2.5 text-xs text-red-700" data-testid="assignments-error-alert">
+              <span>{assignmentsError}</span>
+              <button
+                type="button"
+                onClick={loadAssignments}
+                className="font-semibold underline hover:text-red-900 ml-2"
+              >
+                Coba Lagi
+              </button>
+            </div>
+          )}
           {items.map((it, i) => {
             if (!it) return null;
             const itId = it.item_id;
             const itemAssignments = assignments.filter((a) => a.order_item_id === itId);
+            const activeAssignments = itemAssignments.filter((a) => a.status !== "cancelled");
+            const alreadyAssignedQty = activeAssignments.reduce((sum, a) => sum + (parseInt(a.target_quantity, 10) || 1), 0);
+            const orderedQty = parseInt(it.quantity, 10) || 1;
+            const remainingQty = Math.max(0, orderedQty - alreadyAssignedQty);
+            const isFullyAssigned = remainingQty <= 0;
+
             return (
               <div key={i} className="border-b border-[#F1EBE0] pb-4 last:border-0 mb-3">
                 <div className="flex justify-between items-start gap-2">
@@ -630,15 +678,27 @@ export default function AdminOrderDetail() {
                     <div className="text-xs text-[#8B7355]">{fmtLE(it.subtotal_le)} LE</div>
                   </div>
                   {itId && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleOpenAssignModal(it)}
-                      data-testid={`btn-assign-item-${i}`}
-                      className="rounded-xl border-[#8B5A2B]/40 text-[#8B5A2B] text-xs font-semibold hover:bg-[#8B5A2B] hover:text-white"
-                    >
-                      <Wrench size={13} className="mr-1.5" /> Tugaskan Pengrajin
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      {isFullyAssigned ? (
+                        <span
+                          data-testid={`badge-capacity-full-${i}`}
+                          className="inline-flex items-center gap-1 rounded-xl border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800"
+                        >
+                          <CheckCircle2 size={13} className="text-amber-700" />
+                          Kapasitas penuh — {alreadyAssignedQty}/{orderedQty} unit sudah ditugaskan
+                        </span>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => handleOpenAssignModal(it)}
+                          data-testid={`btn-assign-item-${i}`}
+                          className="rounded-xl border-[#8B5A2B]/40 text-[#8B5A2B] text-xs font-semibold hover:bg-[#8B5A2B] hover:text-white"
+                        >
+                          <Wrench size={13} className="mr-1.5" /> Tugaskan Pengrajin
+                        </Button>
+                      )}
+                    </div>
                   )}
                 </div>
 
@@ -681,10 +741,20 @@ export default function AdminOrderDetail() {
                                 Kategori: <span className="font-medium text-[#5C4A3D]">{asn.task_category}</span> | Basis: {asn.pricing_basis} | Tarif: {fmtLE(asn.agreed_rate_le)} LE | Target: {asn.target_quantity}
                                 {asn.accepted_quantity > 0 && ` | Diterima: ${asn.accepted_quantity}`}
                               </div>
-                              {(asn.wage_obligation_numbers?.length > 0 || asn.wage_obligation_number) && (
+                              {(asn.wage_obligation_numbers?.length > 0 || asn.wage_obligation_number) ? (
                                 <div className="text-emerald-700 text-[11px] font-medium mt-0.5">
                                   No. Kewajiban: {asn.wage_obligation_numbers ? asn.wage_obligation_numbers.join(", ") : asn.wage_obligation_number}
                                 </div>
+                              ) : (
+                                asn.status !== "cancelled" && (
+                                  <div
+                                    className="text-[10px] text-[#8B7355] mt-1 flex items-center gap-1 italic"
+                                    data-testid={`asn-lifecycle-info-${asn.id || asn._id}`}
+                                  >
+                                    <Info size={11} className="shrink-0 text-[#8B7355]/80" />
+                                    <span>Kewajiban upah akan terbit secara otomatis setelah verifikasi hasil kerja (status selesai).</span>
+                                  </div>
+                                )
                               )}
                             </div>
 

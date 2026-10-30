@@ -4214,7 +4214,8 @@ async def admin_get_order_assignments(
 
     workers_map = {}
     if all_worker_ids:
-        worker_docs = await db.admins.find({"_id": {"$in": [id_query(w) for w in all_worker_ids]}}).to_list(len(all_worker_ids))
+        query_ids = multi_id_query(all_worker_ids)
+        worker_docs = await db.admins.find({"_id": {"$in": query_ids}}).to_list(len(query_ids))
         for w in worker_docs:
             workers_map[str(w["_id"])] = w.get("name", "Worker")
 
@@ -4224,7 +4225,7 @@ async def admin_get_order_assignments(
         # Multi-worker formatting
         wids = ca.get("worker_ids") or ([ca.get("worker_id")] if ca.get("worker_id") else [])
         ca_workers = [
-            {"worker_id": wid, "worker_name": workers_map.get(wid, "Worker")}
+            {"worker_id": wid, "worker_name": workers_map.get(wid) or ca.get("worker_name") or "Worker"}
             for wid in wids
         ]
         ca["workers"] = ca_workers
@@ -4233,7 +4234,7 @@ async def admin_get_order_assignments(
         elif len(ca_workers) == 1:
             ca["worker_name"] = ca_workers[0]["worker_name"]
         else:
-            ca["worker_name"] = workers_map.get(ca.get("worker_id"), ca.get("worker_name", "Worker"))
+            ca["worker_name"] = workers_map.get(ca.get("worker_id")) or ca.get("worker_name") or "Worker"
         result.append(ca)
     return result
 
