@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
 import PermanentDeleteModal from "../../components/admin/PermanentDeleteModal";
+import AdminWageOverrideCard from "../../components/admin/AdminWageOverrideCard";
 
 import { generateUUID } from "../../lib/utils";
 export { generateUUID };
@@ -39,7 +40,8 @@ export default function AdminOrderDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
-  const canDelete = user?.role === "owner" || user?.permissions?.delete_data;
+  const isOwner = user?.role === "owner";
+  const canDelete = isOwner || user?.permissions?.delete_data;
   const canEditPrice = user?.role === "owner" || user?.permissions?.access_finance;
   const canModifyProducts = user?.role === "owner" || user?.permissions?.modify_products;
   const [order, setOrder] = useState(null);
@@ -850,6 +852,17 @@ export default function AdminOrderDetail() {
           <Row k="Pengiriman" v={order.delivery_method === "delivery" ? "Delivery" : "Ambil di Toko"} />
           {order.delivery_zone_name && <Row k="Zona" v={order.delivery_zone_name} />}
         </Block>
+
+        {/* Konfigurasi Upah Admin (Phase 08.4D - Owner Only) */}
+        {isOwner && (
+          <AdminWageOverrideCard
+            orderId={id}
+            order={order}
+            isOwner={isOwner}
+            workers={workers}
+            onUpdated={load}
+          />
+        )}
 
         {/* Riwayat Pembayaran (Phase 1) */}
         <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm lg:col-span-2">

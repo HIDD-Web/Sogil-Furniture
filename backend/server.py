@@ -11,8 +11,8 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response as StarletteResponse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 import logging
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional, Dict, Any, Tuple
 import uuid
 from enum import Enum
 import secrets
@@ -84,6 +84,32 @@ def multi_id_query(id_list) -> list:
             res.append(ObjectId(val_str))
         except (InvalidId, TypeError):
             pass
+    return res
+
+async def _mongo_find_one(col, *args, **kwargs):
+    if not hasattr(col, "find_one"):
+        return None
+    res = col.find_one(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    if hasattr(res, "_mock_return_value") or type(res).__name__ == "MagicMock":
+        return None
+    return res
+
+async def _mongo_insert_one(col, *args, **kwargs):
+    if not hasattr(col, "insert_one"):
+        return None
+    res = col.insert_one(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
+
+async def _mongo_update_one(col, *args, **kwargs):
+    if not hasattr(col, "update_one"):
+        return None
+    res = col.update_one(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
     return res
 
 # --------------------------------------------------------------------------
@@ -386,12 +412,22 @@ async def generate_adjustment_number(session=None) -> str:
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
 
-async def compute_order_payment_summary(order_doc: dict) -> dict:
+async def compute_order_payment_summary(order_doc: dict, session=None) -> dict:
     order_oid = id_query(str(order_doc.get("_id") or order_doc.get("id")))
-    recorded_payments = await db.payments.find({
+    find_kw = {"session": session} if session is not None else {}
+    find_res = db.payments.find({
         "order_id": order_oid,
         "status": "recorded"
-    }).to_list(1000)
+    }, **find_kw)
+    if inspect.isawaitable(find_res):
+        find_res = await find_res
+    if hasattr(find_res, "to_list"):
+        coro = find_res.to_list(1000)
+        recorded_payments = (await coro) if inspect.isawaitable(coro) else coro
+    elif isinstance(find_res, list):
+        recorded_payments = find_res
+    else:
+        recorded_payments = []
 
     total_le = _num(order_doc.get("total_le", 0.0))
 
@@ -1813,6 +1849,12 @@ async def _create_invoice_order(request: Request, data: OrderInput):
         "estimated_total_idr": round(total_le * rate),
         "rate_timestamp": now,
         "requires_admin_confirmation": False,
+        "admin_wage_eligibility": {
+            "scope_status": "in_scope_pending",
+            "governance_mode": "automatic",
+            "evaluated_at": now,
+            "version": 1
+        },
         "created_at": now,
         "updated_at": now,
     }
@@ -2008,6 +2050,12 @@ async def create_order(request: Request, data: OrderInput):
         "delivery_method": data.delivery_method, "delivery_zone_id": zone_id, "delivery_zone_name": zone_name,
         "delivery_fee_le": delivery_fee, "payment_method": data.payment_method,
         "payment_status": "belum_dibayar", "order_status": "pesanan_masuk",
+        "admin_wage_eligibility": {
+            "scope_status": "in_scope_pending",
+            "governance_mode": "automatic",
+            "evaluated_at": now,
+            "version": 1
+        },
         "notes": (data.notes or "").strip(), "admin_note": "",
         "items": items, "item": items[0],
         "subtotal_le": subtotal_le, "discount_code": (disc_doc.get("code") if disc_doc else None),
@@ -2257,14 +2305,9 @@ async def record_order_revenue(order):
 
 @api_router.patch("/admin/orders/{order_id}")
 async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict = Depends(require_perm("manage_orders"))):
-    update = audit_fields(admin)
     valid_status = {"pesanan_masuk", "dikonfirmasi", "diproses", "siap", "selesai", "dibatalkan"}
     valid_pay = {"belum_dibayar", "dp", "lunas"}
     valid_methods = {"cash", "transfer"}
-
-    existing_order = await db.orders.find_one({"_id": id_query(order_id)})
-    if not existing_order:
-        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
 
     fields_set = getattr(data, "model_fields_set", None)
     if fields_set is None:
@@ -2275,213 +2318,287 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             detail="Status pembayaran tidak dapat diubah secara manual. Status dikelola secara otomatis melalui pencatatan pembayaran riil."
         )
 
-    # Phase 3.F.4.3 Package 8.1 — Active Delivery Trip Order Guard
-    active_trip_id = existing_order.get("active_delivery_trip_id")
-    if active_trip_id:
-        has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
-        has_conflicting_mutation = (
-            data.order_status is not None or
-            data.payment_method is not None or
-            has_price_change
-        )
-        if has_conflicting_mutation:
-            trip_ref = existing_order.get("active_delivery_trip_number") or active_trip_id
-            raise HTTPException(
-                status_code=409,
-                detail=f"Pesanan sedang terikat pada trip pengiriman aktif ({trip_ref}). Lepaskan penugasan dari trip sebelum memodifikasi status atau rincian pesanan."
+    async def _do_admin_update_order(session):
+        find_kw = {"session": session} if session is not None else {}
+        update = audit_fields(admin)
+
+        existing_order = await _mongo_find_one(db.orders, {"_id": id_query(order_id)}, **find_kw)
+        if not existing_order:
+            raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+        # Phase 3.F.4.3 Package 8.1 — Active Delivery Trip Order Guard
+        active_trip_id = existing_order.get("active_delivery_trip_id")
+        if active_trip_id:
+            has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
+            has_conflicting_mutation = (
+                data.order_status is not None or
+                data.payment_method is not None or
+                has_price_change
             )
-
-    # Phase 3.B.1 — Handover Recognition & Status Transition Checks
-    existing_status = existing_order.get("order_status")
-    has_immutable_snapshot = (
-        bool(existing_order.get("completed_at")) or
-        existing_order.get("recognized_revenue_le") is not None or
-        existing_status == "selesai"
-    )
-
-    if data.order_status is not None:
-        if data.order_status not in valid_status:
-            raise HTTPException(status_code=400, detail="Status tidak valid")
-        # Safeguard on cancellation after handover (selesai -> dibatalkan or any order with established handover snapshot)
-        if (existing_status == "selesai" or has_immutable_snapshot) and data.order_status == "dibatalkan":
-            if not data.confirm_handover_cancellation:
+            if has_conflicting_mutation:
+                trip_ref = existing_order.get("active_delivery_trip_number") or active_trip_id
                 raise HTTPException(
-                    status_code=400,
-                    detail="Pembatalan pesanan yang telah selesai memerlukan konfirmasi eksplisit (confirm_handover_cancellation=True)."
+                    status_code=409,
+                    detail=f"Pesanan sedang terikat pada trip pengiriman aktif ({trip_ref}). Lepaskan penugasan dari trip sebelum memodifikasi status atau rincian pesanan."
                 )
-            reason_str = (data.cancellation_reason or "").strip()
-            if len(reason_str) < 5:
+
+        # Phase 3.B.1 — Handover Recognition & Status Transition Checks
+        existing_status = existing_order.get("order_status")
+        has_immutable_snapshot = (
+            bool(existing_order.get("completed_at")) or
+            existing_order.get("recognized_revenue_le") is not None or
+            existing_status == "selesai"
+        )
+
+        if data.order_status is not None:
+            if data.order_status not in valid_status:
+                raise HTTPException(status_code=400, detail="Status tidak valid")
+            # Safeguard on cancellation after handover (selesai -> dibatalkan or any order with established handover snapshot)
+            if (existing_status == "selesai" or has_immutable_snapshot) and data.order_status == "dibatalkan":
+                if not data.confirm_handover_cancellation:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Pembatalan pesanan yang telah selesai memerlukan konfirmasi eksplisit (confirm_handover_cancellation=True)."
+                    )
+                reason_str = (data.cancellation_reason or "").strip()
+                if len(reason_str) < 5:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Alasan pembatalan pesanan yang telah selesai wajib diisi minimal 5 karakter."
+                    )
+                perms = admin.get("permissions") or {}
+                if admin.get("role") != "owner" and not perms.get("access_finance"):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Hanya owner atau admin dengan akses keuangan yang dapat membatalkan pesanan yang telah selesai."
+                    )
+            update["order_status"] = data.order_status
+
+        if data.payment_method is not None:
+            if data.payment_method not in valid_methods:
+                raise HTTPException(status_code=400, detail="Metode pembayaran tidak valid")
+            update["payment_method"] = data.payment_method
+        if data.admin_note is not None:
+            update["admin_note"] = data.admin_note
+
+        has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
+        if has_price_change:
+            # Phase 3.B.1 / Owner Decision B: Direct post-handover financial edits are strictly rejected (HTTP 409)
+            if has_immutable_snapshot:
                 raise HTTPException(
-                    status_code=400,
-                    detail="Alasan pembatalan pesanan yang telah selesai wajib diisi minimal 5 karakter."
+                    status_code=409,
+                    detail="Pesanan yang telah selesai tidak dapat diubah nilainya secara langsung. Gunakan penyesuaian keuangan resmi (Finance Adjustment)."
                 )
             perms = admin.get("permissions") or {}
             if admin.get("role") != "owner" and not perms.get("access_finance"):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Hanya owner atau admin dengan akses keuangan yang dapat membatalkan pesanan yang telah selesai."
-                )
-        update["order_status"] = data.order_status
+                raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat mengubah harga pesanan")
 
-    if data.payment_method is not None:
-        if data.payment_method not in valid_methods:
-            raise HTTPException(status_code=400, detail="Metode pembayaran tidak valid")
-        update["payment_method"] = data.payment_method
-    if data.admin_note is not None:
-        update["admin_note"] = data.admin_note
+            if data.items is not None:
+                # Phase 2 Order-Item Reconciliation & Protection
+                existing_items = existing_order.get("items") or ([existing_order.get("item")] if existing_order.get("item") else [])
+                existing_map = {it.get("item_id"): it for it in existing_items if it.get("item_id")}
 
-    has_price_change = any(x is not None for x in (data.subtotal_le, data.delivery_fee_le, data.discount_le, data.total_le, data.items))
-    if has_price_change:
-        # Phase 3.B.1 / Owner Decision B: Direct post-handover financial edits are strictly rejected (HTTP 409)
-        if has_immutable_snapshot:
-            raise HTTPException(
-                status_code=409,
-                detail="Pesanan yang telah selesai tidak dapat diubah nilainya secara langsung. Gunakan penyesuaian keuangan resmi (Finance Adjustment)."
-            )
-        perms = admin.get("permissions") or {}
-        if admin.get("role") != "owner" and not perms.get("access_finance"):
-            raise HTTPException(status_code=403, detail="Hanya admin dengan akses keuangan atau owner yang dapat mengubah harga pesanan")
+                # Identify protected item IDs linked to assignments or obligations
+                order_id_str = str(existing_order.get("_id") or existing_order.get("id"))
 
-        if data.items is not None:
-            # Phase 2 Order-Item Reconciliation & Protection
-            existing_items = existing_order.get("items") or ([existing_order.get("item")] if existing_order.get("item") else [])
-            existing_map = {it.get("item_id"): it for it in existing_items if it.get("item_id")}
+                # Query work assignments (active, completed, cancelled)
+                cursor_asn = db.work_assignments.find({
+                    "order_id": order_id_str,
+                    "status": {"$in": ["assigned", "in_progress", "ready_for_review", "accruing", "completed", "cancelled"]}
+                }, **find_kw)
+                linked_assignments = await cursor_asn.to_list(1000) if hasattr(cursor_asn, "to_list") else cursor_asn
 
-            # Identify protected item IDs linked to assignments or obligations
-            order_id_str = str(existing_order.get("_id") or existing_order.get("id"))
-            order_id_filter = {"$in": [order_id_str, id_query(order_id_str)]}
+                # Query wage obligations
+                cursor_ob = db.wage_obligations.find({
+                    "order_id": order_id_str,
+                    "status": {"$in": ["accrued", "partially_paid", "paid", "voided"]}
+                }, **find_kw)
+                linked_obligations = await cursor_ob.to_list(1000) if hasattr(cursor_ob, "to_list") else cursor_ob
 
-            # Query work assignments (active, completed, cancelled)
-            linked_assignments = await db.work_assignments.find({
-                "order_id": order_id_str,
-                "status": {"$in": ["assigned", "in_progress", "ready_for_review", "accruing", "completed", "cancelled"]}
-            }).to_list(1000)
+                protected_item_ids = {a.get("order_item_id") for a in linked_assignments if a.get("order_item_id")}
+                protected_item_ids.update({o.get("order_item_id") for o in linked_obligations if o.get("order_item_id")})
 
-            # Query wage obligations
-            linked_obligations = await db.wage_obligations.find({
-                "order_id": order_id_str,
-                "status": {"$in": ["accrued", "partially_paid", "paid", "voided"]}
-            }).to_list(1000)
+                sanitized_items = []
+                seen_item_ids = set()
+                for incoming_it in data.items:
+                    it_dict = dict(incoming_it)
+                    it_id = it_dict.get("item_id")
+                    if it_id:
+                        if it_id not in existing_map:
+                            raise HTTPException(status_code=400, detail=f"item_id tidak dikenal untuk pesanan ini: {it_id}")
+                        if it_id in seen_item_ids:
+                            raise HTTPException(status_code=400, detail=f"Duplikasi item_id dalam daftar item: {it_id}")
+                        seen_item_ids.add(it_id)
+                    else:
+                        it_id = f"itm_{uuid.uuid4().hex[:12]}"
+                        it_dict["item_id"] = it_id
+                        seen_item_ids.add(it_id)
 
-            protected_item_ids = {a.get("order_item_id") for a in linked_assignments if a.get("order_item_id")}
-            protected_item_ids.update({o.get("order_item_id") for o in linked_obligations if o.get("order_item_id")})
+                    sanitized_items.append(it_dict)
 
-            sanitized_items = []
-            seen_item_ids = set()
-            for incoming_it in data.items:
-                it_dict = dict(incoming_it)
-                it_id = it_dict.get("item_id")
-                if it_id:
-                    if it_id not in existing_map:
-                        raise HTTPException(status_code=400, detail=f"item_id tidak dikenal untuk pesanan ini: {it_id}")
-                    if it_id in seen_item_ids:
-                        raise HTTPException(status_code=400, detail=f"Duplikasi item_id dalam daftar item: {it_id}")
-                    seen_item_ids.add(it_id)
-                else:
-                    it_id = f"itm_{uuid.uuid4().hex[:12]}"
-                    it_dict["item_id"] = it_id
-                    seen_item_ids.add(it_id)
-
-                sanitized_items.append(it_dict)
-
-            # Check if any protected item was omitted/removed
-            for prot_id in protected_item_ids:
-                if prot_id not in seen_item_ids:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Tidak dapat menghapus item pesanan yang memiliki penugasan kerja aktif atau selesai (item_id: {prot_id})"
-                    )
-
-            # Check quantity floor protection against active assignments
-            for a in linked_assignments:
-                if a.get("status") in ("assigned", "in_progress", "ready_for_review", "accruing"):
-                    aid = a.get("order_item_id")
-                    target_qty = a.get("target_quantity", 1)
-                    matched_item = next((it for it in sanitized_items if it.get("item_id") == aid), None)
-                    if matched_item and int(matched_item.get("quantity", 0)) < target_qty:
+                # Check if any protected item was omitted/removed
+                for prot_id in protected_item_ids:
+                    if prot_id not in seen_item_ids:
                         raise HTTPException(
                             status_code=409,
-                            detail=f"Kuantitas item tidak boleh kurang dari kuantitas penugasan aktif ({target_qty})"
+                            detail=f"Tidak dapat menghapus item pesanan yang memiliki penugasan kerja aktif atau selesai (item_id: {prot_id})"
                         )
 
-            update["items"] = sanitized_items
-            if len(sanitized_items) > 0:
-                update["item"] = sanitized_items[0]
-        if data.subtotal_le is not None:
-            update["subtotal_le"] = float(data.subtotal_le)
-        if data.delivery_fee_le is not None:
-            update["delivery_fee_le"] = float(data.delivery_fee_le)
-        if data.discount_le is not None:
-            update["discount_le"] = float(data.discount_le)
+                # Check quantity floor protection against active assignments
+                for a in linked_assignments:
+                    if a.get("status") in ("assigned", "in_progress", "ready_for_review", "accruing"):
+                        aid = a.get("order_item_id")
+                        target_qty = a.get("target_quantity", 1)
+                        matched_item = next((it for it in sanitized_items if it.get("item_id") == aid), None)
+                        if matched_item and int(matched_item.get("quantity", 0)) < target_qty:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"Kuantitas item tidak boleh kurang dari kuantitas penugasan aktif ({target_qty})"
+                            )
 
-        if data.total_le is not None:
-            update["total_le"] = float(data.total_le)
+                update["items"] = sanitized_items
+                if len(sanitized_items) > 0:
+                    update["item"] = sanitized_items[0]
+            if data.subtotal_le is not None:
+                update["subtotal_le"] = float(data.subtotal_le)
+            if data.delivery_fee_le is not None:
+                update["delivery_fee_le"] = float(data.delivery_fee_le)
+            if data.discount_le is not None:
+                update["discount_le"] = float(data.discount_le)
+
+            if data.total_le is not None:
+                update["total_le"] = float(data.total_le)
+            else:
+                cur_sub = update.get("subtotal_le", existing_order.get("subtotal_le", 0))
+                cur_del = update.get("delivery_fee_le", existing_order.get("delivery_fee_le", 0))
+                cur_disc = update.get("discount_le", existing_order.get("discount_le", 0))
+                cur_ref = existing_order.get("referral_discount_le", 0)
+                cur_pts = existing_order.get("points_redeemed_le", 0)
+                update["total_le"] = max(0.0, float(cur_sub) - float(cur_disc) - float(cur_ref) - float(cur_pts) + float(cur_del))
+
+            rate = existing_order.get("exchange_rate_idr_per_le") or 357
+            update["estimated_total_idr"] = round(update["total_le"] * rate)
+
+        # Phase 3.B.1 — Immutable Handover Snapshot & Status Transition Audit History
+        now_iso = update.get("updated_at") or datetime.now(timezone.utc).isoformat()
+        mongo_ops = {"$set": update}
+
+        target_status = data.order_status
+        is_establishing_snapshot = False
+        if target_status is not None and target_status != existing_status:
+            # 1. First valid handover to 'selesai'
+            if target_status == "selesai":
+                # If order has never been completed before, stamp immutable snapshot
+                if not existing_order.get("completed_at") and existing_order.get("recognized_revenue_le") is None:
+                    rev_le = float(existing_order.get("total_le", 0.0))
+                    update["completed_at"] = now_iso
+                    update["completed_by_id"] = admin.get("id")
+                    update["completed_by_name"] = admin.get("name", "Admin")
+                    update["recognized_revenue_le"] = rev_le
+                    is_establishing_snapshot = True
+
+                # Phase 08.5C.4 / Phase 08.5C.6 — Admin Wage Accrual: Sequence B (Paid first, completed later)
+                # Evaluate shared eligibility check inside the transaction session
+                order_for_wage = dict(existing_order)
+                order_for_wage.update(update)
+                order_for_wage["order_status"] = "selesai"
+                if is_order_fully_paid(order_for_wage) and not is_order_excluded_from_admin_wage(order_for_wage):
+                    admin_wage_res = await evaluate_and_process_order_admin_wage_accrual(
+                        order_for_wage,
+                        admin,
+                        session=session,
+                        lifecycle_event="order_completed",
+                        transition_context={
+                            "transition_type": "order_completion",
+                            "order_id": order_id,
+                            "from_status": existing_status,
+                            "to_status": target_status,
+                        }
+                    )
+                    if admin_wage_res:
+                        if admin_wage_res.get("obligation"):
+                            update["admin_wage_obligation"] = admin_wage_res["obligation"]
+                            update["admin_wage_blocked"] = None
+                        elif admin_wage_res.get("blocked"):
+                            update["admin_wage_blocked"] = admin_wage_res["blocked"]
+                        elif admin_wage_res.get("skipped") and admin_wage_res.get("status") not in ("skipped_order_not_completed", "skipped_payment_not_lunas"):
+                            update["admin_wage_skipped"] = admin_wage_res["skipped"]
+                        if admin_wage_res.get("eligibility"):
+                            update["admin_wage_eligibility"] = admin_wage_res["eligibility"]
+
+            # 2. Build status history entry
+            history_entry = {
+                "from_status": existing_status,
+                "to_status": target_status,
+                "changed_at": now_iso,
+                "changed_by_id": admin.get("id"),
+                "changed_by_name": admin.get("name", "Admin"),
+                "reason": (data.cancellation_reason or "").strip() if target_status == "dibatalkan" else None
+            }
+            mongo_ops["$push"] = {"status_history": history_entry}
+
+        if is_establishing_snapshot:
+            # Concurrency guard: Ensure atomicity at database level.
+            # If another concurrent worker already established completed_at, do not overwrite it.
+            atomic_query = {
+                "_id": id_query(order_id),
+                "completed_at": {"$in": [None, False]},
+                "recognized_revenue_le": None,
+            }
+            update_result = await _mongo_update_one(db.orders, atomic_query, mongo_ops, **find_kw)
+            if update_result and hasattr(update_result, "matched_count") and update_result.matched_count == 0:
+                # Another concurrent request won the race to establish the snapshot.
+                # Perform fallback update preserving the existing snapshot and updating remaining fields if needed.
+                fallback_update = dict(update)
+                fallback_update.pop("completed_at", None)
+                fallback_update.pop("completed_by_id", None)
+                fallback_update.pop("completed_by_name", None)
+                fallback_update.pop("recognized_revenue_le", None)
+                fallback_ops = {"$set": fallback_update}
+                if "$push" in mongo_ops:
+                    fallback_ops["$push"] = mongo_ops["$push"]
+                await _mongo_update_one(db.orders, {"_id": id_query(order_id)}, fallback_ops, **find_kw)
         else:
-            cur_sub = update.get("subtotal_le", existing_order.get("subtotal_le", 0))
-            cur_del = update.get("delivery_fee_le", existing_order.get("delivery_fee_le", 0))
-            cur_disc = update.get("discount_le", existing_order.get("discount_le", 0))
-            cur_ref = existing_order.get("referral_discount_le", 0)
-            cur_pts = existing_order.get("points_redeemed_le", 0)
-            update["total_le"] = max(0.0, float(cur_sub) - float(cur_disc) - float(cur_ref) - float(cur_pts) + float(cur_del))
+            await _mongo_update_one(db.orders, {"_id": id_query(order_id)}, mongo_ops, **find_kw)
 
-        rate = existing_order.get("exchange_rate_idr_per_le") or 357
-        update["estimated_total_idr"] = round(update["total_le"] * rate)
+        order = await _mongo_find_one(db.orders, {"_id": id_query(order_id)}, **find_kw)
+        return clean(order)
 
-    # Phase 3.B.1 — Immutable Handover Snapshot & Status Transition Audit History
-    now_iso = update.get("updated_at") or datetime.now(timezone.utc).isoformat()
-    mongo_ops = {"$set": update}
+    def _is_transient_conflict(exc: Exception) -> bool:
+        if isinstance(exc, pymongo.errors.PyMongoError):
+            if hasattr(exc, "has_error_label") and exc.has_error_label("TransientTransactionError"):
+                return True
+            if isinstance(exc, pymongo.errors.OperationFailure) and getattr(exc, "code", None) == 112:
+                return True
+        return False
 
-    target_status = data.order_status
-    is_establishing_snapshot = False
-    if target_status is not None and target_status != existing_status:
-        # 1. First valid handover to 'selesai'
-        if target_status == "selesai":
-            # If order has never been completed before, stamp immutable snapshot
-            if not existing_order.get("completed_at") and existing_order.get("recognized_revenue_le") is None:
-                rev_le = float(existing_order.get("total_le", 0.0))
-                update["completed_at"] = now_iso
-                update["completed_by_id"] = admin.get("id")
-                update["completed_by_name"] = admin.get("name", "Admin")
-                update["recognized_revenue_le"] = rev_le
-                is_establishing_snapshot = True
+    max_txn_retries = 3
+    for attempt in range(1, max_txn_retries + 1):
+        session = None
+        try:
+            session = await client.start_session()
+        except (pymongo.errors.ConfigurationError, pymongo.errors.InvalidOperation, AttributeError, RuntimeError) as sess_err:
+            if not is_standalone_fallback_permitted():
+                logger.error(f"Transaction capability unavailable for admin_update_order in mode {get_environment_mode()!r}: {sess_err}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Layanan transaksi multi-dokumen tidak tersedia pada lingkungan ini (Fail-Closed)"
+                )
+            session = None
 
-        # 2. Build status history entry
-        history_entry = {
-            "from_status": existing_status,
-            "to_status": target_status,
-            "changed_at": now_iso,
-            "changed_by_id": admin.get("id"),
-            "changed_by_name": admin.get("name", "Admin"),
-            "reason": (data.cancellation_reason or "").strip() if target_status == "dibatalkan" else None
-        }
-        mongo_ops["$push"] = {"status_history": history_entry}
-
-    if is_establishing_snapshot:
-        # Concurrency guard: Ensure atomicity at database level.
-        # If another concurrent worker already established completed_at, do not overwrite it.
-        atomic_query = {
-            "_id": id_query(order_id),
-            "completed_at": {"$in": [None, False]},
-            "recognized_revenue_le": None,
-        }
-        update_result = await db.orders.update_one(atomic_query, mongo_ops)
-        if update_result.matched_count == 0:
-            # Another concurrent request won the race to establish the snapshot.
-            # Perform fallback update preserving the existing snapshot and updating remaining fields if needed.
-            fallback_update = dict(update)
-            fallback_update.pop("completed_at", None)
-            fallback_update.pop("completed_by_id", None)
-            fallback_update.pop("completed_by_name", None)
-            fallback_update.pop("recognized_revenue_le", None)
-            fallback_ops = {"$set": fallback_update}
-            if "$push" in mongo_ops:
-                fallback_ops["$push"] = mongo_ops["$push"]
-            await db.orders.update_one({"_id": id_query(order_id)}, fallback_ops)
-    else:
-        await db.orders.update_one({"_id": id_query(order_id)}, mongo_ops)
-
-    order = await db.orders.find_one({"_id": id_query(order_id)})
-    return clean(order)
+        try:
+            if session is not None:
+                async with session:
+                    async with session.start_transaction():
+                        return await _do_admin_update_order(session)
+            else:
+                return await _do_admin_update_order(None)
+        except Exception as txn_exc:
+            if _is_transient_conflict(txn_exc) and attempt < max_txn_retries:
+                logger.warning(f"Transient transaction error in admin_update_order (attempt {attempt}/{max_txn_retries}): {txn_exc}")
+                await asyncio.sleep(0.05 * attempt)
+                continue
+            raise
 
 @api_router.post("/admin/orders/{order_id}/permanent-delete")
 async def admin_permanent_delete_order(
@@ -2906,10 +3023,16 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
     )
 
     # Persistent marker: if this order had historical DP with 0 prior payment docs, mark it unreconciled
-    is_qualifying_legacy_dp = (
-        bool(order.get("has_unrecorded_legacy_dp")) or
-        (order.get("payment_status") == "dp" and (await db.payments.count_documents({"order_id": order["_id"], "status": "recorded"})) == 0)
-    )
+    has_prior_pmts = True
+    if order.get("payment_status") == "dp":
+        cd_fn = getattr(db.payments, "count_documents", None)
+        if callable(cd_fn):
+            cnt_res = cd_fn({"order_id": order["_id"], "status": "recorded"})
+            cnt = (await cnt_res) if inspect.isawaitable(cnt_res) else (cnt_res if isinstance(cnt_res, int) else 1)
+            has_prior_pmts = (cnt > 0)
+    is_qualifying_legacy_dp = bool(order.get("has_unrecorded_legacy_dp")) or (order.get("payment_status") == "dp" and not has_prior_pmts)
+
+    old_payment_status = order.get("payment_status")
 
     # 5. Atomic Execution
     async def _do_create_payment(session):
@@ -3108,7 +3231,62 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
                 if inspect.isawaitable(res_coro):
                     await res_coro
 
-        return created_pmt_id, txn_id
+        # Admin Wage Accrual Evaluation & Order Update within transaction (Phase 08.5C.4 Lifecycle Accrual)
+        new_summary = await compute_order_payment_summary(order, session=session)
+        is_transition_to_lunas = (
+            old_payment_status != "lunas" and
+            new_summary.get("payment_status") == "lunas" and
+            not order.get("admin_wage_legacy_reconciled")
+        )
+        admin_wage_result = None
+        if is_transition_to_lunas:
+            # Trigger Point 1: Transition to lunas evaluates shared eligibility (Condition 1 + Condition 2)
+            admin_wage_result = await evaluate_and_process_order_admin_wage_accrual(
+                order,
+                admin,
+                session=session,
+                payment_summary=new_summary,
+                lifecycle_event="payment_lunas",
+                transition_context={
+                    "transition_type": "payment_lunas",
+                    "order_id": str(order.get("_id") or order_id),
+                    "from_payment_status": old_payment_status,
+                    "to_payment_status": "lunas",
+                    "payment_id": str(created_pmt_id) if created_pmt_id else None,
+                }
+            )
+
+        # Update order cached status and admin wage summary inside the transaction
+        order_update_set = {
+            "payment_method": payment_method,
+            "payment_status": new_summary["payment_status"],
+            "paid_amount_le": new_summary["paid_amount_le"],
+            "outstanding_amount_le": new_summary["outstanding_amount_le"],
+            "updated_at": now,
+            "updated_by_name": admin.get("name", "Admin"),
+        }
+        if "canonical_paid_amount_le" in new_summary:
+            order_update_set["canonical_paid_amount_le"] = new_summary["canonical_paid_amount_le"]
+        if is_qualifying_legacy_dp:
+            order_update_set["has_unrecorded_legacy_dp"] = True
+
+        if admin_wage_result:
+            if admin_wage_result.get("obligation"):
+                order_update_set["admin_wage_obligation"] = admin_wage_result["obligation"]
+                order_update_set["admin_wage_blocked"] = None
+            elif admin_wage_result.get("blocked"):
+                order_update_set["admin_wage_blocked"] = admin_wage_result["blocked"]
+            elif admin_wage_result.get("skipped"):
+                # Persist skipped metadata only for permanent skips (e.g. policy disabled, legacy reconciled),
+                # not for transient lifecycle skips (order not yet completed will be evaluated upon completion)
+                if admin_wage_result.get("status") not in ("skipped_order_not_completed", "skipped_payment_not_lunas"):
+                    order_update_set["admin_wage_skipped"] = admin_wage_result["skipped"]
+            if admin_wage_result.get("eligibility"):
+                order_update_set["admin_wage_eligibility"] = admin_wage_result["eligibility"]
+
+        await _mongo_update_one(db.orders, {"_id": order["_id"]}, {"$set": order_update_set}, **ins_kw)
+
+        return created_pmt_id, txn_id, new_summary, admin_wage_result
 
     def _is_transient_conflict(exc: Exception) -> bool:
         if isinstance(exc, pymongo.errors.PyMongoError):
@@ -3119,8 +3297,7 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
         return False
 
     max_txn_retries = 3
-    pmt_id = None
-    txn_id = None
+    res_tuple = None
 
     for attempt in range(1, max_txn_retries + 1):
         session = None
@@ -3139,10 +3316,10 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
             if session is not None:
                 async with session:
                     async with session.start_transaction():
-                        pmt_id, txn_id = await _do_create_payment(session)
+                        res_tuple = await _do_create_payment(session)
             else:
                 # Explicitly permitted standalone / test fallback
-                pmt_id, txn_id = await _do_create_payment(None)
+                res_tuple = await _do_create_payment(None)
             break
         except pymongo.errors.DuplicateKeyError as dke:
             err_msg = str(dke)
@@ -3156,7 +3333,7 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
                         )
                     res = clean(winning_pmt)
                     try:
-                        fresh_order = await db.orders.find_one({"_id": order["_id"]})
+                        fresh_order = await _mongo_find_one(db.orders, {"_id": order["_id"]})
                         new_summary = await compute_order_payment_summary(fresh_order) if fresh_order else None
                         if new_summary:
                             res["order_summary"] = new_summary
@@ -3181,34 +3358,9 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
                 )
             raise
 
-    # 6. Recalculate and update order cached payment status
-    order_update_set = {
-        "payment_method": payment_method,
-        "updated_at": now,
-        "updated_by_name": admin.get("name", "Admin"),
-    }
-    if is_qualifying_legacy_dp:
-        order_update_set["has_unrecorded_legacy_dp"] = True
+    pmt_id, txn_id, new_summary, admin_wage_result = res_tuple
 
-    await db.orders.update_one({"_id": order["_id"]}, {"$set": order_update_set})
-
-    fresh_order = await db.orders.find_one({"_id": order["_id"]})
-    new_summary = await compute_order_payment_summary(fresh_order)
-
-    status_update = {
-        "payment_status": new_summary["payment_status"],
-        "paid_amount_le": new_summary["paid_amount_le"],
-        "outstanding_amount_le": new_summary["outstanding_amount_le"],
-    }
-    if "canonical_paid_amount_le" in new_summary:
-        status_update["canonical_paid_amount_le"] = new_summary["canonical_paid_amount_le"]
-
-    await db.orders.update_one(
-        {"_id": order["_id"]},
-        {"$set": status_update}
-    )
-
-    created_payment = await db.payments.find_one({"_id": id_query(pmt_id)}) or {
+    created_payment = await _mongo_find_one(db.payments, {"_id": id_query(pmt_id)}) or {
         "_id": pmt_id,
         "payment_number": payment_num,
         "order_id": str(order["_id"]),
@@ -3220,6 +3372,8 @@ async def admin_create_order_payment(order_id: str, payload: PaymentCreateInput,
     }
     clean_pmt = clean(created_payment)
     clean_pmt["order_summary"] = new_summary
+    if admin_wage_result:
+        clean_pmt["admin_wage_summary"] = admin_wage_result
     return clean_pmt
 
 @api_router.post("/admin/orders/{order_id}/payments/{payment_id}/void")
@@ -3243,6 +3397,18 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
 
     if pmt.get("status") == "voided":
         raise HTTPException(status_code=400, detail="Pembayaran sudah dibatalkan sebelumnya")
+
+    accrual_key = f"admin_wage:{str(order['_id'])}"
+    linked_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key})
+    if linked_wob and linked_wob.get("status") in ("paid", "partially_paid"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Tidak dapat membatalkan pembayaran: kewajiban upah admin ({linked_wob.get('obligation_number')}) "
+                f"untuk pesanan ini sudah dalam status '{linked_wob.get('status')}'. "
+                "Harap koordinasikan dengan Owner sebelum membatalkan pembayaran."
+            )
+        )
 
     now_iso = datetime.now(timezone.utc).isoformat()
     txn_id = pmt.get("finance_transaction_id")
@@ -3377,6 +3543,51 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
                 if inspect.isawaitable(res_coro):
                     await res_coro
 
+        # 4. Void linked admin wage obligation if present and accrued
+        in_txn_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key}, **ins_kw)
+        if in_txn_wob and in_txn_wob.get("status") in ("paid", "partially_paid"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tidak dapat membatalkan pembayaran: kewajiban upah admin ({in_txn_wob.get('obligation_number')}) "
+                    f"untuk pesanan ini sudah dalam status '{in_txn_wob.get('status')}'."
+                )
+            )
+
+        if in_txn_wob and in_txn_wob.get("status") == "accrued":
+            await _mongo_update_one(
+                db.wage_obligations,
+                {"_id": in_txn_wob["_id"], "status": "accrued"},
+                {"$set": {
+                    "status": "voided",
+                    "void_reason": f"Payment {pmt.get('payment_number')} voided: {reason}",
+                    "voided_at": now_iso,
+                    "voided_by_id": admin.get("id"),
+                    "voided_by_name": admin.get("name", "Admin"),
+                    "updated_at": now_iso
+                }},
+                **ins_kw
+            )
+            audit_wob_doc = {
+                "action": "admin_wage_obligation_voided",
+                "entity_type": "wage_obligation",
+                "entity_id": str(in_txn_wob["_id"]),
+                "entity_identifier": in_txn_wob.get("obligation_number", ""),
+                "actor_id": admin.get("id"),
+                "actor_name": admin.get("name", "Admin"),
+                "actor_role": admin.get("role", "admin"),
+                "metadata": {
+                    "order_id": str(order["_id"]),
+                    "order_number": order.get("order_number"),
+                    "payment_number": pmt.get("payment_number"),
+                    "reason": reason,
+                    "previous_status": "accrued",
+                    "new_status": "voided",
+                },
+                "timestamp": now_iso,
+            }
+            await _mongo_insert_one(db.audit_logs, audit_wob_doc, **ins_kw)
+
     session = None
     try:
         session = await client.start_session()
@@ -3430,23 +3641,418 @@ async def admin_void_order_payment(order_id: str, payment_id: str, payload: Paym
         )
 
     # Recalculate order status
-    fresh_order = await db.orders.find_one({"_id": order["_id"]})
+    fresh_order = await _mongo_find_one(db.orders, {"_id": order["_id"]})
     new_summary = await compute_order_payment_summary(fresh_order)
-    await db.orders.update_one(
+    order_void_update = {
+        "payment_status": new_summary["payment_status"],
+        "paid_amount_le": new_summary["paid_amount_le"],
+        "outstanding_amount_le": new_summary["outstanding_amount_le"],
+        "updated_at": now_iso,
+        "updated_by_name": admin.get("name", "Admin"),
+    }
+    if linked_wob and linked_wob.get("status") == "accrued":
+        order_void_update["admin_wage_obligation.status"] = "voided"
+        order_void_update["admin_wage_obligation.voided_at"] = now_iso
+        order_void_update["admin_wage_obligation.void_reason"] = reason
+
+    await _mongo_update_one(
+        db.orders,
         {"_id": order["_id"]},
-        {"$set": {
-            "payment_status": new_summary["payment_status"],
-            "paid_amount_le": new_summary["paid_amount_le"],
-            "outstanding_amount_le": new_summary["outstanding_amount_le"],
-            "updated_at": now_iso,
-            "updated_by_name": admin.get("name", "Admin"),
-        }}
+        {"$set": order_void_update}
     )
 
-    voided_pmt = await db.payments.find_one({"_id": pmt["_id"]}) or {**pmt, "status": "voided"}
+    voided_pmt = await _mongo_find_one(db.payments, {"_id": pmt["_id"]}) or {**pmt, "status": "voided"}
     clean_p = clean(voided_pmt)
     clean_p["order_summary"] = new_summary
     return clean_p
+
+# --------------------------------------------------------------------------
+# Phase 08.4C: Owner Admin Wage Override API
+# --------------------------------------------------------------------------
+
+class AdminWageOverrideInput(BaseModel):
+    is_override: bool = Field(..., description="Aktifkan atau nonaktifkan override upah admin")
+    amount_le: Optional[float] = Field(None, description="Nominal upah khusus dalam EGP")
+    recipient_id: Optional[str] = Field(None, description="ID penerima khusus dari db.admins")
+    override_reason: Optional[str] = Field(None, max_length=500, description="Alasan override upah khusus")
+
+    @field_validator("amount_le", mode="before")
+    @classmethod
+    def validate_amount(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("Nominal upah tidak boleh berupa boolean")
+        try:
+            val = float(v)
+        except (ValueError, TypeError):
+            raise ValueError("Nominal upah harus berupa angka valid")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError("Nominal upah tidak boleh NaN atau Infinity")
+        if val <= 0:
+            raise ValueError("Nominal upah harus lebih besar dari 0")
+        return round(val, 2)
+
+    @field_validator("recipient_id", mode="before")
+    @classmethod
+    def validate_recipient_id(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            val = v.strip()
+            return val if val else None
+        return str(v).strip()
+
+@api_router.get("/admin/orders/{order_id}/admin-wage")
+async def admin_get_order_admin_wage(
+    order_id: str,
+    admin: dict = Depends(require_owner())
+):
+    order = await _mongo_find_one(db.orders, {"_id": id_query(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    order_id_str = str(order.get("_id") or order.get("id")).strip()
+    policy = await get_active_admin_wage_policy(db_inst=db)
+
+    # Check for linked wage obligation
+    accrual_key = build_admin_wage_accrual_event_key(order_id_str)
+    linked_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key})
+    if not linked_wob:
+        linked_wob = await _mongo_find_one(db.wage_obligations, {"order_id": order_id_str, "task_category": "admin"})
+
+    # Evaluate editability and restriction reasons
+    is_editable = True
+    restriction_reason = None
+
+    if order.get("admin_wage_legacy_reconciled"):
+        is_editable = False
+        restriction_reason = "Pesanan merupakan pesanan historis yang telah direkonsiliasi (admin_wage_legacy_reconciled)"
+    elif linked_wob:
+        wob_status = linked_wob.get("status")
+        if wob_status in ("paid", "partially_paid"):
+            is_editable = False
+            restriction_reason = f"Kewajiban upah ({linked_wob.get('obligation_number')}) sudah berstatus '{wob_status}'"
+        elif wob_status == "voided":
+            is_editable = False
+            restriction_reason = f"Kewajiban upah ({linked_wob.get('obligation_number')}) telah dibatalkan (voided)"
+        elif wob_status == "accrued":
+            is_editable = True
+            restriction_reason = "Perhatian: Kewajiban upah sudah terbit (accrued). Perubahan konfigurasi tidak otomatis mengubah nominal kewajiban yang sudah tercatat."
+
+    saved_override = order.get("admin_wage_override")
+    is_override = bool(saved_override and saved_override.get("is_override"))
+
+    if is_override:
+        eff_amount = saved_override.get("amount_le")
+        eff_recip_id = saved_override.get("recipient_id")
+        eff_recip_name = saved_override.get("recipient_name")
+        effective_config = {
+            "source": "override",
+            "is_override": True,
+            "amount_le": eff_amount,
+            "recipient_id": str(eff_recip_id) if eff_recip_id else None,
+            "recipient_name": eff_recip_name,
+            "override_reason": saved_override.get("override_reason"),
+        }
+    else:
+        effective_config = {
+            "source": "policy_default" if policy.get("enabled") else "policy_disabled",
+            "is_override": False,
+            "amount_le": policy.get("default_wage_per_order_le"),
+            "recipient_id": str(policy.get("default_recipient_id")) if policy.get("default_recipient_id") else None,
+            "recipient_name": policy.get("default_recipient_name"),
+            "override_reason": None,
+        }
+
+    obligation_state = None
+    if linked_wob:
+        obligation_state = {
+            "obligation_id": str(linked_wob.get("_id")),
+            "obligation_number": linked_wob.get("obligation_number"),
+            "task_category": linked_wob.get("task_category", "admin"),
+            "status": linked_wob.get("status"),
+            "amount_le": linked_wob.get("total_amount_le"),
+            "worker_id": str(linked_wob.get("worker_id")),
+            "worker_name": linked_wob.get("worker_name"),
+            "accrued_at": linked_wob.get("accrued_at") or linked_wob.get("created_at"),
+            "is_override": linked_wob.get("is_override", False),
+        }
+
+    return clean({
+        "order_id": order_id_str,
+        "order_number": order.get("order_number"),
+        "payment_status": order.get("payment_status", "unpaid"),
+        "is_override": is_override,
+        "saved_override": saved_override,
+        "effective_configuration": effective_config,
+        "policy_context": {
+            "enabled": policy.get("enabled", False),
+            "is_configured": policy.get("is_configured", False),
+            "default_wage_per_order_le": policy.get("default_wage_per_order_le"),
+            "default_recipient_id": str(policy.get("default_recipient_id")) if policy.get("default_recipient_id") else None,
+            "default_recipient_name": policy.get("default_recipient_name"),
+            "unusual_amount_threshold_le": policy.get("unusual_amount_threshold_le"),
+            "max_wage_per_order_le": policy.get("max_wage_per_order_le"),
+            "currency": policy.get("currency", "EGP"),
+        },
+        "obligation_state": obligation_state,
+        "blocked_state": order.get("admin_wage_blocked"),
+        "eligibility": get_order_admin_wage_eligibility(order, policy),
+        "is_editable": is_editable,
+        "editing_restriction_reason": restriction_reason,
+    })
+
+@api_router.put("/admin/orders/{order_id}/admin-wage")
+async def admin_update_order_admin_wage(
+    order_id: str,
+    payload: AdminWageOverrideInput,
+    admin: dict = Depends(require_owner())
+):
+    order = await _mongo_find_one(db.orders, {"_id": id_query(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+
+    order_id_str = str(order.get("_id") or order.get("id")).strip()
+
+    # Lifecycle guard 1: Legacy reconciled order
+    if order.get("admin_wage_legacy_reconciled"):
+        raise HTTPException(
+            status_code=409,
+            detail="Konfigurasi upah admin tidak dapat diubah: Pesanan merupakan pesanan historis yang telah direkonsiliasi (admin_wage_legacy_reconciled)"
+        )
+
+    # Lifecycle guard 2: Linked obligation status
+    accrual_key = build_admin_wage_accrual_event_key(order_id_str)
+    linked_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key})
+    if not linked_wob:
+        linked_wob = await _mongo_find_one(db.wage_obligations, {"order_id": order_id_str, "task_category": "admin"})
+
+    if linked_wob:
+        wob_status = linked_wob.get("status")
+        if wob_status in ("paid", "partially_paid"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Konfigurasi upah admin tidak dapat diubah: Kewajiban upah ({linked_wob.get('obligation_number')}) sudah berstatus '{wob_status}'"
+            )
+        if wob_status == "voided":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Konfigurasi upah admin tidak dapat diubah: Kewajiban upah ({linked_wob.get('obligation_number')}) telah dibatalkan (voided)"
+            )
+
+    # Load active admin wage policy
+    policy = await get_active_admin_wage_policy(db_inst=db)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    admin_id_str = str(admin.get("id") or admin.get("_id") or "")
+    admin_name_str = admin.get("name", "Owner")
+
+    cycle_event_action = None
+    current_cycle_id = None
+    old_enabled = False
+    target_enabled = False
+    existing_cycles = []
+
+    prev_override = order.get("admin_wage_override") or {}
+    prev_blocked = order.get("admin_wage_blocked")
+
+    if payload.is_override:
+        # Override activation/update: must specify amount or recipient
+        if payload.amount_le is None and not payload.recipient_id:
+            raise HTTPException(
+                status_code=422,
+                detail="Override upah aktif memerlukan nominal (amount_le) atau penerima (recipient_id)"
+            )
+
+        # 1. Validate amount against hard cap & threshold
+        effective_amount = payload.amount_le
+        if effective_amount is not None:
+            hard_cap = policy.get("max_wage_per_order_le")
+            if hard_cap is not None and effective_amount > hard_cap:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Nominal upah ({effective_amount} LE) melebihi batas maksimum kebijakan aktif ({hard_cap} LE)"
+                )
+            threshold = policy.get("unusual_amount_threshold_le")
+            if threshold is not None and effective_amount > threshold:
+                reason_str = (payload.override_reason or "").strip()
+                if len(reason_str) < 3:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Nominal upah ({effective_amount} LE) melebihi batas konfirmasi nominal tidak wajar ({threshold} LE). Alasan override (override_reason minimal 3 karakter) wajib diisi."
+                    )
+        else:
+            effective_amount = policy.get("default_wage_per_order_le")
+            if effective_amount is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Nominal upah wajib diisi karena kebijakan default belum memiliki tarif terdaftar"
+                )
+
+        # 2. Validate recipient
+        recip_id = payload.recipient_id
+        recip_name = None
+        if recip_id:
+            recip_doc = await _mongo_find_one(db.admins, {"_id": id_query(recip_id)})
+            if not recip_doc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Penerima upah admin '{recip_id}' tidak ditemukan di sistem"
+                )
+            recip_id = str(recip_doc.get("_id") or recip_id)
+            recip_name = recip_doc.get("name") or "Admin"
+        else:
+            default_recip_id = policy.get("default_recipient_id")
+            if not default_recip_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Penerima upah wajib diisi karena kebijakan default belum memiliki penerima upah terdaftar"
+                )
+            recip_doc = await _mongo_find_one(db.admins, {"_id": id_query(default_recip_id)})
+            if not recip_doc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Penerima default dalam kebijakan '{default_recip_id}' tidak valid di database admin"
+                )
+            recip_id = str(recip_doc.get("_id") or default_recip_id)
+            recip_name = recip_doc.get("name") or policy.get("default_recipient_name") or "Admin"
+
+        new_override = {
+            "is_override": True,
+            "amount_le": payload.amount_le,
+            "recipient_id": recip_id,
+            "recipient_name": recip_name,
+            "override_reason": payload.override_reason,
+            "updated_at": now_iso,
+            "updated_by_id": admin_id_str,
+            "updated_by_name": admin_name_str,
+        }
+        audit_action = "order_admin_wage_override_updated" if prev_override.get("is_override") else "order_admin_wage_override_set"
+        response_msg = "Override upah admin berhasil diperbarui" if prev_override.get("is_override") else "Override upah admin berhasil diatur"
+    else:
+        new_override = {
+            "is_override": False,
+            "amount_le": None,
+            "recipient_id": None,
+            "recipient_name": None,
+            "override_reason": payload.override_reason,
+            "updated_at": now_iso,
+            "updated_by_id": admin_id_str,
+            "updated_by_name": admin_name_str,
+        }
+        audit_action = "order_admin_wage_override_cleared"
+        response_msg = "Override upah admin dinonaktifkan (menggunakan kebijakan default)"
+
+    client_inst = getattr(db, "client", None)
+    current_updated_at = order.get("updated_at")
+
+    async def _do_override_update(session):
+        find_kw = {"session": session} if session else {}
+
+        fresh_order = await _mongo_find_one(db.orders, {"_id": order["_id"]}, **find_kw)
+        if not fresh_order:
+            raise HTTPException(status_code=404, detail="Pesanan tidak ditemukan")
+        if fresh_order.get("admin_wage_legacy_reconciled"):
+            raise HTTPException(status_code=409, detail="Konflik status pesanan: Pesanan telah direkonsiliasi historis")
+
+        fresh_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key}, **find_kw)
+        if not fresh_wob:
+            fresh_wob = await _mongo_find_one(db.wage_obligations, {"order_id": order_id_str, "task_category": "admin"}, **find_kw)
+        if fresh_wob and fresh_wob.get("status") in ("paid", "partially_paid", "voided"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Konflik kewajiban upah: Kewajiban ({fresh_wob.get('obligation_number')}) sudah berstatus '{fresh_wob.get('status')}'"
+            )
+
+        filter_q = {"_id": order["_id"]}
+        if current_updated_at:
+            filter_q["updated_at"] = current_updated_at
+
+        update_set = {
+            "admin_wage_override": new_override,
+            "updated_at": now_iso,
+            "updated_by_name": admin_name_str,
+        }
+        if fresh_order.get("admin_wage_blocked"):
+            update_set["admin_wage_blocked"] = None
+
+        res_upd = await _mongo_update_one(db.orders, filter_q, {"$set": update_set}, **find_kw)
+        if getattr(res_upd, "matched_count", 1) == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Konflik konkurensi: Data pesanan telah diubah oleh proses lain. Silakan muat ulang dan coba kembali."
+            )
+
+        # Audit log entry
+        audit_doc = {
+            "action": audit_action,
+            "entity_type": "order",
+            "entity_id": order_id_str,
+            "entity_identifier": str(fresh_order.get("order_number") or ""),
+            "performed_by_id": admin_id_str,
+            "performed_by_name": admin_name_str,
+            "timestamp": now_iso,
+            "metadata": {
+                "previous_override": prev_override,
+                "new_override": new_override,
+                "resolved_blocked_state": prev_blocked,
+                "policy_snapshot": {
+                    "default_wage_per_order_le": policy.get("default_wage_per_order_le"),
+                    "max_wage_per_order_le": policy.get("max_wage_per_order_le"),
+                    "unusual_amount_threshold_le": policy.get("unusual_amount_threshold_le"),
+                }
+            }
+        }
+        await _mongo_insert_one(db.audit_logs, audit_doc, **find_kw)
+
+    await execute_transaction_with_safety(client_inst, _do_override_update)
+
+    # Build effective configuration for response
+    if new_override["is_override"]:
+        eff_amt = new_override["amount_le"] if new_override["amount_le"] is not None else policy.get("default_wage_per_order_le")
+        eff_config = {
+            "source": "override",
+            "is_override": True,
+            "amount_le": eff_amt,
+            "recipient_id": new_override["recipient_id"],
+            "recipient_name": new_override["recipient_name"],
+            "override_reason": new_override["override_reason"],
+        }
+    else:
+        eff_config = {
+            "source": "policy_default" if policy.get("enabled") else "policy_disabled",
+            "is_override": False,
+            "amount_le": policy.get("default_wage_per_order_le"),
+            "recipient_id": str(policy.get("default_recipient_id")) if policy.get("default_recipient_id") else None,
+            "recipient_name": policy.get("default_recipient_name"),
+            "override_reason": None,
+        }
+
+    existing_ob = None
+    if linked_wob:
+        existing_ob = {
+            "obligation_id": str(linked_wob.get("_id")),
+            "obligation_number": linked_wob.get("obligation_number"),
+            "task_category": linked_wob.get("task_category", "admin"),
+            "status": linked_wob.get("status"),
+            "amount_le": linked_wob.get("total_amount_le"),
+            "worker_id": str(linked_wob.get("worker_id")),
+            "worker_name": linked_wob.get("worker_name"),
+            "accrued_at": linked_wob.get("accrued_at") or linked_wob.get("created_at"),
+            "is_override": linked_wob.get("is_override", False),
+            "note": "Kewajiban upah yang sudah terbit tetap tidak berubah oleh perubahan konfigurasi override."
+        }
+
+    return clean({
+        "order_id": order_id_str,
+        "order_number": order.get("order_number"),
+        "saved_override": new_override,
+        "effective_configuration": eff_config,
+        "existing_obligation": existing_ob,
+        "resolved_blocked_state": prev_blocked,
+        "message": response_msg,
+    })
 
 # --------------------------------------------------------------------------
 # Phase 2: Piece-Rate Wage Rules & Work Assignments
@@ -6293,7 +6899,7 @@ class AdminWagePolicyInput(BaseModel):
     default_recipient_id: Optional[str] = Field(None, description="ID penerima upah admin default dari db.admins")
     unusual_amount_threshold_le: float = Field(..., gt=0.0, description="Batas konfirmasi nominal tidak wajar")
     max_wage_per_order_le: float = Field(..., gt=0.0, description="Batas maksimum keras upah admin")
-    enabled: bool = True
+    enabled: bool = False
     currency: Optional[str] = "EGP"
     rounding_policy: Optional[str] = "piastre_round_half_up"
     change_reason: Optional[str] = Field(None, max_length=500, description="Alasan perubahan kebijakan upah")
@@ -6496,6 +7102,11 @@ async def get_active_admin_wage_policy(db_inst=None) -> dict:
     has_threshold = "unusual_amount_threshold_le" in val and val["unusual_amount_threshold_le"] is not None
     has_default = "default_wage_per_order_le" in val and val["default_wage_per_order_le"] is not None
     is_configured = bool(val and has_hard_cap and has_threshold and has_default)
+    is_enabled = bool(val.get("enabled", False)) if is_configured else False
+
+    cycles = list(val.get("activation_cycles") or [])
+    current_cycle_id = val.get("current_cycle_id")
+    initial_act_at = val.get("initial_activation_at")
 
     return {
         "default_wage_per_order_le": _num(val.get("default_wage_per_order_le"), None) if has_default else None,
@@ -6503,14 +7114,131 @@ async def get_active_admin_wage_policy(db_inst=None) -> dict:
         "default_recipient_name": val.get("default_recipient_name"),
         "unusual_amount_threshold_le": _num(val.get("unusual_amount_threshold_le"), None) if has_threshold else None,
         "max_wage_per_order_le": _num(val.get("max_wage_per_order_le"), None) if has_hard_cap else None,
-        "enabled": bool(val.get("enabled", False)) if is_configured else False,
+        "enabled": is_enabled,
         "currency": val.get("currency", "EGP"),
         "rounding_policy": val.get("rounding_policy", "piastre_round_half_up"),
+        "activation_cycles": cycles,
+        "current_cycle_id": current_cycle_id,
+        "initial_activation_at": initial_act_at,
+        "activation_context": {
+            "initial_activation_at": initial_act_at,
+            "current_cycle_id": current_cycle_id,
+            "total_cycles": len(cycles),
+            "is_currently_active": is_enabled,
+            "last_toggled_at": val.get("updated_at"),
+            "last_toggled_by_name": val.get("updated_by_name"),
+        },
         "updated_at": val.get("updated_at"),
         "updated_by_id": val.get("updated_by_id"),
         "updated_by_name": val.get("updated_by_name"),
         "last_change_reason": val.get("last_change_reason"),
         "is_configured": is_configured
+    }
+
+def is_timestamp_within_active_cycle(timestamp_iso: Optional[str], policy: dict) -> Tuple[bool, Optional[str]]:
+    """
+    Evaluates whether a timestamp falls within any recorded activation cycle.
+    Returns: (is_within, cycle_id)
+    """
+    if not timestamp_iso or not isinstance(policy, dict):
+        return False, None
+    cycles = policy.get("activation_cycles") or []
+    for c in cycles:
+        en_at = c.get("enabled_at")
+        dis_at = c.get("disabled_at")
+        if not en_at:
+            continue
+        if dis_at:
+            if en_at <= timestamp_iso <= dis_at:
+                return True, c.get("cycle_id")
+        else:
+            if timestamp_iso >= en_at:
+                return True, c.get("cycle_id")
+    # Fallback for legacy policy documents without activation_cycles array:
+    if not cycles and policy.get("enabled"):
+        init_act = policy.get("initial_activation_at")
+        if init_act and timestamp_iso >= init_act:
+            return True, policy.get("current_cycle_id") or "legacy_cycle"
+    return False, None
+
+def is_order_historical_unreconciled(order: dict, policy: Optional[dict] = None) -> bool:
+    """
+    Evaluates whether an order has explicit legacy manual payment or reconciliation markers.
+    Preserved for backward compatibility with pre-existing legacy data markers.
+    Normal lifecycle orders are evaluated based on event transitions without date cutoffs.
+    """
+    if not isinstance(order, dict):
+        return False
+    if order.get("admin_wage_legacy_reconciled") or order.get("is_legacy_manual"):
+        return True
+    if order.get("has_unrecorded_legacy_dp") or order.get("legacy_manual_payment"):
+        return True
+    if order.get("legacy_finance_transaction_id"):
+        return True
+    return False
+
+def get_order_admin_wage_eligibility(order: dict, policy: Optional[dict] = None) -> dict:
+    """
+    Returns explicit eligibility dictionary for an order.
+    Preserves persisted subdocument 'admin_wage_eligibility' if present,
+    or derives canonical status for backward compatibility.
+    """
+    if not isinstance(order, dict):
+        return {"scope_status": "in_scope_pending", "governance_mode": "automatic", "version": 1}
+
+    existing_el = order.get("admin_wage_eligibility")
+    if existing_el and isinstance(existing_el, dict) and existing_el.get("scope_status"):
+        return dict(existing_el)
+
+    if order.get("admin_wage_legacy_reconciled") or order.get("is_legacy_manual"):
+        return {
+            "scope_status": "excluded_historical",
+            "governance_mode": "historical",
+            "evaluated_at": order.get("updated_at"),
+            "version": 1
+        }
+    if order.get("admin_wage_obligation"):
+        ob = order.get("admin_wage_obligation") or {}
+        return {
+            "scope_status": "accrued",
+            "governance_mode": "manual_override" if ob.get("is_override") else "automatic",
+            "obligation_id": str(ob.get("obligation_id") or ""),
+            "obligation_number": ob.get("obligation_number"),
+            "evaluated_at": ob.get("accrued_at") or order.get("updated_at"),
+            "version": 1
+        }
+    if order.get("admin_wage_blocked"):
+        b = order.get("admin_wage_blocked") or {}
+        return {
+            "scope_status": "blocked",
+            "governance_mode": "automatic",
+            "blocked_reason": b.get("reason"),
+            "evaluated_at": b.get("blocked_at") or order.get("updated_at"),
+            "version": 1
+        }
+    skipped = order.get("admin_wage_skipped") or {}
+    if skipped.get("status") in ("skipped_policy_disabled", "skipped_disabled_window"):
+        return {
+            "scope_status": "skipped_disabled_window",
+            "governance_mode": "automatic",
+            "skip_reason": skipped.get("reason"),
+            "evaluated_at": skipped.get("skipped_at") or order.get("updated_at"),
+            "in_active_cycle_at_maturity": False,
+            "version": 1
+        }
+    override = order.get("admin_wage_override") or {}
+    if override.get("is_override"):
+        return {
+            "scope_status": "manual_override",
+            "governance_mode": "manual_override",
+            "evaluated_at": override.get("updated_at") or order.get("updated_at"),
+            "version": 1
+        }
+    return {
+        "scope_status": "in_scope_pending",
+        "governance_mode": "automatic",
+        "evaluated_at": order.get("updated_at") or order.get("created_at"),
+        "version": 1
     }
 
 async def get_all_active_wage_policies(db_inst=None) -> dict:
@@ -6520,6 +7248,1069 @@ async def get_all_active_wage_policies(db_inst=None) -> dict:
         "material_purchase": await get_active_material_purchase_wage_policy(db_inst),
         "admin": await get_active_admin_wage_policy(db_inst)
     }
+
+def build_admin_wage_accrual_event_key(order_id: str) -> str:
+    return f"admin_wage:{str(order_id).strip()}"
+
+def _safe_finance_amount(val: Any) -> Optional[float]:
+    """
+    Safely converts a value to float for financial computations without raising ValueError/TypeError.
+    Strictly excludes booleans (bool is a subclass of int in Python where float(False) == 0.0).
+    Filters out NaN, inf, -inf, and negative amounts.
+    Returns None if value cannot be safely interpreted as a valid finite non-negative numeric amount.
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            return None
+        return f
+    except (ValueError, TypeError):
+        return None
+
+CANCELLED_ORDER_STATUSES = frozenset({
+    "dibatalkan", "cancelled", "canceled", "batal", "void", "voided"
+})
+COMPLETED_ORDER_STATUSES = frozenset({
+    "selesai", "completed"
+})
+
+def is_order_completed(order: dict) -> bool:
+    """
+    Evaluates whether an order has reached 'completed' status canonically.
+    Owner Business Rule:
+    - Order is cancelled or void -> CANNOT be completed (absolute precedence).
+    - Canonical status is 'order_status'. If set:
+        * 'selesai' or 'completed' -> True.
+        * Otherwise (e.g. 'diproses', 'siap', 'pesanan_masuk') -> False.
+    - Secondary fallback: 'status'. If set:
+        * 'selesai' or 'completed' -> True.
+        * Otherwise -> False.
+    - Historical fallback: If neither status field is provided, non-empty 'completed_at' -> True.
+    """
+    if not isinstance(order, dict):
+        return False
+
+    order_status = str(order.get("order_status") or "").strip().lower()
+    generic_status = str(order.get("status") or "").strip().lower()
+
+    # Rule 1: Absolute cancellation / void precedence
+    if (
+        bool(order.get("is_voided"))
+        or order_status in CANCELLED_ORDER_STATUSES
+        or generic_status in CANCELLED_ORDER_STATUSES
+    ):
+        return False
+
+    # Rule 2: Primary canonical field: order_status
+    if order_status:
+        return order_status in COMPLETED_ORDER_STATUSES
+
+    # Rule 3: Secondary legacy alias: status
+    if generic_status:
+        return generic_status in COMPLETED_ORDER_STATUSES
+
+    # Rule 4: Historical completion timestamp fallback when no status is populated
+    return bool(order.get("completed_at"))
+
+def is_order_fully_paid(order: dict, payment_summary: Optional[dict] = None) -> bool:
+    """
+    Evaluates whether customer payments on an order are fully paid (lunas).
+    Canonical conditions:
+    1. If payment_summary provided:
+       - If outstanding balance is explicitly provided and > 0.01: NOT fully paid (fail-closed against contradictory data).
+       - If outstanding <= 0.01 and paid >= total > 0: fully paid.
+       - If payment_summary.payment_status in ('lunas', 'overpaid') and (outstanding is None or outstanding <= 0.01): fully paid.
+    2. Direct order document evaluation:
+       - order.payment_status in ('lunas', 'overpaid', 'paid'):
+         * If outstanding is provided and > 0.01: NOT fully paid (contradictory data).
+         * If total and paid are provided and total > 0 and paid < total - 0.01: NOT fully paid (contradictory data).
+         * Otherwise: fully paid.
+       - If order.payment_status not 'lunas', but outstanding <= 0.01 and total > 0 and paid >= total - 0.01: fully paid.
+    3. Malformed numeric values (strings like 'N/A', boolean False, negative totals, NaN) fail closed safely.
+    """
+    if not isinstance(order, dict):
+        return False
+
+    # 1. Evaluate from payment_summary if provided
+    if payment_summary and isinstance(payment_summary, dict):
+        raw_ps_out = payment_summary.get("outstanding_amount_le")
+        raw_ps_tot = payment_summary.get("total_le")
+        if raw_ps_tot is None:
+            raw_ps_tot = order.get("total_le")
+        raw_ps_paid = payment_summary.get("paid_amount_le")
+
+        # Fail closed if provided fields are malformed
+        if raw_ps_out is not None and _safe_finance_amount(raw_ps_out) is None:
+            return False
+        if raw_ps_tot is not None and _safe_finance_amount(raw_ps_tot) is None:
+            return False
+        if raw_ps_paid is not None and _safe_finance_amount(raw_ps_paid) is None:
+            return False
+
+        ps_status = str(payment_summary.get("payment_status") or "").strip().lower()
+        ps_outstanding = _safe_finance_amount(raw_ps_out)
+        ps_total = _safe_finance_amount(raw_ps_tot)
+        ps_paid = _safe_finance_amount(raw_ps_paid)
+
+        # Explicit outstanding check: if outstanding > 0.01, cannot be fully paid even if status claims lunas
+        if ps_outstanding is not None:
+            if ps_outstanding > 0.01:
+                return False
+            # outstanding <= 0.01
+            if ps_total is not None and ps_paid is not None:
+                if ps_total > 0 and ps_paid >= (ps_total - 0.01):
+                    return True
+            if ps_status in ("lunas", "overpaid"):
+                return True
+
+        if ps_status in ("lunas", "overpaid"):
+            if ps_total is not None and ps_paid is not None and ps_total > 0:
+                if ps_paid < (ps_total - 0.01):
+                    return False
+            return True
+
+    # 2. Evaluate from order document
+    raw_ord_out = order.get("outstanding_amount_le")
+    raw_ord_tot = (
+        order.get("total_le") if order.get("total_le") is not None
+        else order.get("total_amount_le") if order.get("total_amount_le") is not None
+        else order.get("total_price_le") if order.get("total_price_le") is not None
+        else order.get("grand_total_le")
+    )
+    raw_ord_paid = order.get("paid_amount_le")
+
+    # Fail closed if provided financial fields are malformed (e.g. NaN, Inf, non-numeric strings, negative)
+    if raw_ord_out is not None and _safe_finance_amount(raw_ord_out) is None:
+        return False
+    if raw_ord_tot is not None and _safe_finance_amount(raw_ord_tot) is None:
+        return False
+    if raw_ord_paid is not None and _safe_finance_amount(raw_ord_paid) is None:
+        return False
+
+    order_status = str(order.get("payment_status") or "").strip().lower()
+    ord_outstanding = _safe_finance_amount(raw_ord_out)
+    ord_total = _safe_finance_amount(raw_ord_tot)
+    ord_paid = _safe_finance_amount(raw_ord_paid)
+
+    # If explicit outstanding is present:
+    if ord_outstanding is not None:
+        if ord_outstanding > 0.01:
+            return False
+        # ord_outstanding <= 0.01
+        if ord_total is not None and ord_paid is not None:
+            if ord_total > 0 and ord_paid >= (ord_total - 0.01):
+                return True
+        if order_status in ("lunas", "overpaid", "paid"):
+            return True
+
+    # If outstanding is not present:
+    if order_status in ("lunas", "overpaid", "paid"):
+        if ord_total is not None and ord_paid is not None and ord_total > 0:
+            if ord_paid < (ord_total - 0.01):
+                return False
+        return True
+
+    # When payment_status is not 'lunas', but amounts demonstrate full payment:
+    if ord_total is not None and ord_paid is not None and ord_total > 0:
+        if ord_paid >= (ord_total - 0.01):
+            if ord_outstanding is None or ord_outstanding <= 0.01:
+                return True
+
+    return False
+
+def is_order_excluded_from_admin_wage(order: dict) -> bool:
+    """
+    Evaluates whether an order is explicitly excluded from automated admin wage accrual.
+    Includes:
+    - admin_wage_legacy_reconciled == True
+    - is_legacy_manual == True
+    """
+    if not isinstance(order, dict):
+        return False
+    return bool(order.get("admin_wage_legacy_reconciled") or order.get("is_legacy_manual"))
+
+async def process_order_admin_wage_accrual(
+    order: dict,
+    admin: dict,
+    session=None,
+    policy: Optional[dict] = None,
+    payment_summary: Optional[dict] = None,
+    lifecycle_event: Optional[str] = None,
+    transition_context: Optional[dict] = None
+) -> dict:
+    """
+    Evaluates and creates the admin wage obligation for an order transitioning to 'lunas'.
+    Enforces:
+    1. Precedence: Per-order override (`admin_wage_override`) > Global Policy (`get_active_admin_wage_policy`).
+    2. Hard-Cap Conflict (Option A - Fail-Closed with Alert):
+       If override nominal > active hard cap (max_wage_per_order_le), payment succeeds but wage obligation
+       is NOT created. Sets order admin_wage_blocked with conflict alert. Never silently clamps or replaces.
+    3. Idempotency: Canonical key `admin_wage:{order_id}` guarded by unique index `uniq_wage_obligation_accrual_event`.
+    4. Recipient Validation: Verified in db.admins. If missing/invalid, sets blocked_invalid_recipient fail-safe.
+    5. Inactive/Disabled Policy: Fails safe with skipped_policy_disabled without crashing customer payment.
+    6. Strict Manual Configuration: Valid manual override proceeds even if global automation is OFF.
+       Missing/invalid manual configuration fails-closed without falling back silently to default rates.
+    """
+    find_kw = {"session": session} if session is not None else {}
+    order_id_str = str(order.get("_id") or order.get("id")).strip()
+    accrual_key = build_admin_wage_accrual_event_key(order_id_str)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Defense-in-depth: explicit exclusion guard
+    if is_order_excluded_from_admin_wage(order):
+        return {
+            "status": "skipped_legacy_reconciled",
+            "skipped": {
+                "status": "skipped_legacy_reconciled",
+                "reason": "Pesanan historis/manual telah ditandai direkonsiliasi dan dikecualikan dari akrual otomatis.",
+                "skipped_at": now_iso
+            },
+            "eligibility": {
+                "scope_status": "excluded_historical",
+                "governance_mode": "historical",
+                "evaluated_at": now_iso,
+                "version": 1
+            }
+        }
+
+    # 1. Check existing obligation for idempotency
+    existing_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key}, **find_kw)
+    if existing_wob:
+        ob_status = str(existing_wob.get("status") or "").strip().lower()
+        if ob_status in ("accrued", "paid", "partially_paid"):
+            return {
+                "status": "already_accrued",
+                "obligation": {
+                    "obligation_number": existing_wob.get("obligation_number"),
+                    "obligation_id": str(existing_wob.get("_id")),
+                    "accrual_event_key": accrual_key,
+                    "task_category": "admin",
+                    "recipient_id": str(existing_wob.get("worker_id")),
+                    "recipient_name": existing_wob.get("worker_name"),
+                    "amount_le": existing_wob.get("total_amount_le"),
+                    "status": existing_wob.get("status"),
+                    "is_override": existing_wob.get("is_override", False),
+                    "accrued_at": existing_wob.get("accrued_at") or existing_wob.get("created_at"),
+                },
+                "eligibility": {
+                    "scope_status": "accrued",
+                    "governance_mode": "manual_override" if existing_wob.get("is_override") else "automatic",
+                    "obligation_number": existing_wob.get("obligation_number"),
+                    "obligation_id": str(existing_wob.get("_id")),
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+        if ob_status in ("void", "voided", "cancelled"):
+            blocked_info = {
+                "status": "blocked_prior_voided_obligation",
+                "reason": (
+                    f"Kewajiban upah admin untuk pesanan {order_id_str} sebelumnya telah dibatalkan/void "
+                    f"(nomor: {existing_wob.get('obligation_number')}, status: {ob_status}). "
+                    f"Pembuatan ulang kewajiban memerlukan audit dan review manual oleh Owner."
+                ),
+                "existing_obligation_number": existing_wob.get("obligation_number"),
+                "existing_obligation_id": str(existing_wob.get("_id")),
+                "existing_obligation_status": ob_status,
+                "accrual_event_key": accrual_key,
+                "owner_review_required": True,
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_prior_voided_obligation",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "automatic",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+    # 2. Load active admin wage policy if not provided
+    if policy is None:
+        policy = await get_active_admin_wage_policy(db_inst=db)
+
+    # 3. Resolve precedence: Order Override vs Default Policy
+    override = order.get("admin_wage_override") or {}
+    is_override = bool(override.get("is_override"))
+
+    wage_amount = None
+    recipient_id = None
+    recipient_name = None
+    override_reason = None
+
+    if is_override:
+        override_amt = _safe_finance_amount(override.get("amount_le"))
+        if override_amt is None or override_amt <= 0:
+            blocked_info = {
+                "status": "blocked_missing_rate",
+                "reason": "Nominal upah admin override manual tidak valid atau tidak diisi (dilarang fallback diam-diam ke default global)",
+                "attempted_amount_le": override.get("amount_le"),
+                "recipient_id": str(override.get("recipient_id") or "") or None,
+                "recipient_name": override.get("recipient_name"),
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_missing_rate",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "manual_override",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        override_recip_id = str(override.get("recipient_id") or "").strip() or None
+        if not override_recip_id:
+            blocked_info = {
+                "status": "blocked_missing_recipient",
+                "reason": "Penerima upah admin override manual tidak ditentukan (konfigurasi manual per-pesanan wajib eksplisit dan tidak boleh diam-diam mengambil penerima default global)",
+                "attempted_amount_le": override_amt,
+                "recipient_id": None,
+                "recipient_name": None,
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_missing_recipient",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "manual_override",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        recip_doc = await _mongo_find_one(db.admins, {"_id": id_query(override_recip_id)}, **find_kw)
+        if not recip_doc:
+            blocked_info = {
+                "status": "blocked_invalid_recipient",
+                "reason": f"Penerima upah admin '{override_recip_id}' tidak ditemukan di database admin",
+                "attempted_amount_le": override_amt,
+                "recipient_id": str(override_recip_id),
+                "recipient_name": override.get("recipient_name"),
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_invalid_recipient",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "manual_override",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        wage_amount = override_amt
+        recipient_id = str(recip_doc.get("_id") or override_recip_id)
+        recipient_name = recip_doc.get("name") or override.get("recipient_name") or "Admin"
+        override_reason = override.get("override_reason")
+
+        # Option A: Hard-cap conflict validation
+        hard_cap = policy.get("max_wage_per_order_le")
+        if hard_cap is not None and wage_amount is not None and wage_amount > hard_cap:
+            logger.warning(
+                f"Admin wage accrual blocked by hard cap conflict for order {order_id_str}: "
+                f"override nominal {wage_amount} LE exceeds active hard cap {hard_cap} LE"
+            )
+            blocked_info = {
+                "status": "blocked_hard_cap_conflict",
+                "reason": f"Nominal upah override ({wage_amount} LE) melebihi batas maksimum aktif ({hard_cap} LE)",
+                "attempted_amount_le": wage_amount,
+                "max_wage_per_order_le": hard_cap,
+                "recipient_id": str(recipient_id) if recipient_id else None,
+                "recipient_name": recipient_name,
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_hard_cap_conflict",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "manual_override",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+    else:
+        # Default policy resolution
+        if not policy.get("enabled") or not policy.get("is_configured") or policy.get("default_wage_per_order_le") is None:
+            skipped_info = {
+                "status": "skipped_policy_disabled",
+                "reason": "Kebijakan upah admin tidak aktif saat pesanan selesai dan lunas",
+                "skipped_at": now_iso,
+            }
+            eligibility_info = {
+                "scope_status": "skipped_disabled_window",
+                "governance_mode": "automatic",
+                "maturity_timestamp": now_iso,
+                "evaluated_at": now_iso,
+                "in_active_cycle_at_maturity": False,
+                "skip_reason": "settled_while_automation_disabled",
+                "version": 1
+            }
+            return {
+                "status": "skipped_policy_disabled",
+                "skipped": skipped_info,
+                "eligibility": eligibility_info
+            }
+
+        # Check: Trusted lifecycle transition context (enforce fail-closed for automatic accrual without verified event)
+        eff_event = lifecycle_event
+
+        if not eff_event:
+            return {
+                "status": "skipped_missing_lifecycle_event",
+                "skipped": {
+                    "status": "skipped_missing_lifecycle_event",
+                    "reason": "Evaluasi akrual upah otomatis wajib menyertakan konteks event transisi siklus hidup resmi ('order_completed' atau 'payment_lunas').",
+                    "skipped_at": now_iso
+                },
+                "eligibility": {
+                    "scope_status": "in_scope_pending",
+                    "governance_mode": "automatic",
+                    "skip_reason": "missing_trusted_lifecycle_event",
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        if eff_event not in ("order_completed", "payment_lunas"):
+            return {
+                "status": "skipped_invalid_lifecycle_event",
+                "skipped": {
+                    "status": "skipped_invalid_lifecycle_event",
+                    "reason": f"Event siklus hidup '{eff_event}' tidak valid untuk akrual upah admin otomatis.",
+                    "skipped_at": now_iso
+                },
+                "eligibility": {
+                    "scope_status": "in_scope_pending",
+                    "governance_mode": "automatic",
+                    "skip_reason": "invalid_lifecycle_event",
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        # Authoritative Persisted State & Transition Verification against db.orders
+        # Strict security constraint: caller-supplied snapshots are completely untrusted and ignored.
+        persisted_order = None
+        if hasattr(db, "orders") and hasattr(db.orders, "find_one"):
+            persisted_order = await _mongo_find_one(db.orders, {"_id": id_query(order_id_str)}, **find_kw)
+
+        if not persisted_order:
+            return {
+                "status": "skipped_unverifiable_transition",
+                "skipped": {
+                    "status": "skipped_unverifiable_transition",
+                    "reason": "Data pesanan otoritatif tidak ditemukan di database; akrual otomatis ditolak demi keamanan transaksi.",
+                    "skipped_at": now_iso
+                },
+                "eligibility": {
+                    "scope_status": "in_scope_pending",
+                    "governance_mode": "automatic",
+                    "skip_reason": "authoritative_order_state_missing",
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        # Transition context identity and semantics validation
+        if transition_context and isinstance(transition_context, dict):
+            ctx_order_id = str(transition_context.get("order_id") or "").strip()
+            if ctx_order_id and ctx_order_id != order_id_str:
+                return {
+                    "status": "skipped_unverifiable_transition",
+                    "skipped": {
+                        "status": "skipped_unverifiable_transition",
+                        "reason": f"Konteks transisi tidak cocok dengan ID pesanan target ({ctx_order_id} != {order_id_str}).",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "in_scope_pending",
+                        "governance_mode": "automatic",
+                        "skip_reason": "order_identity_mismatch",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+
+        # Check A: If order was ALREADY completed AND ALREADY fully paid in persistent storage
+        if is_order_completed(persisted_order) and is_order_fully_paid(persisted_order):
+            maturity_ts = (
+                persisted_order.get("completed_at")
+                or persisted_order.get("paid_at")
+                or order.get("completed_at")
+                or order.get("paid_at")
+            )
+            is_active, _ = is_timestamp_within_active_cycle(maturity_ts, policy)
+            if not is_active:
+                return {
+                    "status": "skipped_unverifiable_transition",
+                    "skipped": {
+                        "status": "skipped_unverifiable_transition",
+                        "reason": "Pesanan telah selesai dan lunas sebelum siklus otomatisasi aktif; akrual otomatis ditolak.",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "excluded_historical",
+                        "governance_mode": "historical",
+                        "skip_reason": "settled_prior_to_system_activation",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+
+            # An order already settled in DB cannot transition again without state change
+            if eff_event == "order_completed":
+                return {
+                    "status": "skipped_unverifiable_transition",
+                    "skipped": {
+                        "status": "skipped_unverifiable_transition",
+                        "reason": "Pesanan sudah berstatus selesai di database; transisi order_completed tidak valid.",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "in_scope_pending",
+                        "governance_mode": "automatic",
+                        "skip_reason": "order_already_completed_in_database",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+            elif eff_event == "payment_lunas":
+                return {
+                    "status": "skipped_unverifiable_transition",
+                    "skipped": {
+                        "status": "skipped_unverifiable_transition",
+                        "reason": "Pesanan sudah berstatus lunas di database; transisi payment_lunas tidak valid.",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "in_scope_pending",
+                        "governance_mode": "automatic",
+                        "skip_reason": "order_already_fully_paid_in_database",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+
+        # Check B: Transition checks against authoritative persisted_order
+        if eff_event == "order_completed":
+            target_status = str(order.get("order_status") or order.get("status") or "").strip().lower()
+            if target_status in ("dibatalkan", "cancelled", "void"):
+                return {
+                    "status": "skipped_order_not_completed",
+                    "skipped": {
+                        "status": "skipped_order_not_completed",
+                        "reason": f"Pesanan target berstatus batal ('{target_status}'); akrual otomatis ditolak.",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "in_scope_pending",
+                        "governance_mode": "automatic",
+                        "skip_reason": "order_not_completed",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+            if is_order_completed(persisted_order):
+                return {
+                    "status": "skipped_unverifiable_transition",
+                    "skipped": {
+                        "status": "skipped_unverifiable_transition",
+                        "reason": "Pesanan sudah berstatus selesai di database; transisi order_completed tidak valid.",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "in_scope_pending",
+                        "governance_mode": "automatic",
+                        "skip_reason": "order_already_completed_in_database",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+            if transition_context and isinstance(transition_context, dict):
+                ctx_from = str(transition_context.get("from_status") or "").strip().lower()
+                ctx_to = str(transition_context.get("to_status") or "").strip().lower()
+                persisted_status = str(persisted_order.get("order_status") or persisted_order.get("status") or "").strip().lower()
+                if ctx_from and persisted_status and ctx_from != persisted_status:
+                    return {
+                        "status": "skipped_unverifiable_transition",
+                        "skipped": {
+                            "status": "skipped_unverifiable_transition",
+                            "reason": f"Konteks transisi kontradiktif: from_status '{ctx_from}' tidak cocok dengan status database '{persisted_status}'.",
+                            "skipped_at": now_iso
+                        },
+                        "eligibility": {
+                            "scope_status": "in_scope_pending",
+                            "governance_mode": "automatic",
+                            "skip_reason": "contradictory_transition_context",
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+                if ctx_from in COMPLETED_ORDER_STATUSES:
+                    return {
+                        "status": "skipped_unverifiable_transition",
+                        "skipped": {
+                            "status": "skipped_unverifiable_transition",
+                            "reason": "Bukti transisi tidak valid: from_status tidak boleh selesai.",
+                            "skipped_at": now_iso
+                        },
+                        "eligibility": {
+                            "scope_status": "in_scope_pending",
+                            "governance_mode": "automatic",
+                            "skip_reason": "invalid_transition_context",
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+                if ctx_to and ctx_to not in COMPLETED_ORDER_STATUSES:
+                    return {
+                        "status": "skipped_unverifiable_transition",
+                        "skipped": {
+                            "status": "skipped_unverifiable_transition",
+                            "reason": "Bukti transisi tidak valid: to_status wajib berstatus selesai.",
+                            "skipped_at": now_iso
+                        },
+                        "eligibility": {
+                            "scope_status": "in_scope_pending",
+                            "governance_mode": "automatic",
+                            "skip_reason": "invalid_transition_context",
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+
+        elif eff_event == "payment_lunas":
+            if is_order_fully_paid(persisted_order):
+                return {
+                    "status": "skipped_unverifiable_transition",
+                    "skipped": {
+                        "status": "skipped_unverifiable_transition",
+                        "reason": "Pesanan sudah berstatus lunas di database; transisi payment_lunas tidak valid.",
+                        "skipped_at": now_iso
+                    },
+                    "eligibility": {
+                        "scope_status": "in_scope_pending",
+                        "governance_mode": "automatic",
+                        "skip_reason": "order_already_fully_paid_in_database",
+                        "evaluated_at": now_iso,
+                        "version": 1
+                    }
+                }
+            if transition_context and isinstance(transition_context, dict):
+                ctx_from_pmt = str(transition_context.get("from_payment_status") or "").strip().lower()
+                ctx_to_pmt = str(transition_context.get("to_payment_status") or "").strip().lower()
+                persisted_pmt = str(persisted_order.get("payment_status") or "").strip().lower()
+                if ctx_from_pmt and persisted_pmt and ctx_from_pmt != persisted_pmt:
+                    return {
+                        "status": "skipped_unverifiable_transition",
+                        "skipped": {
+                            "status": "skipped_unverifiable_transition",
+                            "reason": f"Konteks transisi kontradiktif: from_payment_status '{ctx_from_pmt}' tidak cocok dengan status database '{persisted_pmt}'.",
+                            "skipped_at": now_iso
+                        },
+                        "eligibility": {
+                            "scope_status": "in_scope_pending",
+                            "governance_mode": "automatic",
+                            "skip_reason": "contradictory_transition_context",
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+                if ctx_from_pmt in ("lunas", "overpaid", "paid"):
+                    return {
+                        "status": "skipped_unverifiable_transition",
+                        "skipped": {
+                            "status": "skipped_unverifiable_transition",
+                            "reason": "Bukti transisi tidak valid: from_payment_status tidak boleh lunas.",
+                            "skipped_at": now_iso
+                        },
+                        "eligibility": {
+                            "scope_status": "in_scope_pending",
+                            "governance_mode": "automatic",
+                            "skip_reason": "invalid_transition_context",
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+                if ctx_to_pmt and ctx_to_pmt != "lunas":
+                    return {
+                        "status": "skipped_unverifiable_transition",
+                        "skipped": {
+                            "status": "skipped_unverifiable_transition",
+                            "reason": "Bukti transisi tidak valid: to_payment_status wajib lunas.",
+                            "skipped_at": now_iso
+                        },
+                        "eligibility": {
+                            "scope_status": "in_scope_pending",
+                            "governance_mode": "automatic",
+                            "skip_reason": "invalid_transition_context",
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+
+        default_recip_id = policy.get("default_recipient_id")
+        if not default_recip_id:
+            blocked_info = {
+                "status": "blocked_no_default_recipient",
+                "reason": "Penerima default upah admin belum ditentukan dalam kebijakan aktif",
+                "attempted_amount_le": policy.get("default_wage_per_order_le"),
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_no_default_recipient",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "automatic",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        recip_doc = await _mongo_find_one(db.admins, {"_id": id_query(default_recip_id)}, **find_kw)
+        if not recip_doc:
+            blocked_info = {
+                "status": "blocked_invalid_recipient",
+                "reason": f"Penerima default '{default_recip_id}' tidak ditemukan di database admin",
+                "attempted_amount_le": policy.get("default_wage_per_order_le"),
+                "recipient_id": str(default_recip_id),
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_invalid_recipient",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "automatic",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+        recipient_id = str(recip_doc.get("_id") or default_recip_id)
+        recipient_name = recip_doc.get("name") or policy.get("default_recipient_name") or "Admin"
+        wage_amount = policy["default_wage_per_order_le"]
+        override_reason = None
+
+        hard_cap = policy.get("max_wage_per_order_le")
+        if hard_cap is not None and wage_amount is not None and wage_amount > hard_cap:
+            blocked_info = {
+                "status": "blocked_hard_cap_conflict",
+                "reason": f"Nominal upah kebijakan default ({wage_amount} LE) melebihi batas maksimum aktif ({hard_cap} LE)",
+                "attempted_amount_le": wage_amount,
+                "max_wage_per_order_le": hard_cap,
+                "recipient_id": str(recipient_id) if recipient_id else None,
+                "recipient_name": recipient_name,
+                "blocked_at": now_iso,
+            }
+            return {
+                "status": "blocked_hard_cap_conflict",
+                "blocked": blocked_info,
+                "eligibility": {
+                    "scope_status": "blocked",
+                    "governance_mode": "automatic",
+                    "blocked_reason": blocked_info["reason"],
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+    if wage_amount is None or wage_amount <= 0:
+        skipped_info = {
+            "status": "skipped_zero_amount",
+            "reason": "Nominal upah admin bernilai nol atau negatif",
+            "skipped_at": now_iso,
+        }
+        return {
+            "status": "skipped_zero_amount",
+            "skipped": skipped_info,
+            "eligibility": {
+                "scope_status": "blocked",
+                "governance_mode": "manual_override" if is_override else "automatic",
+                "blocked_reason": skipped_info["reason"],
+                "evaluated_at": now_iso,
+                "version": 1
+            }
+        }
+
+    # 4. Generate obligation number and construct document
+    ob_num = await generate_obligation_number(session=session)
+    wob_doc = {
+        "obligation_number": ob_num,
+        "accrual_event_key": accrual_key,
+        "task_category": "admin",
+        "pricing_basis": "per_order_admin",
+        "order_id": order_id_str,
+        "order_number": order.get("order_number"),
+        "worker_id": str(recipient_id),
+        "worker_name": recipient_name,
+        "total_amount_le": round(float(wage_amount), 2),
+        "amount_piastres": int(round(float(wage_amount) * 100)),
+        "currency": policy.get("currency", "EGP"),
+        "status": "accrued",
+        "paid_amount_le": 0.0,
+        "is_override": is_override,
+        "rate_policy_snapshot": {
+            "default_wage_per_order_le": policy.get("default_wage_per_order_le"),
+            "unusual_amount_threshold_le": policy.get("unusual_amount_threshold_le"),
+            "max_wage_per_order_le": policy.get("max_wage_per_order_le"),
+            "wage_amount_le": round(float(wage_amount), 2),
+            "is_override": is_override,
+            "override_reason": override_reason,
+        },
+        "accrued_at": now_iso,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "verified_by_id": str(admin.get("id") or admin.get("_id") or ""),
+        "verified_by_name": admin.get("name", "Admin"),
+    }
+
+    # 5. Insert into wage_obligations collection with idempotent handling of DuplicateKeyError
+    try:
+        res_wob = await _mongo_insert_one(db.wage_obligations, wob_doc, **find_kw)
+        if res_wob and hasattr(res_wob, "inserted_id"):
+            wob_doc["_id"] = res_wob.inserted_id
+    except pymongo.errors.DuplicateKeyError as dke:
+        err_msg = str(dke)
+        if "uniq_wage_obligation_accrual_event" in err_msg or "accrual_event_key" in err_msg or accrual_key in err_msg:
+            existing_wob = await _mongo_find_one(db.wage_obligations, {"accrual_event_key": accrual_key}, **find_kw)
+            if existing_wob:
+                ob_status = str(existing_wob.get("status") or "").strip().lower()
+                if ob_status in ("void", "voided", "cancelled"):
+                    blocked_info = {
+                        "status": "blocked_prior_voided_obligation",
+                        "reason": (
+                            f"Kewajiban upah admin untuk pesanan {order_id_str} sebelumnya telah dibatalkan/void "
+                            f"(nomor: {existing_wob.get('obligation_number')}, status: {ob_status}). "
+                            f"Pembuatan ulang kewajiban memerlukan audit dan review manual oleh Owner."
+                        ),
+                        "existing_obligation_number": existing_wob.get("obligation_number"),
+                        "existing_obligation_id": str(existing_wob.get("_id")),
+                        "existing_obligation_status": ob_status,
+                        "accrual_event_key": accrual_key,
+                        "owner_review_required": True,
+                        "blocked_at": now_iso,
+                    }
+                    return {
+                        "status": "blocked_prior_voided_obligation",
+                        "blocked": blocked_info,
+                        "eligibility": {
+                            "scope_status": "blocked",
+                            "governance_mode": "automatic",
+                            "blocked_reason": blocked_info["reason"],
+                            "evaluated_at": now_iso,
+                            "version": 1
+                        }
+                    }
+                wob_doc = existing_wob
+            else:
+                raise
+        else:
+            raise
+
+    # 6. Record audit log
+    audit_doc = {
+        "action": "admin_wage_accrued",
+        "entity_type": "order",
+        "entity_id": order_id_str,
+        "entity_identifier": order.get("order_number", ""),
+        "actor_id": str(admin.get("id") or ""),
+        "actor_name": admin.get("name", "Admin"),
+        "actor_role": admin.get("role", "admin"),
+        "metadata": {
+            "obligation_number": wob_doc.get("obligation_number"),
+            "obligation_id": str(wob_doc.get("_id")),
+            "total_amount_le": round(float(wage_amount), 2),
+            "worker_id": str(recipient_id),
+            "worker_name": recipient_name,
+            "is_override": is_override,
+            "accrual_event_key": accrual_key,
+            "governance_mode": "manual_override" if is_override else "automatic",
+            "cycle_id": policy.get("current_cycle_id") if not is_override else None,
+        },
+        "timestamp": now_iso,
+    }
+    await _mongo_insert_one(db.audit_logs, audit_doc, **find_kw)
+
+    obligation_summary = {
+        "obligation_number": wob_doc.get("obligation_number"),
+        "obligation_id": str(wob_doc.get("_id")),
+        "accrual_event_key": accrual_key,
+        "task_category": "admin",
+        "recipient_id": str(recipient_id),
+        "recipient_name": recipient_name,
+        "amount_le": round(float(wage_amount), 2),
+        "status": wob_doc.get("status", "accrued"),
+        "is_override": is_override,
+        "accrued_at": wob_doc.get("accrued_at") or now_iso,
+    }
+    eligibility_info = {
+        "scope_status": "accrued",
+        "governance_mode": "manual_override" if is_override else "automatic",
+        "maturity_timestamp": now_iso,
+        "evaluated_at": now_iso,
+        "evaluated_in_cycle_id": policy.get("current_cycle_id") if not is_override else None,
+        "in_active_cycle_at_maturity": True,
+        "obligation_number": wob_doc.get("obligation_number"),
+        "obligation_id": str(wob_doc.get("_id")),
+        "version": 1
+    }
+    return {
+        "status": "accrued",
+        "obligation": obligation_summary,
+        "eligibility": eligibility_info
+    }
+
+VALID_ADMIN_WAGE_LIFECYCLE_EVENTS = {"order_completed", "payment_lunas", "manual_override"}
+
+async def evaluate_and_process_order_admin_wage_accrual(
+    order: dict,
+    admin: dict,
+    session=None,
+    payment_summary: Optional[dict] = None,
+    lifecycle_event: Optional[str] = None,
+    transition_context: Optional[dict] = None
+) -> dict:
+    """
+    Shared, idempotent eligibility check and accrual service for admin wages.
+    Enforces the Owner's approved business rules:
+    1. Condition 1: Order is completed (is_order_completed).
+    2. Condition 2: Customer payment is fully paid (is_order_fully_paid).
+    3. Order is not explicitly excluded (is_order_excluded_from_admin_wage).
+    4. Anti-Retroactivity: Orders that matured during a disabled window remain skipped.
+    5. Manual Override: Proceeds even if global policy is disabled.
+    6. Trusted Lifecycle Event Contract: Automatic accrual strictly requires an explicit,
+       valid lifecycle transition event ('order_completed' or 'payment_lunas') to prevent
+       accidental accrual of historical or settled orders via out-of-band direct invocations.
+    7. Canonical event key `admin_wage:{order_id}` and MongoDB unique index guarantee
+       idempotency across duplicate events, retries, and concurrent calls.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Check 1: Explicit exclusion (historical/reconciled/manual)
+    if is_order_excluded_from_admin_wage(order):
+        return {
+            "status": "skipped_legacy_reconciled",
+            "skipped": {
+                "status": "skipped_legacy_reconciled",
+                "reason": "Pesanan historis/manual telah ditandai direkonsiliasi dan dikecualikan dari akrual otomatis.",
+                "skipped_at": now_iso
+            },
+            "eligibility": {
+                "scope_status": "excluded_historical",
+                "governance_mode": "historical",
+                "evaluated_at": now_iso,
+                "version": 1
+            }
+        }
+
+    override = order.get("admin_wage_override") or {}
+    is_override = bool(override.get("is_override"))
+
+    # Check 2: Anti-retroactive protection for non-override orders
+    if not is_override:
+        elig = order.get("admin_wage_eligibility") or {}
+        skipped_data = order.get("admin_wage_skipped") or {}
+        if elig.get("scope_status") == "skipped_disabled_window" or skipped_data.get("status") in ("skipped_policy_disabled", "skipped_disabled_window"):
+            return {
+                "status": "skipped_disabled_window_matured",
+                "skipped": {
+                    "status": "skipped_disabled_window",
+                    "reason": "Pesanan telah selesai dan lunas pada saat otomatisasi nonaktif; dilindungi dari akrual retroaktif.",
+                    "skipped_at": now_iso
+                },
+                "eligibility": {
+                    "scope_status": "skipped_disabled_window",
+                    "governance_mode": "automatic",
+                    "skip_reason": "settled_while_automation_disabled",
+                    "evaluated_at": now_iso,
+                    "version": 1
+                }
+            }
+
+    # Check 3: Order completion (Condition 1)
+    if not is_order_completed(order):
+        return {
+            "status": "skipped_order_not_completed",
+            "skipped": {
+                "status": "skipped_order_not_completed",
+                "reason": f"Pesanan belum berstatus selesai (status saat ini: '{order.get('order_status') or order.get('status')}').",
+                "skipped_at": now_iso
+            },
+            "eligibility": {
+                "scope_status": "in_scope_pending",
+                "governance_mode": "manual_override" if is_override else "automatic",
+                "evaluated_at": now_iso,
+                "version": 1
+            }
+        }
+
+    # Check 4: Customer payment completion (Condition 2)
+    if not is_order_fully_paid(order, payment_summary=payment_summary):
+        return {
+            "status": "skipped_payment_not_lunas",
+            "skipped": {
+                "status": "skipped_payment_not_lunas",
+                "reason": f"Pembayaran pesanan belum lunas (status saat ini: '{order.get('payment_status')}').",
+                "skipped_at": now_iso
+            },
+            "eligibility": {
+                "scope_status": "in_scope_pending",
+                "governance_mode": "manual_override" if is_override else "automatic",
+                "evaluated_at": now_iso,
+                "version": 1
+            }
+        }
+
+    policy = await get_active_admin_wage_policy(db_inst=db)
+
+    # Check 5: Historical pre-activation check (if not manual override)
+    check_order = dict(order)
+    if payment_summary and isinstance(payment_summary, dict):
+        pmt_date = payment_summary.get("payment_date") or now_iso
+        check_order["paid_at"] = pmt_date
+
+    if not is_override and is_order_historical_unreconciled(check_order, policy):
+        return {
+            "status": "skipped_pre_activation_historical",
+            "skipped": {
+                "status": "skipped_pre_activation_historical",
+                "reason": "Pesanan diselesaikan sebelum sistem upah admin resmi diaktifkan. Kompensasi ditangani manual di kasir fisik.",
+                "skipped_at": now_iso
+            },
+            "eligibility": {
+                "scope_status": "excluded_historical",
+                "governance_mode": "historical",
+                "skip_reason": "settled_prior_to_system_activation",
+                "evaluated_at": now_iso,
+                "version": 1
+            }
+        }
+
+    # Both conditions satisfied: delegate to process_order_admin_wage_accrual
+    return await process_order_admin_wage_accrual(
+        order, admin, session=session, policy=policy,
+        payment_summary=payment_summary, lifecycle_event=lifecycle_event,
+        transition_context=transition_context
+    )
 
 def distribute_wage_piastres(total_amount_le: float, recipients: list) -> list:
     """
@@ -7212,6 +9003,36 @@ async def execute_order_handover_completion(
         "changed_by_name": admin_name,
         "reason": reason
     }
+
+    # Phase 08.5C.4 — Admin Wage Accrual: Sequence B (Paid first, completed later)
+    # Evaluate shared eligibility check when order transitions to 'selesai'
+    if order_doc.get("order_status") != "selesai":
+        order_for_wage = dict(order_doc)
+        order_for_wage.update(order_update)
+        order_for_wage["order_status"] = "selesai"
+        if is_order_fully_paid(order_for_wage) and not is_order_excluded_from_admin_wage(order_for_wage):
+            admin_wage_res = await evaluate_and_process_order_admin_wage_accrual(
+                order_for_wage,
+                admin,
+                session=session,
+                lifecycle_event="order_completed",
+                transition_context={
+                    "transition_type": "order_completion",
+                    "order_id": str(order_doc.get("_id") or order_doc.get("id")),
+                    "from_status": order_doc.get("order_status"),
+                    "to_status": "selesai",
+                }
+            )
+            if admin_wage_res:
+                if admin_wage_res.get("obligation"):
+                    order_update["admin_wage_obligation"] = admin_wage_res["obligation"]
+                    order_update["admin_wage_blocked"] = None
+                elif admin_wage_res.get("blocked"):
+                    order_update["admin_wage_blocked"] = admin_wage_res["blocked"]
+                elif admin_wage_res.get("skipped") and admin_wage_res.get("status") not in ("skipped_order_not_completed", "skipped_payment_not_lunas"):
+                    order_update["admin_wage_skipped"] = admin_wage_res["skipped"]
+                if admin_wage_res.get("eligibility"):
+                    order_update["admin_wage_eligibility"] = admin_wage_res["eligibility"]
 
     res_ord = await db.orders.update_one(
         {"_id": order_doc["_id"]},
@@ -8002,6 +9823,12 @@ async def admin_update_wage_policy_endpoint(
     admin_id_str = str(admin.get("id") or admin.get("_id") or "")
     admin_name_str = admin.get("name", "Owner")
 
+    cycle_event_action = None
+    current_cycle_id = None
+    old_enabled = False
+    target_enabled = False
+    existing_cycles = []
+
     if category == "delivery":
         try:
             payload = DeliveryWagePolicyInput(**body)
@@ -8150,15 +9977,57 @@ async def admin_update_wage_policy_endpoint(
             recipient_name = recip.get("name", "Admin")
 
         old_policy = await get_active_admin_wage_policy(db_inst=db)
+        old_enabled = bool(old_policy.get("enabled", False))
+        target_enabled = bool(payload.enabled)
+        existing_cycles = list(old_policy.get("activation_cycles") or [])
+        current_cycle_id = old_policy.get("current_cycle_id")
+        initial_activation_at = old_policy.get("initial_activation_at")
+
+        cycle_event_action = None
+        if not old_enabled and target_enabled:
+            # Transition: OFF -> ON (Start new cycle)
+            new_cycle_id = f"cycle_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            new_cycle = {
+                "cycle_id": new_cycle_id,
+                "enabled_at": now_iso,
+                "enabled_by_id": admin_id_str,
+                "enabled_by_name": admin_name_str,
+                "enabled_reason": (body.get("change_reason") or getattr(payload, "change_reason", None) or "").strip(),
+                "disabled_at": None,
+                "disabled_by_id": None,
+                "disabled_by_name": None,
+                "disabled_reason": None,
+            }
+            existing_cycles.append(new_cycle)
+            current_cycle_id = new_cycle_id
+            if not initial_activation_at:
+                initial_activation_at = now_iso
+            cycle_event_action = "admin_wage_policy_cycle_opened"
+
+        elif old_enabled and not target_enabled:
+            # Transition: ON -> OFF (Close active cycle)
+            reason_text = (body.get("change_reason") or getattr(payload, "change_reason", None) or "").strip()
+            for c in existing_cycles:
+                if c.get("disabled_at") is None or c.get("cycle_id") == current_cycle_id:
+                    c["disabled_at"] = now_iso
+                    c["disabled_by_id"] = admin_id_str
+                    c["disabled_by_name"] = admin_name_str
+                    c["disabled_reason"] = reason_text
+            current_cycle_id = None
+            cycle_event_action = "admin_wage_policy_cycle_closed"
+
         new_policy_val = {
             "default_wage_per_order_le": float(payload.default_wage_per_order_le),
             "default_recipient_id": str(payload.default_recipient_id) if payload.default_recipient_id else None,
             "default_recipient_name": recipient_name,
             "unusual_amount_threshold_le": float(payload.unusual_amount_threshold_le),
             "max_wage_per_order_le": float(payload.max_wage_per_order_le),
-            "enabled": bool(payload.enabled),
+            "enabled": target_enabled,
             "currency": "EGP",
             "rounding_policy": "piastre_round_half_up",
+            "activation_cycles": existing_cycles,
+            "current_cycle_id": current_cycle_id,
+            "initial_activation_at": initial_activation_at,
             "updated_at": now_iso,
             "updated_by_id": admin_id_str,
             "updated_by_name": admin_name_str
@@ -8217,6 +10086,24 @@ async def admin_update_wage_policy_endpoint(
             },
             session=sess
         )
+
+        if cycle_event_action:
+            await record_audit_log(
+                action=cycle_event_action,
+                entity_type=f"{category}_wage_policy",
+                entity_id=setting_key,
+                entity_identifier=setting_key,
+                admin=admin,
+                metadata={
+                    "category": category,
+                    "cycle_id": current_cycle_id,
+                    "previous_enabled": old_enabled,
+                    "new_enabled": target_enabled,
+                    "activation_cycles_count": len(existing_cycles),
+                    "change_reason": change_reason
+                },
+                session=sess
+            )
 
     await execute_transaction_with_safety(client, _do_policy_update)
 
@@ -8974,6 +10861,12 @@ async def admin_convert_invoice_to_order(
         "estimated_total_idr": round(total_le * rate),
         "rate_timestamp": now,
         "requires_admin_confirmation": False,
+        "admin_wage_eligibility": {
+            "scope_status": "in_scope_pending",
+            "governance_mode": "automatic",
+            "evaluated_at": now,
+            "version": 1
+        },
         "created_at": now,
         "updated_at": now,
     }

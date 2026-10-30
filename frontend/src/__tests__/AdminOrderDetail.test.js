@@ -512,4 +512,71 @@ describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => 
       expect(container.textContent).toContain("Estimasi Total Upah");
     });
   });
+
+  describe("Phase 08.4D — Owner Admin Wage Override Integration", () => {
+    let container = null;
+    let root = null;
+
+    beforeEach(() => {
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+    });
+
+    afterEach(() => {
+      act(() => {
+        if (root) root.unmount();
+      });
+      if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
+      }
+      container = null;
+      root = null;
+      jest.clearAllMocks();
+    });
+
+    test("renders AdminWageOverrideCard inside AdminOrderDetail for Owner", async () => {
+      const dummyOrder = {
+        _id: "order-test-123",
+        order_number: "SGF-2026-001",
+        order_status: "diproses",
+        payment_status: "dp",
+        items: [],
+        payments: [],
+      };
+
+      const dummyWageConfig = {
+        order_id: "order-test-123",
+        order_number: "SGF-2026-001",
+        is_override: false,
+        effective_configuration: {
+          source: "policy_default",
+          is_override: false,
+          amount_le: 150.0,
+          recipient_name: "Siti Admin",
+        },
+        policy_context: {
+          default_wage_per_order_le: 150.0,
+          max_wage_per_order_le: 500.0,
+        },
+        is_editable: true,
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/admin-wage")) return Promise.resolve({ data: dummyWageConfig });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        if (url.includes("/assignments")) return Promise.resolve({ data: [] });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        return Promise.resolve({ data: dummyOrder });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      expect(container.querySelector('[data-testid="admin-wage-override-card"]')).not.toBeNull();
+      expect(container.textContent).toContain("Upah Admin Per Pesanan");
+      expect(container.textContent).toContain("Owner Only");
+    });
+  });
 });
