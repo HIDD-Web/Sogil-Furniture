@@ -833,8 +833,10 @@ class MaterialPurchaseInput(BaseModel):
     notes: Optional[str] = ""
     stock_processing: Optional[StockProcessingInput] = None
     buyer_worker_id: Optional[str] = None
+    buyer_worker_ids: Optional[List[str]] = None
     buyer_wage_amount: Optional[float] = None
     buyer_wage_notes: Optional[str] = ""
+    confirmed_unusual_amount: Optional[bool] = False
 
 class VoidPurchaseInput(BaseModel):
     void_reason: Optional[str] = ""
@@ -14411,18 +14413,23 @@ async def create_material_purchase(
     now = datetime.now(timezone.utc).isoformat()
     material_canonical_id = str(mat["_id"])
 
-    # Buyer worker & wage validation
-    buyer_worker_id = (data.buyer_worker_id or "").strip() or None
-    buyer_wage_amount = data.buyer_wage_amount
-    buyer_worker_doc = None
-    buyer_wage_le = None
+    # Buyer worker(s) & wage validation
+    raw_wids = []
+    if data.buyer_worker_ids is not None:
+        raw_wids = [str(w).strip() for w in data.buyer_worker_ids if str(w).strip()]
+    elif data.buyer_worker_id:
+        raw_wids = [str(data.buyer_worker_id).strip()]
 
-    if buyer_worker_id and (buyer_wage_amount is None or _num(buyer_wage_amount) <= 0):
+    has_buyers = len(raw_wids) > 0
+    buyer_wage_amount = data.buyer_wage_amount
+    has_wage_amount = buyer_wage_amount is not None and _num(buyer_wage_amount) > 0
+
+    if has_buyers and (buyer_wage_amount is None or _num(buyer_wage_amount) <= 0):
         raise HTTPException(
             status_code=400,
             detail="Nominal upah pembelian bahan harus lebih besar dari 0 jika pekerja pembeli dipilih"
         )
-    if buyer_wage_amount is not None and _num(buyer_wage_amount) > 0 and not buyer_worker_id:
+    if has_wage_amount and not has_buyers:
         raise HTTPException(
             status_code=400,
             detail="Pekerja pembeli wajib dipilih jika nominal upah diisi"
@@ -14433,14 +14440,70 @@ async def create_material_purchase(
             detail="Nominal upah pembelian bahan harus lebih besar dari 0"
         )
 
-    if buyer_worker_id and buyer_wage_amount is not None and _num(buyer_wage_amount) > 0:
-        buyer_worker_doc = await db.admins.find_one({"_id": id_query(buyer_worker_id), "status": {"$ne": "inactive"}})
-        if not buyer_worker_doc:
+    buyer_worker_docs = []
+    buyer_wage_le = None
+    wage_allocations = []
+
+    if has_buyers and has_wage_amount:
+        # Check active policy
+        policy = await get_active_material_purchase_wage_policy(db_inst=db)
+        if policy.get("is_configured") and not policy.get("enabled"):
             raise HTTPException(
-                status_code=404,
-                detail="Pekerja pembeli tidak ditemukan atau berstatus tidak aktif"
+                status_code=422,
+                detail="Kebijakan upah belanja bahan sedang dinonaktifkan oleh Owner."
             )
+
+        max_buyers = policy.get("max_buyers") or 5
+        if len(raw_wids) > max_buyers:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Jumlah pekerja pembeli ({len(raw_wids)}) melebihi batas maksimum ({max_buyers} orang)"
+            )
+        if len(set(raw_wids)) != len(raw_wids):
+            raise HTTPException(
+                status_code=422,
+                detail="Daftar pekerja pembeli memuat ID duplikat. Setiap pekerja hanya boleh dipilih satu kali."
+            )
+
+        for wid in raw_wids:
+            w_doc = await db.admins.find_one({"_id": id_query(wid)})
+            if not w_doc:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Pekerja pembeli dengan ID '{wid}' tidak ditemukan dalam sistem"
+                )
+            if w_doc.get("status") == "inactive":
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Pekerja pembeli '{w_doc.get('name', wid)}' berstatus tidak aktif dan tidak dapat ditugaskan"
+                )
+            buyer_worker_docs.append(w_doc)
+
         buyer_wage_le = round(_num(buyer_wage_amount), 2)
+
+        # Hard cap validation
+        max_cap = policy.get("max_wage_per_purchase_le")
+        if max_cap is not None and buyer_wage_le > _num(max_cap):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Nominal upah belanja bahan ({buyer_wage_le} LE) melebihi batas maksimum keras ({max_cap} LE)."
+            )
+
+        # Threshold confirmation validation
+        threshold = policy.get("unusual_amount_threshold_le")
+        if threshold is not None and buyer_wage_le > _num(threshold):
+            notes_str = (data.buyer_wage_notes or "").strip()
+            if not data.confirmed_unusual_amount or len(notes_str) < 3:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Nominal upah belanja bahan ({buyer_wage_le} LE) melebihi batas konfirmasi ({threshold} LE). Wajib menyertakan konfirmasi dan catatan/alasan minimal 3 karakter."
+                )
+
+        recipients_input = [
+            {"worker_id": str(w["_id"]), "worker_name": w.get("name", "Worker")}
+            for w in buyer_worker_docs
+        ]
+        wage_allocations = distribute_wage_piastres(buyer_wage_le, recipients_input)
 
     # Stock processing validation (Phase 5 Pre-cut)
     stock_processing_dict = None
@@ -14511,12 +14574,15 @@ async def create_material_purchase(
         "supplier_name": (data.supplier_name or "").strip(),
         "notes": (data.notes or "").strip(),
         "stock_processing": stock_processing_dict,
-        "buyer_worker_id": str(buyer_worker_doc["_id"]) if buyer_worker_doc else None,
-        "buyer_worker_name": buyer_worker_doc.get("name", "Worker") if buyer_worker_doc else None,
-        "buyer_wage_amount": buyer_wage_le if buyer_worker_doc else None,
-        "buyer_wage_notes": (data.buyer_wage_notes or "").strip() if buyer_worker_doc else None,
+        "buyer_worker_id": str(buyer_worker_docs[0]["_id"]) if buyer_worker_docs else None,
+        "buyer_worker_name": ", ".join(w.get("name", "Worker") for w in buyer_worker_docs) if buyer_worker_docs else None,
+        "buyer_worker_ids": [str(w["_id"]) for w in buyer_worker_docs] if buyer_worker_docs else [],
+        "buyer_wage_amount": buyer_wage_le if buyer_worker_docs else None,
+        "buyer_wage_notes": (data.buyer_wage_notes or "").strip() if buyer_worker_docs else None,
         "buyer_wage_obligation_number": None,
         "buyer_wage_obligation_id": None,
+        "buyer_wage_obligation_numbers": [],
+        "buyer_workers": [],
         "is_void": False,
         "voided_at": None,
         "voided_by_id": None,
@@ -14551,56 +14617,98 @@ async def create_material_purchase(
         # 4. Create Finance expense transaction inside transaction (Phase 4)
         await apply_purchase_finance_expense(doc, admin, session=session)
 
-        # 5. Create Wage Obligation if buyer wage is specified
-        if buyer_worker_doc and buyer_wage_le and buyer_wage_le > 0:
+        # 5. Create Wage Obligation(s) if buyer wage is specified
+        if buyer_worker_docs and buyer_wage_le and buyer_wage_le > 0 and wage_allocations:
             pb_id_str = str(doc["_id"])
-            wob_num = await generate_obligation_number(session=session)
-            accrual_key = f"material_purchase:{pb_id_str}"
+            obligation_numbers = []
+            obligation_ids = []
+            buyer_workers_summary = []
 
-            wob_call = db.wage_obligations.find_one({"accrual_event_key": accrual_key}, **ins_kw)
-            existing_wob = await wob_call if inspect.isawaitable(wob_call) else (wob_call if isinstance(wob_call, dict) else None)
-            if not existing_wob:
-                wob_doc = {
+            for alloc in wage_allocations:
+                wid = str(alloc["worker_id"])
+                wname = alloc.get("worker_name", "Worker")
+                w_amt_le = alloc["amount_le"]
+                w_piastres = alloc["amount_piastres"]
+
+                wob_num = await generate_obligation_number(session=session)
+                obligation_numbers.append(wob_num)
+
+                accrual_key = f"material_purchase:{pb_id_str}:{wid}" if len(wage_allocations) > 1 else f"material_purchase:{pb_id_str}"
+
+                wob_call = db.wage_obligations.find_one({"accrual_event_key": accrual_key}, **ins_kw)
+                existing_wob = await wob_call if inspect.isawaitable(wob_call) else (wob_call if isinstance(wob_call, dict) else None)
+                if not existing_wob:
+                    wob_doc = {
+                        "obligation_number": wob_num,
+                        "accrual_event_key": accrual_key,
+                        "source_type": "material_purchase",
+                        "material_purchase_id": pb_id_str,
+                        "purchase_number": pb_num,
+                        "material_id": material_canonical_id,
+                        "material_name": mat.get("name", ""),
+                        "worker_id": wid,
+                        "worker_name": wname,
+                        "task_category": "material_purchase",
+                        "pricing_basis": "lump_sum",
+                        "rate_le": w_amt_le,
+                        "accepted_quantity": 1,
+                        "total_amount_le": w_amt_le,
+                        "amount_piastres": w_piastres,
+                        "currency": "EGP",
+                        "status": "accrued",
+                        "paid_amount_le": 0.0,
+                        "locked_exchange_rate": exchange_rate,
+                        "notes": (data.buyer_wage_notes or "").strip() or f"Upah belanja bahan {mat.get('name', '')} ({pb_num})",
+                        "verified_by_id": str(admin.get("id") or admin.get("_id") or ""),
+                        "verified_by_name": admin.get("name", "Admin"),
+                        "rate_policy_snapshot": {
+                            "total_purchase_wage_le": buyer_wage_le,
+                            "allocated_amount_le": w_amt_le,
+                            "allocated_piastres": w_piastres,
+                            "buyers_count": len(wage_allocations),
+                            "exchange_rate": exchange_rate,
+                        },
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    res_wob = db.wage_obligations.insert_one(wob_doc, **ins_kw)
+                    if inspect.isawaitable(res_wob):
+                        res_wob = await res_wob
+                    wob_id_str = str(getattr(res_wob, "inserted_id", "") or "")
+                else:
+                    wob_id_str = str(existing_wob.get("_id") or existing_wob.get("id") or "")
+                    wob_num = existing_wob.get("obligation_number")
+
+                obligation_ids.append(wob_id_str)
+                buyer_workers_summary.append({
+                    "worker_id": wid,
+                    "worker_name": wname,
+                    "amount_le": w_amt_le,
+                    "amount_piastres": w_piastres,
                     "obligation_number": wob_num,
-                    "accrual_event_key": accrual_key,
-                    "source_type": "material_purchase",
-                    "material_purchase_id": pb_id_str,
-                    "purchase_number": pb_num,
-                    "material_id": material_canonical_id,
-                    "material_name": mat.get("name", ""),
-                    "worker_id": str(buyer_worker_doc["_id"]),
-                    "worker_name": buyer_worker_doc.get("name", "Worker"),
-                    "task_category": "material_purchase",
-                    "pricing_basis": "lump_sum",
-                    "rate_le": buyer_wage_le,
-                    "accepted_quantity": 1,
-                    "total_amount_le": buyer_wage_le,
-                    "currency": "EGP",
-                    "status": "accrued",
-                    "paid_amount_le": 0.0,
-                    "locked_exchange_rate": exchange_rate,
-                    "notes": (data.buyer_wage_notes or "").strip() or f"Upah belanja bahan {mat.get('name', '')} ({pb_num})",
-                    "verified_by_id": str(admin.get("id") or admin.get("_id") or ""),
-                    "verified_by_name": admin.get("name", "Admin"),
-                    "created_at": now,
-                    "updated_at": now,
-                }
-                res_wob = db.wage_obligations.insert_one(wob_doc, **ins_kw)
-                if inspect.isawaitable(res_wob):
-                    res_wob = await res_wob
-                wob_id_str = str(getattr(res_wob, "inserted_id", "") or "")
-                upd_pur_res = db.material_purchases.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {
-                        "buyer_wage_obligation_number": wob_num,
-                        "buyer_wage_obligation_id": wob_id_str,
-                    }},
-                    **ins_kw
-                )
-                if inspect.isawaitable(upd_pur_res):
-                    await upd_pur_res
-                doc["buyer_wage_obligation_number"] = wob_num
-                doc["buyer_wage_obligation_id"] = wob_id_str
+                    "obligation_id": wob_id_str,
+                })
+
+            primary_wob_num = obligation_numbers[0]
+            primary_wob_id = obligation_ids[0]
+
+            upd_pur_res = db.material_purchases.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {
+                    "buyer_wage_obligation_number": primary_wob_num,
+                    "buyer_wage_obligation_id": primary_wob_id,
+                    "buyer_wage_obligation_numbers": obligation_numbers,
+                    "buyer_workers": buyer_workers_summary,
+                }},
+                **ins_kw
+            )
+            if inspect.isawaitable(upd_pur_res):
+                await upd_pur_res
+
+            doc["buyer_wage_obligation_number"] = primary_wob_num
+            doc["buyer_wage_obligation_id"] = primary_wob_id
+            doc["buyer_wage_obligation_numbers"] = obligation_numbers
+            doc["buyer_workers"] = buyer_workers_summary
 
         return doc
 
@@ -14660,17 +14768,37 @@ async def void_material_purchase(
             )
         )
 
-    # STRICT WAGE OBLIGATION INVARIANT: Check linked worker wage status
+    # STRICT WAGE OBLIGATION INVARIANT: Check ALL linked worker wage statuses
     pb_id_str = str(doc["_id"])
-    wob_call = db.wage_obligations.find_one({
-        "$or": [
-            {"material_purchase_id": pb_id_str},
-            {"accrual_event_key": f"material_purchase:{pb_id_str}"},
-            {"purchase_number": doc.get("purchase_number")}
-        ]
-    })
-    linked_wob = await wob_call if inspect.isawaitable(wob_call) else (wob_call if isinstance(wob_call, dict) else None)
-    if linked_wob:
+    p_num = str(doc.get("purchase_number") or "").strip()
+    wob_query_conditions = []
+    if pb_id_str:
+        wob_query_conditions.append({"material_purchase_id": pb_id_str})
+        wob_query_conditions.append({"accrual_event_key": f"material_purchase:{pb_id_str}"})
+    if p_num:
+        wob_query_conditions.append({"purchase_number": p_num, "task_category": "material_purchase"})
+
+    linked_wobs = []
+    if wob_query_conditions and hasattr(db.wage_obligations, "find"):
+        try:
+            wobs_cursor = db.wage_obligations.find({"$or": wob_query_conditions})
+            to_list_fn = getattr(wobs_cursor, "to_list", None)
+            if callable(to_list_fn):
+                res_cursor = to_list_fn(100)
+                if inspect.isawaitable(res_cursor):
+                    res_cursor = await res_cursor
+                if isinstance(res_cursor, list):
+                    linked_wobs = res_cursor
+        except Exception:
+            pass
+
+    if not linked_wobs and wob_query_conditions and hasattr(db.wage_obligations, "find_one"):
+        wob_call = db.wage_obligations.find_one({"$or": wob_query_conditions})
+        single_wob = await wob_call if inspect.isawaitable(wob_call) else (wob_call if isinstance(wob_call, dict) else None)
+        if single_wob:
+            linked_wobs = [single_wob]
+
+    for linked_wob in linked_wobs:
         wob_status = linked_wob.get("status")
         if wob_status in ("paid", "partially_paid") or _num(linked_wob.get("paid_amount_le", 0)) > 0:
             raise HTTPException(
@@ -14719,22 +14847,40 @@ async def void_material_purchase(
         if not updated_doc:
             raise HTTPException(status_code=400, detail="Pembelian bahan ini sudah dibatalkan sebelumnya.")
 
-        # 3b. Void linked wage obligation inside transaction if status is accrued
-        if linked_wob and linked_wob.get("status") == "accrued":
-            upd_wob_res = db.wage_obligations.update_one(
-                {"_id": linked_wob["_id"], "status": "accrued"},
-                {"$set": {
-                    "status": "voided",
-                    "voided_at": now,
-                    "voided_by_id": str(admin.get("id") or admin.get("_id") or ""),
-                    "voided_by_name": admin.get("name", "Admin"),
-                    "void_reason": f"Dibatalkan otomatis karena pembelian {doc.get('purchase_number')} di-void: {void_reason}",
-                    "updated_at": now,
-                }},
-                **tx_kw
-            )
-            if inspect.isawaitable(upd_wob_res):
-                await upd_wob_res
+        # 3b. Void all linked wage obligations inside transaction if status is accrued
+        void_set = {
+            "status": "voided",
+            "voided_at": now,
+            "voided_by_id": str(admin.get("id") or admin.get("_id") or ""),
+            "voided_by_name": admin.get("name", "Admin"),
+            "void_reason": f"Dibatalkan otomatis karena pembelian {doc.get('purchase_number')} di-void: {void_reason}",
+            "updated_at": now,
+        }
+        if wob_query_conditions and hasattr(db.wage_obligations, "update_many"):
+            try:
+                upd_wob_res = db.wage_obligations.update_many(
+                    {
+                        "$or": wob_query_conditions,
+                        "status": "accrued"
+                    },
+                    {"$set": void_set},
+                    **tx_kw
+                )
+                if inspect.isawaitable(upd_wob_res):
+                    await upd_wob_res
+            except Exception:
+                pass
+
+        if linked_wobs and hasattr(db.wage_obligations, "update_one"):
+            for lw in linked_wobs:
+                if lw.get("status") == "accrued":
+                    upd_single = db.wage_obligations.update_one(
+                        {"_id": lw["_id"], "status": "accrued"},
+                        {"$set": void_set},
+                        **tx_kw
+                    )
+                    if inspect.isawaitable(upd_single):
+                        await upd_single
 
         # 4. Recalculate material latest price snapshot inside transaction
         await recalculate_material_latest_price(doc["material_id"], session=session)

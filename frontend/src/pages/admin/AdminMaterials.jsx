@@ -31,8 +31,38 @@ import {
   FileText,
   ChevronDown,
   ChevronUp,
+  ShieldAlert,
+  AlertTriangle,
+  CheckCircle2,
+  Info,
 } from "lucide-react";
 import { toast } from "sonner";
+
+/**
+ * Calculates exact integer piastre allocations without drift.
+ */
+export function calculatePiastreAllocations(totalAmount, count) {
+  const n = Math.max(1, parseInt(count, 10) || 1);
+  const totalPiastres = Math.round((Number(totalAmount) || 0) * 100);
+  if (totalPiastres <= 0) return { list: [], totalPiastres: 0, checksum: 0 };
+
+  const quotient = Math.floor(totalPiastres / n);
+  const remainder = totalPiastres % n;
+
+  const list = [];
+  let checksum = 0;
+  for (let i = 0; i < n; i++) {
+    const p = i < remainder ? quotient + 1 : quotient;
+    checksum += p;
+    list.push({
+      index: i + 1,
+      piastres: p,
+      amount_le: (p / 100).toFixed(2),
+      pct: totalPiastres > 0 ? ((p / totalPiastres) * 100).toFixed(1) : 0,
+    });
+  }
+  return { list, totalPiastres, checksum };
+}
 
 const CATEGORIES = ["Material", "Parts"];
 const UNITS = [
@@ -86,9 +116,11 @@ const INITIAL_PURCHASE_FORM = {
   processed_quantity: "",
   precut_outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT }],
   has_buyer_wage: false,
+  buyer_worker_ids: [""],
   buyer_worker_id: "",
   buyer_wage_amount: "",
   buyer_wage_notes: "",
+  confirmed_unusual_amount: false,
 };
 
 const INITIAL_ADJUSTMENT_FORM = {
@@ -206,6 +238,19 @@ export default function AdminMaterials() {
   // Expanded stock forms per material in main tables: { [materialId]: boolean }
   const [expandedStockForms, setExpandedStockForms] = useState({});
 
+  // Material purchase wage policy
+  const [wagePolicy, setWagePolicy] = useState(null);
+
+  const loadWagePolicy = async () => {
+    try {
+      const res = await api.get("/admin/wage-policies/material_purchase");
+      setWagePolicy(res.data);
+    } catch (err) {
+      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") return;
+      console.error("Error loading wage policy:", err);
+    }
+  };
+
   const loadMaterials = async () => {
     try {
       setLoading(true);
@@ -269,6 +314,7 @@ export default function AdminMaterials() {
     loadStockSummary();
     loadTransformations();
     loadWorkers();
+    loadWagePolicy();
   }, []);
 
   const openAddModal = () => {
@@ -366,6 +412,22 @@ export default function AdminMaterials() {
     } catch {
       // Keep default 357
     }
+
+    let policy = wagePolicy;
+    if (!policy) {
+      try {
+        const pRes = await api.get("/admin/wage-policies/material_purchase");
+        policy = pRes.data;
+        setWagePolicy(pRes.data);
+      } catch (err) {
+        console.error("Error fetching wage policy:", err);
+      }
+    }
+
+    const defaultWage = policy?.default_wage_per_purchase_le != null
+      ? String(policy.default_wage_per_purchase_le)
+      : "";
+
     setPurchaseForm({
       material_id: presetMaterial ? presetMaterial.id : "",
       purchase_date: new Date().toISOString().slice(0, 10),
@@ -379,9 +441,11 @@ export default function AdminMaterials() {
       processed_quantity: "",
       precut_outputs: [{ ...INITIAL_TRANSFORMATION_OUTPUT, stock_unit: presetMaterial?.unit || "pcs" }],
       has_buyer_wage: false,
+      buyer_worker_ids: [""],
       buyer_worker_id: "",
-      buyer_wage_amount: "",
+      buyer_wage_amount: defaultWage,
       buyer_wage_notes: "",
+      confirmed_unusual_amount: false,
     });
     if (workers.length === 0) {
       loadWorkers();
@@ -397,11 +461,48 @@ export default function AdminMaterials() {
     if (purchaseForm.unit_price === "" || Number(purchaseForm.unit_price) < 0) return toast.error("Harga satuan tidak valid");
 
     if (purchaseForm.has_buyer_wage) {
-      if (!purchaseForm.buyer_worker_id) {
-        return toast.error("Pekerja pembeli wajib dipilih jika upah diaktifkan");
+      if (wagePolicy && wagePolicy.enabled === false) {
+        return toast.error("Kebijakan upah belanja bahan saat ini sedang dinonaktifkan di Pengaturan Upah.");
       }
-      if (!purchaseForm.buyer_wage_amount || Number(purchaseForm.buyer_wage_amount) <= 0) {
+
+      const rawBuyerIds = purchaseForm.buyer_worker_ids || [];
+      const cleanBuyerIds = rawBuyerIds.filter((id) => id && String(id).trim() !== "");
+      if (cleanBuyerIds.length === 0 && purchaseForm.buyer_worker_id) {
+        cleanBuyerIds.push(purchaseForm.buyer_worker_id);
+      }
+
+      if (cleanBuyerIds.length === 0) {
+        return toast.error("Pilih minimal satu pekerja pembeli");
+      }
+
+      const uniqueBuyers = new Set(cleanBuyerIds);
+      if (uniqueBuyers.size !== cleanBuyerIds.length) {
+        return toast.error("Setiap pekerja pembeli harus unik (tidak boleh ada pekerja duplikat)");
+      }
+
+      const maxBuyers = wagePolicy?.max_buyers ?? 3;
+      if (cleanBuyerIds.length > maxBuyers) {
+        return toast.error(`Jumlah pekerja pembeli (${cleanBuyerIds.length}) melebihi batas maksimal (${maxBuyers} orang)`);
+      }
+
+      const wageAmount = Number(purchaseForm.buyer_wage_amount);
+      if (!wageAmount || wageAmount <= 0) {
         return toast.error("Nominal upah pembelian bahan harus lebih besar dari 0");
+      }
+
+      const hardCap = wagePolicy?.max_wage_per_purchase_le ?? 300;
+      if (wageAmount > hardCap) {
+        return toast.error(`Nominal upah (${wageAmount} LE) melebihi batas maksimum keras (${hardCap} LE). Simpan ditolak.`);
+      }
+
+      const threshold = wagePolicy?.unusual_amount_threshold_le ?? 200;
+      if (wageAmount > threshold) {
+        if (!purchaseForm.confirmed_unusual_amount) {
+          return toast.error(`Nominal upah (${wageAmount} LE) melebihi batas konfirmasi (${threshold} LE). Harap centang konfirmasi.`);
+        }
+        if (!purchaseForm.buyer_wage_notes || purchaseForm.buyer_wage_notes.trim().length < 3) {
+          return toast.error("Catatan alasan upah tidak wajar wajib diisi minimal 3 karakter.");
+        }
       }
     }
 
@@ -432,11 +533,23 @@ export default function AdminMaterials() {
         notes: purchaseForm.notes.trim(),
       };
 
-      if (purchaseForm.has_buyer_wage && purchaseForm.buyer_worker_id && Number(purchaseForm.buyer_wage_amount) > 0) {
-        payload.buyer_worker_id = purchaseForm.buyer_worker_id;
-        payload.buyer_wage_amount = Number(purchaseForm.buyer_wage_amount);
-        if (purchaseForm.buyer_wage_notes?.trim()) {
-          payload.buyer_wage_notes = purchaseForm.buyer_wage_notes.trim();
+      if (purchaseForm.has_buyer_wage) {
+        const rawBuyerIds = purchaseForm.buyer_worker_ids || [];
+        const cleanBuyerIds = rawBuyerIds.filter((id) => id && String(id).trim() !== "");
+        if (cleanBuyerIds.length === 0 && purchaseForm.buyer_worker_id) {
+          cleanBuyerIds.push(purchaseForm.buyer_worker_id);
+        }
+
+        if (cleanBuyerIds.length > 0 && Number(purchaseForm.buyer_wage_amount) > 0) {
+          payload.buyer_worker_ids = cleanBuyerIds;
+          payload.buyer_worker_id = cleanBuyerIds[0];
+          payload.buyer_wage_amount = Number(purchaseForm.buyer_wage_amount);
+          if (purchaseForm.buyer_wage_notes?.trim()) {
+            payload.buyer_wage_notes = purchaseForm.buyer_wage_notes.trim();
+          }
+          if (purchaseForm.confirmed_unusual_amount) {
+            payload.confirmed_unusual_amount = true;
+          }
         }
       }
 
@@ -1586,11 +1699,18 @@ export default function AdminMaterials() {
                           </td>
                           <td className="px-4 py-3 text-xs text-[#5C4A3D]">
                             <div>{p.supplier_name || "-"}</div>
-                            {p.buyer_worker_name && (
+                            {p.buyer_workers && p.buyer_workers.length > 1 ? (
+                              <div className="text-[11px] text-amber-800 font-medium mt-0.5">
+                                <div>Upah ({p.buyer_wage_amount} LE - {p.buyer_workers.length} Orang):</div>
+                                <div className="text-[10px] text-amber-700">
+                                  {p.buyer_workers.map((bw) => `${bw.name || "Pekerja"} (${bw.allocated_amount_le} LE)`).join(", ")}
+                                </div>
+                              </div>
+                            ) : p.buyer_worker_name ? (
                               <div className="text-[11px] text-amber-800 font-medium mt-0.5" title={`No. Kewajiban: ${p.buyer_wage_obligation_number || "-"}`}>
                                 Upah: {p.buyer_worker_name} ({p.buyer_wage_amount} LE)
                               </div>
-                            )}
+                            ) : null}
                           </td>
                           <td className="px-4 py-3">
                             <Badge
@@ -2189,73 +2309,245 @@ export default function AdminMaterials() {
                 />
               </div>
 
-              {/* UPAH PEKERJA PEMBELI (Phase Wage Recovery) */}
+              {/* UPAH PEKERJA PEMBELI (Multi-Buyer Wage Policy) */}
               <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-3 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      id="enable-buyer-wage"
-                      checked={purchaseForm.has_buyer_wage || false}
-                      onChange={(e) => {
-                        const checked = e.target.checked;
-                        setPurchaseForm({
-                          ...purchaseForm,
-                          has_buyer_wage: checked,
-                          buyer_worker_id: checked ? (purchaseForm.buyer_worker_id || workers[0]?.id || "") : "",
-                          buyer_wage_amount: checked ? purchaseForm.buyer_wage_amount : "",
-                        });
-                      }}
-                      className="rounded border-[#C8B89E] text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
-                      data-testid="purchase-form-enable-wage"
-                    />
-                    <Label htmlFor="enable-buyer-wage" className="text-xs font-semibold text-[#5C4A3D] cursor-pointer">
-                      Catat Upah Belanja / Pengambilan Bahan untuk Pekerja
-                    </Label>
+                {wagePolicy && wagePolicy.enabled === false ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-stone-700">
+                      <Info className="h-4 w-4 text-stone-500 shrink-0" />
+                      <span>Kebijakan Upah Belanja Bahan Dinonaktifkan</span>
+                    </div>
+                    <p className="text-[11px] text-stone-500">
+                      Kebijakan Upah Belanja Bahan saat ini dinonaktifkan di menu Pengaturan Upah. Aktifkan kebijakan tersebut jika ingin mencatat kewajiban upah belanja bahan.
+                    </p>
                   </div>
-                </div>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          id="enable-buyer-wage"
+                          checked={purchaseForm.has_buyer_wage || false}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            const initialWorkerId = purchaseForm.buyer_worker_ids?.[0] || purchaseForm.buyer_worker_id || workers[0]?.id || "";
+                            const defaultAmt = purchaseForm.buyer_wage_amount || (wagePolicy?.default_wage_per_purchase_le != null ? String(wagePolicy.default_wage_per_purchase_le) : "");
+                            setPurchaseForm({
+                              ...purchaseForm,
+                              has_buyer_wage: checked,
+                              buyer_worker_ids: checked ? [initialWorkerId] : [""],
+                              buyer_worker_id: checked ? initialWorkerId : "",
+                              buyer_wage_amount: checked ? defaultAmt : "",
+                            });
+                          }}
+                          className="rounded border-[#C8B89E] text-[#8B5A2B] focus:ring-[#8B5A2B] h-4 w-4"
+                          data-testid="purchase-form-enable-wage"
+                        />
+                        <Label htmlFor="enable-buyer-wage" className="text-xs font-semibold text-[#5C4A3D] cursor-pointer">
+                          Catat Upah Belanja / Pengambilan Bahan untuk Pekerja
+                        </Label>
+                      </div>
+                      {wagePolicy && (
+                        <span className="text-[10px] font-medium text-amber-900 bg-amber-200/70 px-2 py-0.5 rounded-full">
+                          Maks {wagePolicy.max_buyers || 3} Pembeli
+                        </span>
+                      )}
+                    </div>
 
-                {purchaseForm.has_buyer_wage && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-amber-200/60">
-                    <div>
-                      <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
-                        Pilih Pekerja Pembeli <span className="text-red-500">*</span>
-                      </Label>
-                      <Select
-                        value={purchaseForm.buyer_worker_id}
-                        onValueChange={(val) => setPurchaseForm({ ...purchaseForm, buyer_worker_id: val })}
-                      >
-                        <SelectTrigger className="bg-white text-xs" data-testid="purchase-form-buyer-worker">
-                          <SelectValue placeholder="-- Pilih Pekerja --" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {workers.map((w) => (
-                            <SelectItem key={w.id} value={w.id}>
-                              {w.name} ({w.role})
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div>
-                      <Label className="mb-1 block text-xs font-semibold text-[#5C4A3D]">
-                        Nominal Upah (LE / EGP) <span className="text-red-500">*</span>
-                      </Label>
-                      <Input
-                        type="number"
-                        step="0.01"
-                        min="0.01"
-                        placeholder="Contoh: 50"
-                        value={purchaseForm.buyer_wage_amount}
-                        onChange={(e) => setPurchaseForm({ ...purchaseForm, buyer_wage_amount: e.target.value })}
-                        data-testid="purchase-form-buyer-wage-amount"
-                        className="bg-white text-xs"
-                      />
-                      <span className="text-[10px] text-[#8B7355] mt-0.5 block">
-                        Otomatis masuk ke rekap Upah Pekerja dan dicairkan via menu Upah Pekerja.
-                      </span>
-                    </div>
-                  </div>
+                    {purchaseForm.has_buyer_wage && (() => {
+                      const maxBuyers = wagePolicy?.max_buyers ?? 3;
+                      const hardCap = wagePolicy?.max_wage_per_purchase_le ?? 300;
+                      const threshold = wagePolicy?.unusual_amount_threshold_le ?? 200;
+                      const wageAmt = Number(purchaseForm.buyer_wage_amount) || 0;
+                      const isHardCapExceeded = wageAmt > hardCap;
+                      const isThresholdExceeded = wageAmt > threshold && wageAmt <= hardCap;
+                      const cleanBuyerIds = (purchaseForm.buyer_worker_ids || []).filter(Boolean);
+                      const allocationCount = Math.max(1, cleanBuyerIds.length);
+                      const allocation = calculatePiastreAllocations(wageAmt, allocationCount);
+
+                      return (
+                        <div className="space-y-3 pt-2 border-t border-amber-200/60">
+                          {/* Nominal Upah Total */}
+                          <div>
+                            <div className="flex items-center justify-between mb-1">
+                              <Label className="text-xs font-semibold text-[#5C4A3D]">
+                                Nominal Upah Total (LE / EGP) <span className="text-red-500">*</span>
+                              </Label>
+                              <span className="text-[10px] text-stone-500">
+                                Standar: {wagePolicy?.default_wage_per_purchase_le ?? 100} LE | Batas: {threshold} LE | Maks: {hardCap} LE
+                              </span>
+                            </div>
+                            <Input
+                              type="number"
+                              step="0.01"
+                              min="0.01"
+                              placeholder="Contoh: 100"
+                              value={purchaseForm.buyer_wage_amount}
+                              onChange={(e) => setPurchaseForm({ ...purchaseForm, buyer_wage_amount: e.target.value })}
+                              data-testid="purchase-form-buyer-wage-amount"
+                              className={`bg-white text-xs ${isHardCapExceeded ? "border-red-500 focus:ring-red-500" : ""}`}
+                            />
+                            {isHardCapExceeded && (
+                              <div className="flex items-center gap-1.5 mt-1 text-[11px] text-red-600 font-medium">
+                                <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+                                <span>Melebihi batas maksimum keras ({hardCap} LE). Penyimpanan akan ditolak.</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Daftar Pekerja Pembeli */}
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <Label className="text-xs font-semibold text-[#5C4A3D]">
+                                Pekerja Pembeli ({purchaseForm.buyer_worker_ids?.length || 1} dari maks {maxBuyers}) <span className="text-red-500">*</span>
+                              </Label>
+                              {(purchaseForm.buyer_worker_ids?.length || 1) < maxBuyers && (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    const current = purchaseForm.buyer_worker_ids || [""];
+                                    if (current.length < maxBuyers) {
+                                      setPurchaseForm({
+                                        ...purchaseForm,
+                                        buyer_worker_ids: [...current, ""],
+                                      });
+                                    }
+                                  }}
+                                  data-testid="purchase-form-add-buyer"
+                                  className="h-6 text-[11px] px-2 text-[#8B5A2B] border-amber-300 hover:bg-amber-100/60"
+                                >
+                                  <Plus className="h-3 w-3 mr-1" /> Tambah Pembeli
+                                </Button>
+                              )}
+                            </div>
+
+                            <div className="space-y-1.5">
+                              {(purchaseForm.buyer_worker_ids || [""]).map((buyerId, idx) => (
+                                <div key={idx} className="flex items-center gap-2">
+                                  <span className="text-[11px] font-medium text-stone-500 w-16 shrink-0">
+                                    Pembeli #{idx + 1}
+                                  </span>
+                                  <select
+                                    value={buyerId}
+                                    onChange={(e) => {
+                                      const updated = [...(purchaseForm.buyer_worker_ids || [""])];
+                                      updated[idx] = e.target.value;
+                                      setPurchaseForm({
+                                        ...purchaseForm,
+                                        buyer_worker_ids: updated,
+                                        buyer_worker_id: updated[0] || "",
+                                      });
+                                    }}
+                                    data-testid={`purchase-form-buyer-worker-${idx}`}
+                                    className="flex-1 h-8 rounded-md border border-[#E5DCC5] bg-white px-2 py-1 text-xs text-[#2C241E] focus:outline-none focus:ring-1 focus:ring-[#8B5A2B]"
+                                  >
+                                    <option value="">-- Pilih Pekerja --</option>
+                                    {workers.map((w) => {
+                                      const isAlreadyChosen = (purchaseForm.buyer_worker_ids || []).some(
+                                        (chosenId, cIdx) => chosenId === w.id && cIdx !== idx
+                                      );
+                                      return (
+                                        <option key={w.id} value={w.id} disabled={isAlreadyChosen}>
+                                          {w.name} ({w.role || "Tukang"}){w.status === "inactive" ? " - [Nonaktif]" : ""}{isAlreadyChosen ? " (Sudah dipilih)" : ""}
+                                        </option>
+                                      );
+                                    })}
+                                  </select>
+                                  {(purchaseForm.buyer_worker_ids?.length || 1) > 1 && (
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      onClick={() => {
+                                        const updated = (purchaseForm.buyer_worker_ids || []).filter((_, i) => i !== idx);
+                                        setPurchaseForm({
+                                          ...purchaseForm,
+                                          buyer_worker_ids: updated.length ? updated : [""],
+                                          buyer_worker_id: updated[0] || "",
+                                        });
+                                      }}
+                                      className="h-8 w-8 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+                                      title="Hapus Pembeli"
+                                      data-testid={`purchase-form-remove-buyer-${idx}`}
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Simulasi Distribusi Presisi Piastre */}
+                          {wageAmt > 0 && cleanBuyerIds.length > 0 && (
+                            <div className="rounded-lg border border-amber-200 bg-white/90 p-2.5 space-y-1.5">
+                              <div className="flex items-center justify-between text-xs font-semibold text-[#5C4A3D]">
+                                <span>Simulasi Distribusi ({cleanBuyerIds.length} Pembeli)</span>
+                                <span className="font-mono text-amber-900">{wageAmt} LE ({allocation.totalPiastres} piastre)</span>
+                              </div>
+                              <div className="space-y-1">
+                                {cleanBuyerIds.map((wId, i) => {
+                                  const alloc = allocation.list[i];
+                                  const workerObj = workers.find((w) => w.id === wId);
+                                  const wName = workerObj ? workerObj.name : `Pembeli #${i + 1}`;
+                                  return (
+                                    <div key={i} className="flex items-center justify-between text-[11px] py-0.5 border-b border-amber-100/60 last:border-b-0">
+                                      <span className="text-stone-700">{wName}</span>
+                                      <span className="font-mono font-medium text-amber-900">
+                                        {alloc?.amount_le} LE <span className="text-stone-400 font-normal">({alloc?.piastres} p · {alloc?.pct}%)</span>
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                              <div className="text-[10px] text-stone-500 pt-0.5 flex items-center justify-between">
+                                <span>* Pembagian presisi integer piastre tanpa selisih pembulatan.</span>
+                                <span className="font-mono text-green-700 font-semibold">Selisih: 0 piastre</span>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Konfirmasi Batas Tidak Wajar (Threshold) */}
+                          {isThresholdExceeded && (
+                            <div className="p-2.5 rounded-lg border border-amber-300 bg-amber-100/70 space-y-2">
+                              <div className="flex items-start gap-2">
+                                <AlertTriangle className="h-4 w-4 text-amber-700 shrink-0 mt-0.5" />
+                                <div className="text-xs text-amber-900">
+                                  <strong>Perhatian:</strong> Nominal upah ({wageAmt} LE) melebihi batas konfirmasi ({threshold} LE).
+                                </div>
+                              </div>
+                              <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-amber-900">
+                                <input
+                                  type="checkbox"
+                                  checked={purchaseForm.confirmed_unusual_amount || false}
+                                  onChange={(e) => setPurchaseForm({ ...purchaseForm, confirmed_unusual_amount: e.target.checked })}
+                                  className="rounded border-amber-400 text-amber-800 focus:ring-amber-800"
+                                  data-testid="purchase-form-confirm-unusual"
+                                />
+                                Konfirmasi nominal upah di luar batas normal
+                              </label>
+                              <div>
+                                <Label className="text-[11px] font-semibold text-amber-900">
+                                  Alasan Upah Tidak Wajar (Wajib min 3 karakter) <span className="text-red-500">*</span>
+                                </Label>
+                                <Input
+                                  type="text"
+                                  placeholder="Contoh: Belanja malam hari / barang volume sangat banyak"
+                                  value={purchaseForm.buyer_wage_notes || ""}
+                                  onChange={(e) => setPurchaseForm({ ...purchaseForm, buyer_wage_notes: e.target.value })}
+                                  data-testid="purchase-form-buyer-wage-notes"
+                                  className="bg-white text-xs mt-1"
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  </>
                 )}
               </div>
 
