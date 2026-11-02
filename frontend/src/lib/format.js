@@ -41,9 +41,14 @@ export const formatMoney = (v, cur = "EGP", options = {}) => {
 export const formatApiError = (detail) => {
   if (detail == null) return "Terjadi kesalahan. Silakan coba lagi.";
   if (typeof detail === "string") return detail;
+  if (detail?.name === "CanceledError" || detail?.code === "ERR_CANCELED") return "";
+  if (detail?.response?.data?.detail != null) {
+    return formatApiError(detail.response.data.detail);
+  }
   if (Array.isArray(detail))
     return detail.map((e) => (e && typeof e.msg === "string" ? e.msg : JSON.stringify(e))).join(" ");
   if (detail && typeof detail.msg === "string") return detail.msg;
+  if (detail && typeof detail.message === "string") return detail.message;
   return String(detail);
 };
 

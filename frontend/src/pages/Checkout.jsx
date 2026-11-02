@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import api from "../lib/api";
+import api, { imgUrl } from "../lib/api";
 import { fmtLE, fmtIDR, formatApiError } from "../lib/format";
 import { config_summary_client } from "../lib/summary";
 import { normalizePhone, validIntlPhone, normalizeEgyptPhone, validEgyptPhone } from "../lib/photoMatch";
@@ -12,7 +12,7 @@ import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
 import { Label } from "../components/ui/label";
 import { toast } from "sonner";
-import { Store, Truck, ChevronLeft } from "lucide-react";
+import { Store, Truck, ChevronLeft, Camera, Upload, Trash2, CheckCircle2 } from "lucide-react";
 
 const Chip = ({ active, onClick, children, testid }) => (
   <button type="button" onClick={onClick} data-testid={testid}
@@ -31,6 +31,8 @@ export default function Checkout() {
   const [validatingReferral, setValidatingReferral] = useState(false);
   const [delivery, setDelivery] = useState({ method: "", zone_id: "" });
   const [cust, setCust] = useState({ name: "", phone: "", phone_number: "", address: "", maps: "", payment: "", notes: "" });
+  const [buildingPhotoUrl, setBuildingPhotoUrl] = useState("");
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [disc, setDisc] = useState({ code: "", amount: 0, applied: false });
   const [ref, setRef] = useState({ code: "", amount: 0, applied: false });
   const [pts, setPts] = useState(0);
@@ -200,6 +202,43 @@ export default function Checkout() {
     );
   }
 
+  const handleBuildingPhotoUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowedTypes.includes(file.type)) {
+      return toast.error("Format gambar tidak didukung. Gunakan JPG, PNG, atau WebP.");
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      return toast.error("Ukuran foto gedung melebihi batas 10MB.");
+    }
+
+    setUploadingPhoto(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const { data } = await api.post("/upload-building-photo", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      if (data?.url) {
+        setBuildingPhotoUrl(data.url);
+        toast.success("Foto gedung berhasil diunggah.");
+      }
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail) || "Gagal mengunggah foto gedung.");
+    } finally {
+      setUploadingPhoto(false);
+      e.target.value = "";
+    }
+  };
+
+  const handleRemoveBuildingPhoto = () => {
+    setBuildingPhotoUrl("");
+    toast.info("Foto gedung dihapus.");
+  };
+
   const submit = async () => {
     if (!cust.name.trim()) return toast.error(t("err.nama"));
     const phone = normalizePhone(cust.phone);
@@ -233,6 +272,10 @@ export default function Checkout() {
       return toast.error("Link Maps harus berupa link Google Maps yang valid.");
     }
 
+    if (uploadingPhoto) {
+      return toast.warning("Mohon tunggu hingga proses unggah foto gedung selesai.");
+    }
+
     setSubmitting(true);
     const notes = [cust.notes, ...items.filter((i) => i.config?.custom_size && i.config?.custom_note).map((i) => `Custom (${i.product?.name || i.name}): ${i.config.custom_note}`)].filter(Boolean).join(" | ");
     try {
@@ -240,6 +283,7 @@ export default function Checkout() {
         customer_name: cust.name, customer_phone: phone, phone_number: normEgyptPhone, customer_address: cust.address,
         customer_maps_url: normalizedMaps, delivery_method: delivery.method,
         delivery_zone_id: delivery.method === "delivery" ? delivery.zone_id : null,
+        building_photo_url: buildingPhotoUrl || null,
         payment_method: cust.payment, notes,
         discount_code: !ref.applied && disc.applied ? disc.code : null,
         referral_code: ref.applied ? ref.code : null,
@@ -311,8 +355,96 @@ export default function Checkout() {
               </div>
               <p className="mt-1 text-xs text-[#8B7355]">Nomor panggilan telepon lokal Mesir (opsional jika memiliki simcard Mesir)</p>
             </div>
-            <div><Label className="mb-1.5 block text-sm">{t("chk.alamat")} *</Label><Textarea value={cust.address} onChange={(e) => setCust({ ...cust, address: e.target.value })} data-testid="input-address" className="min-h-[80px] bg-white" /></div>
-            <div><Label className="mb-1.5 block text-sm">{t("chk.link_maps")} {delivery.method === "delivery" ? "* (Wajib untuk pengiriman kurir)" : t("chk.maps_opsional")}</Label><Input value={cust.maps} onChange={(e) => setCust({ ...cust, maps: e.target.value })} data-testid="input-maps" placeholder="https://maps.app.goo.gl/... atau https://maps.google.com/..." className="h-12 bg-white" /></div>
+            <div>
+              <Label className="mb-1.5 block text-sm">{t("chk.alamat")} *</Label>
+              <Textarea
+                value={cust.address}
+                onChange={(e) => setCust({ ...cust, address: e.target.value })}
+                data-testid="input-address"
+                placeholder={t("chk.alamat_ph")}
+                className="min-h-[80px] bg-white text-sm"
+              />
+              <p className="mt-1 text-xs text-[#8B7355]">{t("chk.alamat_help")}</p>
+            </div>
+            <div>
+              <Label className="mb-1.5 block text-sm">{t("chk.link_maps")} {delivery.method === "delivery" ? "* (Wajib untuk pengiriman kurir)" : t("chk.maps_opsional")}</Label>
+              <Input
+                value={cust.maps}
+                onChange={(e) => setCust({ ...cust, maps: e.target.value })}
+                data-testid="input-maps"
+                placeholder="https://maps.app.goo.gl/... atau https://maps.google.com/..."
+                className="h-12 bg-white"
+              />
+            </div>
+
+            {/* Foto Gedung / Imarah (Opsional) */}
+            <div className="rounded-xl border border-[#E5DCC5] bg-[#FAF8F5] p-3.5 space-y-2" data-testid="section-building-photo">
+              <div className="flex items-center justify-between">
+                <Label className="text-sm font-medium text-[#2C1E16] flex items-center gap-1.5">
+                  <Camera size={16} className="text-[#8B5A2B]" />
+                  {t("chk.foto_gedung")}
+                </Label>
+                <span className="text-xs text-[#8B7355]">{t("chk.foto_gedung_opsional")}</span>
+              </div>
+              <p className="text-xs text-[#8B7355]">
+                {t("chk.foto_gedung_help")}
+              </p>
+
+              {buildingPhotoUrl ? (
+                <div className="flex items-center gap-3 pt-1">
+                  <div className="h-16 w-16 overflow-hidden rounded-lg border border-[#E5DCC5] bg-white">
+                    <img
+                      src={imgUrl(buildingPhotoUrl)}
+                      alt="Foto Gedung"
+                      className="h-full w-full object-cover"
+                      data-testid="building-photo-preview"
+                    />
+                  </div>
+                  <div className="flex-1 space-y-1">
+                    <span className="text-xs text-green-700 font-medium flex items-center gap-1">
+                      <CheckCircle2 size={14} /> Foto gedung tersimpan
+                    </span>
+                    <div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleRemoveBuildingPhoto}
+                        className="h-7 text-xs border-red-200 text-red-600 hover:bg-red-50"
+                        data-testid="btn-remove-building-photo"
+                      >
+                        <Trash2 size={12} className="mr-1" />
+                        {t("chk.hapus_foto")}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="pt-1">
+                  <label className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-[#8B5A2B]/40 bg-white px-4 py-3 text-xs font-semibold text-[#8B5A2B] hover:bg-[#FAF5EE] cursor-pointer transition-colors">
+                    {uploadingPhoto ? (
+                      <span className="flex items-center gap-2">
+                        <Upload size={14} className="animate-spin" /> Mengunggah foto...
+                      </span>
+                    ) : (
+                      <>
+                        <Upload size={14} />
+                        <span>{t("chk.unggah_foto")}</span>
+                      </>
+                    )}
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      className="hidden"
+                      onChange={handleBuildingPhotoUpload}
+                      disabled={uploadingPhoto || submitting}
+                      data-testid="input-building-photo"
+                    />
+                  </label>
+                  <p className="mt-1 text-[11px] text-[#8B7355]">Format: JPG, PNG, WebP (maks. 10MB)</p>
+                </div>
+              )}
+            </div>
             <div>
               <Label className="mb-2 block font-heading text-sm font-semibold text-[#2C1E16]">{t("chk.metode_bayar")} *</Label>
               <div className="flex flex-wrap gap-2"><Chip active={cust.payment === "cash"} onClick={() => setCust({ ...cust, payment: "cash" })} testid="pay-cash">{t("chk.cash")}</Chip><Chip active={cust.payment === "transfer"} onClick={() => setCust({ ...cust, payment: "transfer" })} testid="pay-transfer">{t("chk.transfer")}</Chip></div>

@@ -97,21 +97,21 @@ export default function Home() {
         if (mounted) setLoading(false);
       });
 
-    if (showSplash) {
-      sessionStorage.setItem("sogil_splash_seen", "true");
-      const timer = window.setTimeout(() => {
-        if (mounted) setShowSplash(false);
-      }, 1000);
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
-      return () => {
-        mounted = false;
-        window.clearTimeout(timer);
-      };
-    } else {
-      return () => {
-        mounted = false;
-      };
-    }
+  useEffect(() => {
+    if (!showSplash) return;
+    sessionStorage.setItem("sogil_splash_seen", "true");
+    const timer = window.setTimeout(() => {
+      setShowSplash(false);
+    }, 1000);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
   }, [showSplash]);
 
   const categoryOrder = useMemo(() => {

@@ -51,70 +51,105 @@ export default function ProductConfigure() {
   const { addItem } = useCart();
   const [product, setProduct] = useState(null);
   const [store, setStore] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState(null);
+  const [retryCount, setRetryCount] = useState(0);
   const [config, setConfig] = useState({ custom_size: false });
   const [quantity, setQuantity] = useState(1);
   const [customNote, setCustomNote] = useState("");
   const isInitializedRef = useRef(false);
+  const activeRequestIdRef = useRef(0);
 
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setFetchError(null);
     isInitializedRef.current = false;
-    Promise.all([api.get(`/products/${slug}`), api.get("/store-info")]).then(([p, s]) => {
-      setProduct(p.data); setStore(s.data);
-      const pr = p.data.pricing || {};
-      const grps = Array.isArray(pr.groups) ? pr.groups : null;
-      let init = { custom_size: false };
-      if (grps) {
-        grps.forEach((g) => {
-          if ((g.options || []).length) {
-            if (p.data.category === "meja_rak" && g.key === "size") {
-              const opt50 = g.options.find((o) => o.includes("50x80"));
-              init[g.key] = opt50 || g.options[0];
-            } else {
-              init[g.key] = g.options[0];
+    const reqId = ++activeRequestIdRef.current;
+
+    Promise.all([api.get(`/products/${slug}`), api.get("/store-info")])
+      .then(([p, s]) => {
+        if (cancelled || reqId !== activeRequestIdRef.current) return;
+        setProduct(p.data);
+        setStore(s.data);
+        const pr = p.data.pricing || {};
+        const grps = Array.isArray(pr.groups) ? pr.groups : null;
+        let init = { custom_size: false };
+        if (grps) {
+          grps.forEach((g) => {
+            if ((g.options || []).length) {
+              if (p.data.category === "meja_rak" && g.key === "size") {
+                const opt50 = g.options.find((o) => o.includes("50x80"));
+                init[g.key] = opt50 || g.options[0];
+              } else {
+                init[g.key] = g.options[0];
+              }
             }
+          });
+        }
+        else if (p.data.category === "rak") {
+          init = {
+            length: (pr.lengths || [])[0],
+            level: (pr.levels || [])[0],
+            type: "B",
+            finishing: "Natural",
+            custom_size: false,
+          };
+        }
+        else if (p.data.category === "meja") {
+          const sizes = pr.sizes || [];
+          const defaultSize = sizes.includes("50x80") ? "50x80" : sizes[0];
+          init = {
+            size: defaultSize,
+            height: (pr.heights || [])[0],
+            finishing: "Natural",
+            custom_size: false,
+          };
+        }
+        else if (p.data.category === "meja_rak") {
+          const variants = pr.variants || [];
+          const defaultVariant = variants.find((v) => v.includes("50x80")) || variants[0];
+          init = {
+            variant: defaultVariant,
+            type: "B",
+            finishing: "Natural",
+            custom_size: false,
+          };
+        }
+
+        searchParams.forEach((val, key) => {
+          if (val && key !== "custom_size") {
+            init[key] = val;
           }
         });
-      }
-      else if (p.data.category === "rak") {
-        init = {
-          length: (pr.lengths || [])[0],
-          level: (pr.levels || [])[0],
-          type: "B",
-          finishing: "Natural",
-          custom_size: false,
-        };
-      }
-      else if (p.data.category === "meja") {
-        const sizes = pr.sizes || [];
-        const defaultSize = sizes.includes("50x80") ? "50x80" : sizes[0];
-        init = {
-          size: defaultSize,
-          height: (pr.heights || [])[0],
-          finishing: "Natural",
-          custom_size: false,
-        };
-      }
-      else if (p.data.category === "meja_rak") {
-        const variants = pr.variants || [];
-        const defaultVariant = variants.find((v) => v.includes("50x80")) || variants[0];
-        init = {
-          variant: defaultVariant,
-          type: "B",
-          finishing: "Natural",
-          custom_size: false,
-        };
-      }
 
-      searchParams.forEach((val, key) => {
-        if (val && key !== "custom_size") {
-          init[key] = val;
+        setConfig(init);
+        isInitializedRef.current = true;
+      })
+      .catch((err) => {
+        if (cancelled || reqId !== activeRequestIdRef.current) return;
+        setProduct(null);
+        const status = err?.response?.status;
+        const msg = err?.response?.data?.detail
+          ? (typeof err.response.data.detail === "string" ? err.response.data.detail : "Gagal memuat produk")
+          : (err?.message || "Gagal memuat produk");
+        setFetchError({ status, message: msg });
+        if (status === 404) {
+          toast.error(t("err.product_not_found"));
+        } else {
+          toast.error(msg);
+        }
+      })
+      .finally(() => {
+        if (!cancelled && reqId === activeRequestIdRef.current) {
+          setLoading(false);
         }
       });
 
-      setConfig(init);
-      isInitializedRef.current = true;
-    }).catch(() => toast.error(t("err.product_not_found")));
-  }, [slug, searchParams, t]);
+    return () => {
+      cancelled = true;
+    };
+  }, [slug, retryCount, searchParams, t]);
 
   const rate = store?.exchange_rate_idr_per_le || 357;
   const breakdown = useMemo(() => (product ? computeBreakdown(product, config, quantity) : null), [product, config, quantity]);
@@ -244,7 +279,51 @@ export default function ProductConfigure() {
     else toast.success(t("err.cart_added"));
   };
 
-  if (!product) return <div className="py-20 text-center text-[#8B7355]">{t("cat.memuat")}</div>;
+  if (loading) {
+    return (
+      <div className="py-20 text-center text-[#8B7355]" data-testid="product-loading">
+        {t("cat.memuat") || "Memuat..."}
+      </div>
+    );
+  }
+
+  if (fetchError || !product) {
+    const is404 = fetchError?.status === 404;
+    return (
+      <div className="max-w-md mx-auto py-16 px-4 text-center space-y-4" data-testid="product-error-state">
+        <div className="w-12 h-12 rounded-full bg-amber-50 text-amber-700 mx-auto flex items-center justify-center">
+          <Info size={24} />
+        </div>
+        <h2 className="text-lg font-semibold text-[#2C1E16]">
+          {is404 ? (t("err.product_not_found") || "Produk tidak ditemukan") : "Gagal Memuat Produk"}
+        </h2>
+        <p className="text-sm text-[#8B7355]">
+          {is404
+            ? "Produk yang Anda cari tidak tersedia atau tautan sudah tidak berlaku."
+            : (fetchError?.message || "Terjadi kesalahan saat memuat data produk. Silakan coba lagi.")}
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+          {!is404 && (
+            <Button
+              onClick={() => setRetryCount((c) => c + 1)}
+              className="rounded-xl bg-[#8B5A2B] text-white hover:bg-[#6B4423]"
+              data-testid="product-retry-btn"
+            >
+              Coba Lagi
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            onClick={() => navigate("/katalog")}
+            className="rounded-xl border-[#E5DCC5] text-[#5C4A3D] hover:bg-[#FBF9F4]"
+            data-testid="product-back-catalog-btn"
+          >
+            {t("prod.back_catalog") || "Kembali ke katalog"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
   const pr = product.pricing || {};
   const groups = Array.isArray(pr.groups) ? pr.groups : null;
   const isFixed = pr.price_model === "additive";

@@ -39,7 +39,7 @@ jest.mock("sonner", () => ({
   },
 }));
 
-import api from "../lib/api";
+import api, { imgUrl } from "../lib/api";
 jest.mock("../lib/api");
 
 describe("AdminOrderDetail - Component Mount & Regression Suite", () => {
@@ -876,6 +876,161 @@ describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => 
       expect(toast.warning).toHaveBeenCalledWith(
         expect.stringContaining("tidak terjadi duplikasi")
       );
+    });
+  });
+
+  describe("Phase 1 — Mobile Layout, Compact Maps CTA & Update Error Standardization", () => {
+    let container = null;
+    let root = null;
+
+    beforeEach(() => {
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      root = createRoot(container);
+    });
+
+    afterEach(() => {
+      act(() => {
+        if (root) root.unmount();
+      });
+      if (container && container.parentNode) {
+        container.parentNode.removeChild(container);
+      }
+      container = null;
+      root = null;
+      jest.clearAllMocks();
+    });
+
+    test("renders compact accessible Google Maps CTA link instead of raw URL text dump", async () => {
+      const orderWithLongMaps = {
+        id: "order-test-123",
+        order_number: "SGF-20261101-MAPS",
+        customer_name: "Farhan Kairo",
+        customer_phone: "+201011112222",
+        customer_address: "Imarah No. 12, Jalan Abbasia, Kairo, Lantai 3, Syaqqoh 8",
+        customer_maps_url: "https://www.google.com/maps/place/30%C2%B003'12.4%22N+31%C2%B019'48.7%22E/@30.053434,31.327618,17z/data=!3m1!4b1!4m4!3m3!8m2!3d30.053434!4d31.330193",
+        order_status: "dikonfirmasi",
+        payment_status: "dp",
+        delivery_method: "delivery",
+        subtotal_le: 1500,
+        delivery_fee_le: 100,
+        discount_le: 0,
+        total_le: 1600,
+        items: [{ item_id: "itm_1", product_name_snapshot: "Lemari 2 Pintu", quantity: 1, subtotal_le: 1500 }],
+        created_at: new Date().toISOString(),
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: [] });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-policies/production")) return Promise.resolve({ data: null });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: orderWithLongMaps });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // Verify compact link exists
+      const mapsLink = container.querySelector('[data-testid="customer-maps-link"]');
+      expect(mapsLink).toBeTruthy();
+      expect(mapsLink.getAttribute("href")).toBe(orderWithLongMaps.customer_maps_url);
+      expect(mapsLink.getAttribute("target")).toBe("_blank");
+      expect(mapsLink.getAttribute("rel")).toBe("noopener noreferrer");
+      expect(mapsLink.textContent).toContain("Buka Google Maps");
+
+      // Verify accessible aria-label is present
+      expect(mapsLink.getAttribute("aria-label")).toContain("Buka Link Google Maps");
+
+      // Verify row container and value element use responsive break-words
+      expect(mapsLink.parentElement.className).toContain("break-words");
+    });
+
+    test("update failure surfaces specific backend validation error via toast.error", async () => {
+      const { toast } = require("sonner");
+      const sampleOrder = {
+        id: "order-test-123",
+        order_number: "SGF-20261101-VAL",
+        customer_name: "Budi",
+        order_status: "dikonfirmasi",
+        payment_status: "dp",
+        total_le: 1000,
+        items: [{ item_id: "itm_1", product_name_snapshot: "Meja", quantity: 1, subtotal_le: 1000 }],
+        created_at: new Date().toISOString(),
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: [] });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-policies/production")) return Promise.resolve({ data: null });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: sampleOrder });
+      });
+
+      api.patch.mockRejectedValueOnce({
+        response: {
+          data: {
+            detail: "Pesanan sedang terikat pada trip pengiriman aktif (TRIP-20261101-01).",
+          },
+        },
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      // Trigger note update
+      const noteInput = container.querySelector('[data-testid="admin-note-input"]');
+      const saveBtn = container.querySelector('[data-testid="save-admin-note"]');
+      await act(async () => {
+        saveBtn.click();
+      });
+
+      expect(toast.error).toHaveBeenCalledWith(
+        "Pesanan sedang terikat pada trip pengiriman aktif (TRIP-20261101-01)."
+      );
+    });
+
+    test("renders building photo CTA link when building_photo_url is present, omits when null", async () => {
+      const orderWithBuildingPhoto = {
+        id: "order-test-photo",
+        order_number: "SGF-20261101-PHOTO",
+        customer_name: "Ahmad Kairo",
+        customer_phone: "+201011112222",
+        customer_address: "Imarah 15, Syaqqoh 4",
+        building_photo_url: "/api/files/sogil/building-photos/test12345.webp",
+        order_status: "dikonfirmasi",
+        payment_status: "dp",
+        total_le: 500,
+        items: [{ item_id: "itm_1", product_name_snapshot: "Kursi", quantity: 1, subtotal_le: 500 }],
+        created_at: new Date().toISOString(),
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: [] });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-policies/production")) return Promise.resolve({ data: null });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: orderWithBuildingPhoto });
+      });
+
+      if (imgUrl && imgUrl.mockImplementation) {
+        imgUrl.mockImplementation((p) => (p ? `https://test.com${p}` : ""));
+      }
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      const photoLink = container.querySelector('[data-testid="admin-building-photo-link"]');
+      expect(photoLink).toBeTruthy();
+      expect(photoLink.getAttribute("href")).toBe("https://test.com/api/files/sogil/building-photos/test12345.webp");
+      expect(photoLink.getAttribute("target")).toBe("_blank");
+      expect(photoLink.textContent).toContain("Lihat Foto Gedung");
     });
   });
 });

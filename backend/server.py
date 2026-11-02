@@ -12,7 +12,7 @@ from starlette.responses import Response as StarletteResponse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 import logging
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 import uuid
 from enum import Enum
 import secrets
@@ -163,6 +163,16 @@ def get_object(path: str):
     )
 
     return content, content_type
+
+def delete_object(path: str):
+    try:
+        s3 = get_r2_client()
+        s3.delete_object(
+            Bucket=R2_BUCKET,
+            Key=path,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to delete object from R2 ({path}): {e}")
 
 # --------------------------------------------------------------------------
 # Auth & permissions
@@ -341,6 +351,7 @@ class OrderInput(BaseModel):
     redeem_points: Optional[float] = 0
     phone_number: Optional[str] = None
     invoice_id: Optional[str] = None
+    building_photo_url: Optional[str] = None
 
 class OrderStatusUpdate(BaseModel):
     order_status: Optional[str] = None
@@ -1699,6 +1710,18 @@ def validate_and_normalize_maps_url(maps_url: Optional[str], delivery_method: st
 
     return maps
 
+def validate_building_photo_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    val = url.strip()
+    if not val:
+        return None
+    if not (val.startswith("/api/files/") or val.startswith("https://") or val.startswith("http://")):
+        raise HTTPException(status_code=400, detail="URL foto gedung tidak valid.")
+    if len(val) > 1000:
+        raise HTTPException(status_code=400, detail="URL foto gedung terlalu panjang.")
+    return val
+
 def clean_customer_invoice(inv: dict) -> dict:
     d = clean(inv)
     d.pop("internal_note", None)
@@ -1749,6 +1772,7 @@ async def _create_invoice_order(request: Request, data: OrderInput):
         raise HTTPException(status_code=400, detail="Silakan pilih metode pembayaran.")
 
     maps = validate_and_normalize_maps_url(data.customer_maps_url, data.delivery_method)
+    building_photo = validate_building_photo_url(data.building_photo_url)
 
     delivery_fee = 0.0; zone_name = None; zone_id = None
     if data.delivery_method == "delivery":
@@ -1822,6 +1846,7 @@ async def _create_invoice_order(request: Request, data: OrderInput):
         "phone_number": egypt_phone,
         "customer_address": data.customer_address.strip(),
         "customer_maps_url": maps,
+        "building_photo_url": building_photo,
         "delivery_method": data.delivery_method,
         "delivery_zone_id": zone_id,
         "delivery_zone_name": zone_name,
@@ -1975,6 +2000,7 @@ async def create_order(request: Request, data: OrderInput):
         raise HTTPException(status_code=400, detail="Keranjang kosong.")
 
     maps = validate_and_normalize_maps_url(data.customer_maps_url, data.delivery_method)
+    building_photo = validate_building_photo_url(data.building_photo_url)
 
     delivery_fee = 0.0; zone_name = None; zone_id = None
     if data.delivery_method == "delivery":
@@ -2049,6 +2075,7 @@ async def create_order(request: Request, data: OrderInput):
         "customer_name": data.customer_name.strip(), "customer_phone": phone,
         "phone_number": egypt_phone,
         "customer_address": data.customer_address.strip(), "customer_maps_url": maps,
+        "building_photo_url": building_photo,
         "delivery_method": data.delivery_method, "delivery_zone_id": zone_id, "delivery_zone_name": zone_name,
         "delivery_fee_le": delivery_fee, "payment_method": data.payment_method,
         "payment_status": "belum_dibayar", "order_status": "pesanan_masuk",
@@ -2113,18 +2140,18 @@ def config_summary(item):
     return ", ".join(parts)
 
 def build_whatsapp_message(order):
-    lines = ["Halo Sogil Furniture, saya ingin melakukan pemesanan.", "", f"No. Pesanan: {order['order_number']}", ""]
+    lines = ["Halo Sogil Furniture, saya ingin melakukan pemesanan.", "", f"No. Pesanan: {order.get('order_number', '')}", ""]
     for idx, item in enumerate(order.get("items", [order.get("item")]), 1):
         if not item:
             continue
         prefix = f"{idx}. " if len(order.get("items", [])) > 1 else ""
-        lines.append(f"{prefix}Produk: {item['product_name_snapshot']}")
+        lines.append(f"{prefix}Produk: {item.get('product_name_snapshot', '')}")
         cs = config_summary(item)
         if cs:
             lines.append(f"   Spesifikasi: {cs}")
-        lines.append(f"   Jumlah: {item['quantity']}")
+        lines.append(f"   Jumlah: {item.get('quantity', 1)}")
     lines.append("")
-    if order["delivery_method"] == "delivery":
+    if order.get("delivery_method") == "delivery":
         lines.append("Pengiriman: Delivery")
         lines.append(f"Zona: {order.get('delivery_zone_name', '-')}")
     else:
@@ -2139,12 +2166,12 @@ def build_whatsapp_message(order):
     if _num(order.get("points_redeemed_le")) > 0:
         lines.append(f"Penukaran Poin: -{fmt_le(_num(order['points_redeemed_le']))} LE")
     lines += [f"Ongkir: {fmt_le(_num(order.get('delivery_fee_le')))} LE",
-              f"Total: {fmt_le(order['total_le'])} LE (≈ {fmt_idr(order['estimated_total_idr'])})",
-              f"Rate: Rp{fmt_le(order['exchange_rate_idr_per_le'])}/LE", "",
-              f"Nama: {order['customer_name']}", f"No. HP: {order['customer_phone']}", f"Alamat: {order['customer_address']}"]
+              f"Total: {fmt_le(order.get('total_le', 0))} LE (≈ {fmt_idr(order.get('estimated_total_idr', 0))})",
+              f"Rate: Rp{fmt_le(order.get('exchange_rate_idr_per_le', 0))}/LE", "",
+              f"Nama: {order.get('customer_name', '')}", f"No. HP: {order.get('customer_phone', '')}", f"Alamat: {order.get('customer_address', '')}"]
     if order.get("customer_maps_url"):
         lines.append(f"Maps: {order['customer_maps_url']}")
-    lines += ["", f"Pembayaran: {'Transfer' if order['payment_method'] == 'transfer' else 'Cash'}"]
+    lines += ["", f"Pembayaran: {'Transfer' if order.get('payment_method') == 'transfer' else 'Cash'}"]
     if order.get("notes"):
         lines += ["", f"Catatan: {order['notes']}"]
     if order.get("requires_admin_confirmation"):
@@ -2481,6 +2508,15 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             rate = existing_order.get("exchange_rate_idr_per_le") or 357
             update["estimated_total_idr"] = round(update["total_le"] * rate)
 
+        # Phase 1: Always keep stored whatsapp_message synchronized with saved order modifications
+        order_for_wa = dict(existing_order)
+        order_for_wa.update(update)
+        if "items" in update:
+            order_for_wa["items"] = update["items"]
+        if "item" in update:
+            order_for_wa["item"] = update["item"]
+        update["whatsapp_message"] = build_whatsapp_message(order_for_wa)
+
         # Phase 3.B.1 — Immutable Handover Snapshot & Status Transition Audit History
         now_iso = update.get("updated_at") or datetime.now(timezone.utc).isoformat()
         mongo_ops = {"$set": update}
@@ -2564,7 +2600,10 @@ async def admin_update_order(order_id: str, data: OrderStatusUpdate, admin: dict
             await _mongo_update_one(db.orders, {"_id": id_query(order_id)}, mongo_ops, **find_kw)
 
         order = await _mongo_find_one(db.orders, {"_id": id_query(order_id)}, **find_kw)
-        return clean(order)
+        order = clean(order)
+        order["whatsapp_message"] = update.get("whatsapp_message") or build_whatsapp_message(order)
+        order["whatsapp_number"] = await get_setting("whatsapp_number", "628XXXXXXXXXX")
+        return order
 
     def _is_transient_conflict(exc: Exception) -> bool:
         if isinstance(exc, pymongo.errors.PyMongoError):
@@ -6382,8 +6421,9 @@ async def download_file(path: str):
     if not record:
         raise HTTPException(status_code=404, detail="File tidak ditemukan")
     data, content_type = get_object(path)
+    cache_control = "private, max-age=3600" if record.get("category") == "building_photo" else "public, max-age=86400"
     return StarletteResponse(content=data, media_type=record.get("content_type", content_type),
-                             headers={"Cache-Control": "public, max-age=86400"})
+                             headers={"Cache-Control": cache_control})
 
 @api_router.post("/upload-reference")
 async def upload_reference(file: UploadFile = File(...)):
@@ -6406,6 +6446,256 @@ async def upload_reference(file: UploadFile = File(...)):
         "is_deleted": False, "category": "custom_reference",
         "created_at": datetime.now(timezone.utc).isoformat()
     })
+    return {"path": result["storage_path"], "url": f"/api/files/{result['storage_path']}"}
+
+def get_client_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return "127.0.0.1"
+    # Optional trusted origin verification header (e.g. Cloudflare Authenticated Origin Pulls / Transform Rule)
+    # When TRUSTED_ORIGIN_VERIFY_SECRET is set, direct requests missing this secret cannot spoof IP headers.
+    trusted_secret = os.environ.get("TRUSTED_ORIGIN_VERIFY_SECRET")
+    if trusted_secret:
+        origin_token = request.headers.get("x-origin-verify")
+        if not origin_token or origin_token.strip() != trusted_secret.strip():
+            if request.client and request.client.host:
+                return request.client.host
+            return "127.0.0.1"
+
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip and cf_ip.strip():
+        return cf_ip.strip().split(",")[0].strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff and xff.strip():
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[0]
+    if request.client and request.client.host:
+        return request.client.host
+    return "127.0.0.1"
+
+BUILDING_PHOTO_RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
+BUILDING_PHOTO_RATE_LIMIT_MAX_UPLOADS = 5
+
+async def reserve_upload_quota(
+    ip: str,
+    now: Optional[datetime] = None,
+    reservation_id: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Atomically reserves an upload quota slot for the client IP using a single find_one_and_update pipeline.
+    Tracks reservations with a unique reservation ID to prevent accidental collision during rollback.
+    Maintains backward compatibility with legacy documents having bare timestamps.
+    Returns (allowed: bool, reservation_id: str).
+    Fails open (allowed=True) if MongoDB query fails to preserve guest checkout availability.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if not reservation_id:
+        reservation_id = uuid.uuid4().hex
+    cutoff = now - timedelta(seconds=BUILDING_PHOTO_RATE_LIMIT_WINDOW_SECONDS)
+    try:
+        coll = db.upload_rate_limits
+        find_op = getattr(coll, "find_one_and_update", None)
+        if callable(find_op):
+            res_val = find_op(
+                {"_id": f"bphoto_rate:{ip}"},
+                [
+                    {
+                        "$set": {
+                            "ip": ip,
+                            "category": "building_photo",
+                            "updated_at": now,
+                            "reservations": {
+                                "$filter": {
+                                    "input": {
+                                        "$ifNull": [
+                                            "$reservations",
+                                            {
+                                                "$map": {
+                                                    "input": {"$ifNull": ["$timestamps", []]},
+                                                    "as": "t",
+                                                    "in": {"id": "legacy", "ts": "$$t"}
+                                                }
+                                            }
+                                        ]
+                                    },
+                                    "as": "r",
+                                    "cond": {"$gte": [{"$ifNull": ["$$r.ts", "$$r"]}, cutoff]}
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "$set": {
+                            "allowed": {"$lt": [{"$size": "$reservations"}, BUILDING_PHOTO_RATE_LIMIT_MAX_UPLOADS]},
+                            "reservations": {
+                                "$cond": {
+                                    "if": {"$lt": [{"$size": "$reservations"}, BUILDING_PHOTO_RATE_LIMIT_MAX_UPLOADS]},
+                                    "then": {"$concatArrays": ["$reservations", [{"id": reservation_id, "ts": now}]]},
+                                    "else": "$reservations"
+                                }
+                            }
+                        }
+                    }
+                ],
+                upsert=True,
+                return_document=ReturnDocument.AFTER
+            )
+            if asyncio.iscoroutine(res_val) or hasattr(res_val, "__await__"):
+                res = await res_val
+            else:
+                res = res_val
+
+            if isinstance(res, dict):
+                if not res.get("allowed", False):
+                    return False, reservation_id
+                return True, reservation_id
+
+        # Legacy fallback if find_one_and_update is not available or mocked with count_documents
+        count_op = getattr(coll, "count_documents", None)
+        if callable(count_op):
+            cnt_val = count_op({
+                "ip": ip,
+                "category": "building_photo",
+                "created_at": {"$gte": cutoff}
+            })
+            if asyncio.iscoroutine(cnt_val) or hasattr(cnt_val, "__await__"):
+                cnt = await cnt_val
+            else:
+                cnt = cnt_val
+            if isinstance(cnt, (int, float)) and cnt >= BUILDING_PHOTO_RATE_LIMIT_MAX_UPLOADS:
+                return False, reservation_id
+        return True, reservation_id
+    except Exception as e:
+        logger.error(f"Error reserving building photo upload rate limit for {ip}: {e}")
+        # Fail-open to preserve checkout availability
+        return True, reservation_id
+
+async def rollback_upload_quota(ip: str, reservation_id_or_ts: Union[str, datetime]):
+    """
+    Rolls back a reserved upload quota slot when a server-side failure occurs (R2/DB error),
+    ensuring customers are not penalized for infrastructure downtime.
+    Supports both unique reservation ID (str) and legacy timestamp (datetime) for backward compatibility.
+    """
+    try:
+        coll = db.upload_rate_limits
+        if isinstance(reservation_id_or_ts, str):
+            upd = coll.update_one(
+                {"_id": f"bphoto_rate:{ip}"},
+                {"$pull": {"reservations": {"id": reservation_id_or_ts}}}
+            )
+        else:
+            upd = coll.update_one(
+                {"_id": f"bphoto_rate:{ip}"},
+                {
+                    "$pull": {
+                        "timestamps": reservation_id_or_ts,
+                        "reservations": {"ts": reservation_id_or_ts}
+                    }
+                }
+            )
+        if asyncio.iscoroutine(upd) or hasattr(upd, "__await__"):
+            await upd
+    except Exception as e:
+        logger.error(f"Error rolling back upload quota for IP {ip}: {e}")
+
+async def check_building_photo_rate_limit(ip: str):
+    """
+    Public rate limit checker for callers/tests.
+    Raises HTTPException(429) if the limit is exceeded.
+    """
+    allowed, res_id = await reserve_upload_quota(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Batas unggah foto tercapai (maksimal 5 unggah per 5 menit). Silakan tunggu beberapa menit atau lanjutkan checkout tanpa foto."
+        )
+    # Check-only caller: release the speculative reservation immediately
+    await rollback_upload_quota(ip, res_id)
+
+async def record_building_photo_upload_rate_limit(ip: str):
+    """
+    Backward-compatibility helper for legacy callers.
+    """
+    try:
+        coll = db.upload_rate_limits
+        ins = coll.insert_one({
+            "ip": ip,
+            "category": "building_photo",
+            "created_at": datetime.now(timezone.utc)
+        })
+        if asyncio.iscoroutine(ins) or hasattr(ins, "__await__"):
+            await ins
+    except Exception as e:
+        logger.error(f"Error recording building photo upload rate limit: {e}")
+
+@api_router.post("/upload-building-photo")
+async def upload_building_photo(request: Request, file: UploadFile = File(...)):
+    client_ip = get_client_ip(request)
+    allowed, reservation_id = await reserve_upload_quota(client_ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Batas unggah foto tercapai (maksimal 5 unggah per 5 menit). Silakan tunggu beberapa menit atau lanjutkan checkout tanpa foto."
+        )
+
+    ext = (file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "bin").lower()
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        raise HTTPException(status_code=400, detail="Format gambar tidak didukung (jpg, png, webp)")
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Ukuran gambar maksimal 10MB")
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        img.verify()
+    except ImportError:
+        pass
+    except Exception:
+        raise HTTPException(status_code=400, detail="File gambar tidak valid atau rusak")
+
+    opt = optimize_image(data)
+    if opt:
+        data, ext, ctype = opt
+    else:
+        ctype = MIME_TYPES.get(ext, "image/jpeg")
+    path = f"{APP_NAME}/building-photos/{uuid.uuid4().hex}.{ext}"
+
+    try:
+        result = put_object(path, data, ctype)
+    except Exception as r2_err:
+        logger.error(f"Gagal mengunggah foto gedung ke storage R2: {r2_err}")
+        await rollback_upload_quota(client_ip, reservation_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Layanan penyimpanan foto sedang tidak tersedia. Silakan coba lagi nanti atau lanjutkan tanpa foto."
+        )
+
+    try:
+        await db.files.insert_one({
+            "storage_path": result["storage_path"], "original_filename": file.filename or "building_photo",
+            "content_type": ctype, "size": result.get("size", len(data)),
+            "is_deleted": False, "category": "building_photo",
+            "ip": client_ip,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+    except Exception as db_err:
+        logger.error(f"Gagal mencatat metadata foto gedung di database: {db_err}")
+        try:
+            delete_object(path)
+        except Exception as cleanup_err:
+            logger.critical(
+                f"RECONCILIATION NEEDED: Orphan R2 object detected. "
+                f"Storage path '{path}' could not be deleted after MongoDB insert failure. "
+                f"DB error: {db_err}, Cleanup error: {cleanup_err}"
+            )
+        await rollback_upload_quota(client_ip, reservation_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Layanan penyimpanan foto sedang tidak tersedia. Silakan coba lagi nanti atau lanjutkan tanpa foto."
+        )
+
     return {"path": result["storage_path"], "url": f"/api/files/{result['storage_path']}"}
 
 # --------------------------------------------------------------------------
@@ -13193,6 +13483,8 @@ async def seed(target_db=None):
         await use_db.claim_attempts.create_index("created_at", expireAfterSeconds=900)
         await use_db.claim_attempts.create_index([("ip", 1), ("created_at", -1)])
         await use_db.claim_attempts.create_index([("customer_id", 1), ("created_at", -1)])
+        # Upload rate limits indexes (Phase 2 hardening)
+        await use_db.upload_rate_limits.create_index("updated_at", expireAfterSeconds=600)
         # Audit logs indexes
         await use_db.audit_logs.create_index([("entity_type", 1), ("entity_id", 1)])
         await use_db.audit_logs.create_index("entity_identifier")

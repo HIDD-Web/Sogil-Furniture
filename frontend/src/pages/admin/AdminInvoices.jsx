@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import api from "../../lib/api";
 import { fmtLE } from "../../lib/format";
@@ -29,28 +29,23 @@ export default function AdminInvoices() {
     cancelled: 0,
   });
 
-  const loadGlobalCounts = () => {
-    api.get("/admin/invoices")
-      .then((r) => {
-        const allList = Array.isArray(r.data) ? r.data : [];
-        setGlobalCounts({
-          all: allList.length,
-          draft: allList.filter((x) => x.status === "DRAFT").length,
-          sent: allList.filter((x) => x.status === "SENT").length,
-          claimed: allList.filter((x) => x.status === "CLAIMED").length,
-          converted: allList.filter((x) => x.status === "CONVERTED").length,
-          cancelled: allList.filter((x) => x.status === "CANCELLED").length,
-        });
-      })
-      .catch(() => {});
-  };
+  const latestRequestIdRef = useRef(0);
+
+  const countInvoices = (list) => ({
+    all: list.length,
+    draft: list.filter((x) => x.status === "DRAFT").length,
+    sent: list.filter((x) => x.status === "SENT").length,
+    claimed: list.filter((x) => x.status === "CLAIMED").length,
+    converted: list.filter((x) => x.status === "CONVERTED").length,
+    cancelled: list.filter((x) => x.status === "CANCELLED").length,
+  });
 
   useEffect(() => {
-    loadGlobalCounts();
-  }, []);
-
-  const loadInvoices = () => {
+    let cancelled = false;
     setLoading(true);
+    const requestId = ++latestRequestIdRef.current;
+    const isUnfiltered = (!statusFilter || statusFilter === "all") && !appliedQ;
+
     const q = {};
     if (statusFilter && statusFilter !== "all") {
       q.status = statusFilter;
@@ -58,26 +53,50 @@ export default function AdminInvoices() {
     if (appliedQ) {
       q.q = appliedQ;
     }
-    api.get("/admin/invoices", { params: q })
-      .then((r) => {
-        const list = Array.isArray(r.data) ? r.data : [];
-        setInvoices(list);
-        if ((!statusFilter || statusFilter === "all") && !appliedQ) {
-          setGlobalCounts({
-            all: list.length,
-            draft: list.filter((x) => x.status === "DRAFT").length,
-            sent: list.filter((x) => x.status === "SENT").length,
-            converted: list.filter((x) => x.status === "CONVERTED").length,
-            cancelled: list.filter((x) => x.status === "CANCELLED").length,
-          });
-        }
-      })
-      .catch((err) => toast.error(err.response?.data?.detail || "Gagal memuat invoice"))
-      .finally(() => setLoading(false));
-  };
 
-  useEffect(() => {
-    loadInvoices();
+    if (isUnfiltered) {
+      api.get("/admin/invoices")
+        .then((r) => {
+          if (cancelled || requestId !== latestRequestIdRef.current) return;
+          const list = Array.isArray(r.data) ? r.data : [];
+          setInvoices(list);
+          setGlobalCounts(countInvoices(list));
+        })
+        .catch((err) => {
+          if (cancelled || requestId !== latestRequestIdRef.current) return;
+          toast.error(err.response?.data?.detail || "Gagal memuat invoice");
+        })
+        .finally(() => {
+          if (!cancelled && requestId === latestRequestIdRef.current) {
+            setLoading(false);
+          }
+        });
+    } else {
+      Promise.all([
+        api.get("/admin/invoices", { params: q }),
+        api.get("/admin/invoices"),
+      ])
+        .then(([filterRes, countsRes]) => {
+          if (cancelled || requestId !== latestRequestIdRef.current) return;
+          const list = Array.isArray(filterRes?.data) ? filterRes.data : [];
+          setInvoices(list);
+          const allList = Array.isArray(countsRes?.data) ? countsRes.data : [];
+          setGlobalCounts(countInvoices(allList));
+        })
+        .catch((err) => {
+          if (cancelled || requestId !== latestRequestIdRef.current) return;
+          toast.error(err.response?.data?.detail || "Gagal memuat invoice");
+        })
+        .finally(() => {
+          if (!cancelled && requestId === latestRequestIdRef.current) {
+            setLoading(false);
+          }
+        });
+    }
+
+    return () => {
+      cancelled = true;
+    };
   }, [statusFilter, appliedQ]);
 
   const handleStatusTab = (st) => {

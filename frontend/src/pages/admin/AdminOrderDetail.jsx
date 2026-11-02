@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import api from "../../lib/api";
+import api, { imgUrl } from "../../lib/api";
 import { fmtLE, fmtIDR, copyToClipboard, formatApiError } from "../../lib/format";
 import { config_summary_client } from "../../lib/summary";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../../lib/constants";
@@ -9,7 +9,7 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { Label } from "../../components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
-import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History, Wrench, UserCheck, ShieldCheck, CheckSquare, Info } from "lucide-react";
+import { ChevronLeft, MapPin, Copy, MessageCircle, Trash2, Pencil, X, Sparkles, Phone, FileText, AlertTriangle, CreditCard, CheckCircle2, History, Wrench, UserCheck, ShieldCheck, CheckSquare, Info, ExternalLink, Camera } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "../../context/AuthContext";
 import PublishCustomCollectionModal from "../../components/admin/PublishCustomCollectionModal";
@@ -154,8 +154,13 @@ export default function AdminOrderDetail() {
   }, [id]);
 
   const update = async (patch) => {
-    try { const { data } = await api.patch(`/admin/orders/${id}`, patch); setOrder((o) => ({ ...o, ...data })); toast.success("Pesanan diperbarui"); }
-    catch { toast.error("Gagal memperbarui"); }
+    try {
+      const { data } = await api.patch(`/admin/orders/${id}`, patch);
+      setOrder((o) => ({ ...o, ...data }));
+      toast.success("Pesanan diperbarui");
+    } catch (e) {
+      toast.error(formatApiError(e?.response?.data?.detail) || "Gagal memperbarui");
+    }
   };
 
   const handleOpenAssignModal = (it) => {
@@ -573,7 +578,7 @@ export default function AdminOrderDetail() {
             <Textarea value={note} onChange={(e) => setNote(e.target.value)} data-testid="admin-note-input" className="min-h-[70px] bg-white" />
             <Button onClick={() => update({ admin_note: note })} data-testid="save-admin-note" className="mt-2 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423]">Simpan Catatan</Button></div>
           <div className="mt-4 flex flex-wrap gap-2">
-            <a href={`https://wa.me/${phoneNum}`} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#25D366] text-[#25D366]"><MessageCircle size={16} className="mr-1" /> WhatsApp</Button></a>
+            <a href={`https://wa.me/${phoneNum}`} target="_blank" rel="noopener noreferrer"><Button variant="outline" className="rounded-xl border-[#25D366] text-[#25D366]"><MessageCircle size={16} className="mr-1" /> WhatsApp</Button></a>
             {order.phone_number && (
               <a href={`tel:${order.phone_number}`}>
                 <Button variant="outline" data-testid="admin-call-button" className="rounded-xl border-[#8B5A2B] text-[#8B5A2B] hover:bg-[#FAF5EE]">
@@ -581,7 +586,7 @@ export default function AdminOrderDetail() {
                 </Button>
               </a>
             )}
-            {order.customer_maps_url && <a href={order.customer_maps_url} target="_blank" rel="noreferrer"><Button variant="outline" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><MapPin size={16} className="mr-1" /> Maps</Button></a>}
+            {order.customer_maps_url && <a href={order.customer_maps_url} target="_blank" rel="noopener noreferrer"><Button variant="outline" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><MapPin size={16} className="mr-1" /> Maps</Button></a>}
             <Button variant="outline" onClick={copySummary} data-testid="admin-copy-summary" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><Copy size={16} className="mr-1" /> Salin Ringkasan</Button>
             {canModifyProducts && (
               <Button
@@ -638,7 +643,44 @@ export default function AdminOrderDetail() {
           <Row k="No WhatsApp" v={order.customer_phone} />
           {order.phone_number && <Row k="No Telepon" v={order.phone_number} />}
           <Row k="Alamat" v={order.customer_address} />
-          {order.customer_maps_url && <Row k="Maps" v={order.customer_maps_url} />}
+          {order.customer_maps_url && (
+            <Row
+              k="Maps"
+              v={
+                <a
+                  href={order.customer_maps_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="customer-maps-link"
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#8B5A2B] hover:text-[#6B4423] hover:underline focus:outline-none focus:ring-2 focus:ring-[#8B5A2B]/40 rounded-sm px-1 py-0.5"
+                  aria-label="Buka Link Google Maps Lokasi Pengiriman (Buka di tab baru)"
+                >
+                  <MapPin size={13} className="shrink-0 text-[#8B5A2B]" aria-hidden="true" />
+                  <span>Buka Google Maps</span>
+                  <ExternalLink size={12} className="shrink-0 opacity-70" aria-hidden="true" />
+                </a>
+              }
+            />
+          )}
+          {order.building_photo_url && (
+            <Row
+              k="Foto Gedung"
+              v={
+                <a
+                  href={imgUrl(order.building_photo_url)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="admin-building-photo-link"
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#8B5A2B] hover:text-[#6B4423] hover:underline focus:outline-none focus:ring-2 focus:ring-[#8B5A2B]/40 rounded-sm px-1 py-0.5"
+                  aria-label="Buka Foto Gedung / Imarah (Buka di tab baru)"
+                >
+                  <Camera size={13} className="shrink-0 text-[#8B5A2B]" aria-hidden="true" />
+                  <span>Lihat Foto Gedung</span>
+                  <ExternalLink size={12} className="shrink-0 opacity-70" aria-hidden="true" />
+                </a>
+              }
+            />
+          )}
         </Block>
 
         <Block title="Produk & Penugasan Pengrajin">
@@ -1821,4 +1863,9 @@ export default function AdminOrderDetail() {
 const Block = ({ title, children }) => (
   <div className="rounded-2xl border border-[#E5DCC5] bg-white p-5 shadow-sm"><div className="mb-2 font-heading text-sm font-bold uppercase tracking-wide text-[#8B5A2B]">{title}</div><div className="space-y-1">{children}</div></div>
 );
-const Row = ({ k, v }) => (<div className="flex justify-between gap-4 text-sm"><span className="shrink-0 text-[#8B7355]">{k}</span><span className="break-all text-right font-medium text-[#2C1E16]">{v}</span></div>);
+const Row = ({ k, v }) => (
+  <div className="flex justify-between gap-3 text-xs sm:text-sm">
+    <span className="shrink-0 text-[#8B7355]">{k}</span>
+    <span className="break-words text-right font-medium text-[#2C1E16] max-w-[70%]">{v}</span>
+  </div>
+);

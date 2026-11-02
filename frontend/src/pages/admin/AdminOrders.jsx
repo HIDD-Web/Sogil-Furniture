@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import axios from "axios";
 import api from "../../lib/api";
 import { fmtLE } from "../../lib/format";
 import { ORDER_STATUS, PAYMENT_STATUS } from "../../lib/constants";
@@ -57,6 +58,7 @@ export default function AdminOrders() {
   const navigate = useNavigate();
   const status = params.get("status");
   const payment = params.get("payment_status");
+  const latestRequestIdRef = useRef(0);
 
   const loadStats = () => {
     api.get("/admin/overview")
@@ -68,24 +70,42 @@ export default function AdminOrders() {
     loadStats();
   }, []);
 
-  const loadOrders = () => {
+  useEffect(() => {
+    const controller = new AbortController();
+    const requestId = ++latestRequestIdRef.current;
+
     setLoading(true);
     const q = {};
     if (status) q.status = status;
     if (payment) q.payment_status = payment;
     if (appliedQ) q.q = appliedQ;
 
-    api.get("/admin/orders", { params: q })
+    api.get("/admin/orders", { params: q, signal: controller.signal })
       .then((r) => {
-        setOrders(Array.isArray(r.data) ? r.data : []);
+        if (requestId === latestRequestIdRef.current) {
+          setOrders(Array.isArray(r.data) ? r.data : []);
+          setLoading(false);
+        }
       })
-      .catch((err) => toast.error(err.response?.data?.detail || "Gagal memuat pesanan"))
-      .finally(() => setLoading(false));
-  };
+      .catch((err) => {
+        // If aborted or request is no longer active, ignore cleanly without toast/error
+        if (
+          axios.isCancel(err) ||
+          err?.name === "CanceledError" ||
+          err?.code === "ERR_CANCELED" ||
+          requestId !== latestRequestIdRef.current
+        ) {
+          return;
+        }
+        toast.error(err.response?.data?.detail || "Gagal memuat pesanan");
+        if (requestId === latestRequestIdRef.current) {
+          setLoading(false);
+        }
+      });
 
-  useEffect(() => {
-    loadOrders();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => {
+      controller.abort();
+    };
   }, [status, payment, appliedQ]);
 
   const handleFilterSelect = (filterType, filterValue) => {
@@ -203,7 +223,7 @@ export default function AdminOrders() {
         </div>
 
         {/* Search */}
-        <div className="flex gap-2 w-full lg:w-auto">
+        <div className="flex flex-wrap sm:flex-nowrap gap-2 w-full lg:w-auto">
           <div className="relative flex-1 lg:w-64">
             <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#8B7355]" />
             <Input
@@ -250,7 +270,10 @@ export default function AdminOrders() {
 
       {/* Content */}
       {loading ? (
-        <div className="py-16 text-center text-sm text-[#8B7355]">Memuat data pesanan...</div>
+        <div className="py-16 text-center text-sm text-[#8B7355] flex flex-col items-center justify-center gap-2.5" data-testid="orders-loading">
+          <Loader size={24} className="animate-spin text-[#8B5A2B]" />
+          <span>Memuat data pesanan...</span>
+        </div>
       ) : orders.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-[#E5DCC5] bg-white p-12 text-center">
           <ShoppingBag size={36} className="mx-auto text-[#8B7355]/60 mb-2" />
