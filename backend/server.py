@@ -423,25 +423,8 @@ async def generate_adjustment_number(session=None) -> str:
     seq = res["seq"]
     return f"{prefix}{seq:04d}"
 
-async def compute_order_payment_summary(order_doc: dict, session=None) -> dict:
-    order_oid = id_query(str(order_doc.get("_id") or order_doc.get("id")))
-    find_kw = {"session": session} if session is not None else {}
-    find_res = db.payments.find({
-        "order_id": order_oid,
-        "status": "recorded"
-    }, **find_kw)
-    if inspect.isawaitable(find_res):
-        find_res = await find_res
-    if hasattr(find_res, "to_list"):
-        coro = find_res.to_list(1000)
-        recorded_payments = (await coro) if inspect.isawaitable(coro) else coro
-    elif isinstance(find_res, list):
-        recorded_payments = find_res
-    else:
-        recorded_payments = []
-
+def compute_payment_summary_from_records(order_doc: dict, recorded_payments: list) -> dict:
     total_le = _num(order_doc.get("total_le", 0.0))
-
     has_unrecorded_legacy_dp = bool(order_doc.get("has_unrecorded_legacy_dp"))
 
     if recorded_payments:
@@ -511,6 +494,25 @@ async def compute_order_payment_summary(order_doc: dict, session=None) -> dict:
             "has_unrecorded_legacy_dp": False,
             "valid_payments_count": 0
         }
+
+async def compute_order_payment_summary(order_doc: dict, session=None) -> dict:
+    order_oid = id_query(str(order_doc.get("_id") or order_doc.get("id")))
+    find_kw = {"session": session} if session is not None else {}
+    find_res = db.payments.find({
+        "order_id": order_oid,
+        "status": "recorded"
+    }, **find_kw)
+    if inspect.isawaitable(find_res):
+        find_res = await find_res
+    if hasattr(find_res, "to_list"):
+        coro = find_res.to_list(1000)
+        recorded_payments = (await coro) if inspect.isawaitable(coro) else coro
+    elif isinstance(find_res, list):
+        recorded_payments = find_res
+    else:
+        recorded_payments = []
+
+    return compute_payment_summary_from_records(order_doc, recorded_payments)
 
 async def generate_payment_number() -> str:
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -2215,9 +2217,48 @@ async def admin_list_orders(status: Optional[str] = None, payment_status: Option
         query["$or"] = [{"order_number": rx}, {"customer_name": rx}, {"customer_phone": rx},
                         {"customer_username": rx}, {"items.product_name_snapshot": rx}, {"referral.code": rx}]
     orders = await db.orders.find(query).sort("created_at", -1).to_list(2000)
+    if not orders:
+        return []
+
+    # Batch fetch recorded payments for all matched orders in a single database query (eliminates N+1)
+    order_id_keys = set()
+    for o in orders:
+        raw_id = o.get("_id") or o.get("id")
+        if raw_id is not None:
+            raw_str = str(raw_id)
+            order_id_keys.add(raw_str)
+            try:
+                order_id_keys.add(ObjectId(raw_str))
+            except (InvalidId, TypeError):
+                pass
+
+    payments_by_order = {}
+    if order_id_keys:
+        unique_ids = list(order_id_keys)
+        p_find = db.payments.find({
+            "order_id": {"$in": unique_ids},
+            "status": "recorded"
+        }, {"order_id": 1, "status": 1, "amount_le": 1})
+        if inspect.isawaitable(p_find):
+            p_find = await p_find
+        if hasattr(p_find, "to_list"):
+            coro = p_find.to_list(10000)
+            all_payments = (await coro) if inspect.isawaitable(coro) else coro
+        elif isinstance(p_find, list):
+            all_payments = p_find
+        else:
+            all_payments = []
+
+        for p in all_payments:
+            pid_str = str(p.get("order_id") or "")
+            if pid_str:
+                payments_by_order.setdefault(pid_str, []).append(p)
+
     res = []
     for o in orders:
-        summary = await compute_order_payment_summary(o)
+        oid_str = str(o.get("_id") or o.get("id") or "")
+        recorded_payments = payments_by_order.get(oid_str, [])
+        summary = compute_payment_summary_from_records(o, recorded_payments)
         o.update(summary)
         res.append(clean(o))
     return res

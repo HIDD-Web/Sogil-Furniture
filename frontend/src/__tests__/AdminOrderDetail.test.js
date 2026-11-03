@@ -939,13 +939,53 @@ describe("AdminOrderDetail - Payment Idempotency & UI Gating Unit Tests", () => 
       expect(mapsLink.getAttribute("href")).toBe(orderWithLongMaps.customer_maps_url);
       expect(mapsLink.getAttribute("target")).toBe("_blank");
       expect(mapsLink.getAttribute("rel")).toBe("noopener noreferrer");
-      expect(mapsLink.textContent).toContain("Buka Google Maps");
+      expect(mapsLink.textContent).toBe(orderWithLongMaps.customer_maps_url);
 
       // Verify accessible aria-label is present
-      expect(mapsLink.getAttribute("aria-label")).toContain("Buka Link Google Maps");
+      expect(mapsLink.getAttribute("aria-label")).toContain("Link Google Maps");
 
       // Verify row container and value element use responsive break-words
       expect(mapsLink.parentElement.className).toContain("break-words");
+
+      // Verify exactly ONE action button exists for Google Maps (next to WhatsApp)
+      const mapsButtons = container.querySelectorAll('[data-testid="admin-maps-button"]');
+      expect(mapsButtons.length).toBe(1);
+      expect(mapsButtons[0].textContent).toContain("Maps");
+    });
+
+    test("maps action button and maps customer link are absent when customer_maps_url is empty", async () => {
+      const orderWithoutMaps = {
+        id: "order-no-maps",
+        order_number: "SGF-20261101-NOMAPS",
+        customer_name: "Ahmad",
+        customer_phone: "+201011113333",
+        customer_address: "Nasr City",
+        order_status: "dikonfirmasi",
+        payment_status: "dp",
+        delivery_method: "pickup",
+        subtotal_le: 1000,
+        delivery_fee_le: 0,
+        discount_le: 0,
+        total_le: 1000,
+        items: [{ item_id: "itm_1", product_name_snapshot: "Kursi", quantity: 1, subtotal_le: 1000 }],
+        created_at: new Date().toISOString(),
+      };
+
+      api.get.mockImplementation((url) => {
+        if (url.includes("/assignments")) return Promise.resolve({ data: [] });
+        if (url.includes("/workers")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-rules")) return Promise.resolve({ data: [] });
+        if (url.includes("/wage-policies/production")) return Promise.resolve({ data: null });
+        if (url.includes("/payments")) return Promise.resolve({ data: { payments: [] } });
+        return Promise.resolve({ data: orderWithoutMaps });
+      });
+
+      await act(async () => {
+        root.render(<AdminOrderDetail />);
+      });
+
+      expect(container.querySelector('[data-testid="admin-maps-button"]')).toBeNull();
+      expect(container.querySelector('[data-testid="customer-maps-link"]')).toBeNull();
     });
 
     test("update failure surfaces specific backend validation error via toast.error", async () => {

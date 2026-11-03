@@ -52,6 +52,8 @@ export default function AdminOrders() {
   const [orders, setOrders] = useState([]);
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [retryCount, setRetryCount] = useState(0);
   const [search, setSearch] = useState("");
   const [appliedQ, setAppliedQ] = useState("");
   const [params, setParams] = useSearchParams();
@@ -75,6 +77,7 @@ export default function AdminOrders() {
     const requestId = ++latestRequestIdRef.current;
 
     setLoading(true);
+    setError(null);
     const q = {};
     if (status) q.status = status;
     if (payment) q.payment_status = payment;
@@ -84,6 +87,7 @@ export default function AdminOrders() {
       .then((r) => {
         if (requestId === latestRequestIdRef.current) {
           setOrders(Array.isArray(r.data) ? r.data : []);
+          setError(null);
           setLoading(false);
         }
       })
@@ -97,8 +101,11 @@ export default function AdminOrders() {
         ) {
           return;
         }
-        toast.error(err.response?.data?.detail || "Gagal memuat pesanan");
+        const errorMsg = err.response?.data?.detail || "Gagal memuat pesanan";
+        toast.error(errorMsg);
         if (requestId === latestRequestIdRef.current) {
+          setOrders([]);
+          setError(errorMsg);
           setLoading(false);
         }
       });
@@ -106,21 +113,23 @@ export default function AdminOrders() {
     return () => {
       controller.abort();
     };
-  }, [status, payment, appliedQ]);
+  }, [status, payment, appliedQ, retryCount]);
 
   const handleFilterSelect = (filterType, filterValue) => {
-    const next = new URLSearchParams(params);
-    if (!filterType || filterType === "all") {
-      next.delete("status");
-      next.delete("payment_status");
-    } else if (filterType === "status") {
-      next.delete("payment_status");
-      next.set("status", filterValue);
-    } else if (filterType === "payment") {
-      next.delete("status");
-      next.set("payment_status", filterValue);
-    }
-    setParams(next);
+    setParams((prevParams) => {
+      const next = new URLSearchParams(prevParams);
+      if (!filterType || filterType === "all") {
+        next.delete("status");
+        next.delete("payment_status");
+      } else if (filterType === "status") {
+        next.delete("payment_status");
+        next.set("status", filterValue);
+      } else if (filterType === "payment") {
+        next.delete("status");
+        next.set("payment_status", filterValue);
+      }
+      return next;
+    });
   };
 
   const isCardActive = (card) => {
@@ -273,6 +282,19 @@ export default function AdminOrders() {
         <div className="py-16 text-center text-sm text-[#8B7355] flex flex-col items-center justify-center gap-2.5" data-testid="orders-loading">
           <Loader size={24} className="animate-spin text-[#8B5A2B]" />
           <span>Memuat data pesanan...</span>
+        </div>
+      ) : error ? (
+        <div className="rounded-2xl border border-red-200 bg-red-50 p-12 text-center" data-testid="orders-error">
+          <p className="text-sm font-semibold text-red-800">{error}</p>
+          <p className="mt-1 text-xs text-red-600">Terjadi kesalahan saat memuat data pesanan dari server.</p>
+          <Button
+            variant="outline"
+            onClick={() => setRetryCount((c) => c + 1)}
+            data-testid="orders-retry-btn"
+            className="mt-4 rounded-xl border-red-300 text-red-700 hover:bg-red-100 text-xs"
+          >
+            Coba Lagi
+          </Button>
         </div>
       ) : orders.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-[#E5DCC5] bg-white p-12 text-center">

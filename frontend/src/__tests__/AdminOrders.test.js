@@ -29,9 +29,7 @@ beforeAll(() => {
 });
 
 let mockSearchParams = new URLSearchParams();
-const mockSetParams = jest.fn((newParams) => {
-  mockSearchParams = new URLSearchParams(newParams);
-});
+const mockSetParams = jest.fn();
 
 jest.mock(
   "react-router-dom",
@@ -77,6 +75,13 @@ describe("Phase 1: AdminOrders Race Condition, Loading & Mobile Responsiveness",
     root = createRoot(container);
     jest.clearAllMocks();
     mockSearchParams = new URLSearchParams();
+    mockSetParams.mockImplementation((newParams) => {
+      if (typeof newParams === "function") {
+        mockSearchParams = new URLSearchParams(newParams(mockSearchParams));
+      } else {
+        mockSearchParams = new URLSearchParams(newParams);
+      }
+    });
 
     api.get.mockImplementation((url) => {
       if (url === "/admin/overview") {
@@ -272,5 +277,252 @@ describe("Phase 1: AdminOrders Race Condition, Loading & Mobile Responsiveness",
     // Search bar container has flex-wrap for small viewports
     const searchContainer = container.querySelector('[data-testid="order-search-btn"]').parentElement;
     expect(searchContainer.className).toContain("flex-wrap");
+  });
+
+  test("5. Error on active request clears stale orders and displays dedicated error view with retry", async () => {
+    // 1. Initial success on status=diproses
+    api.get.mockImplementation((url, config) => {
+      if (url === "/admin/overview") return Promise.resolve({ data: {} });
+      if (url === "/admin/orders") {
+        return Promise.resolve({
+          data: [
+            {
+              _id: "ord_1",
+              order_number: "SGF-OLD-001",
+              customer_name: "Customer Lama",
+              total_le: 500,
+              order_status: "diproses",
+              payment_status: "dp",
+              created_at: new Date().toISOString(),
+              items: [{ product_name_snapshot: "Meja" }],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({ data: [] });
+    });
+
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+    expect(container.textContent).toContain("SGF-OLD-001");
+
+    // 2. Next request (user switched status) fails
+    api.get.mockImplementation((url) => {
+      if (url === "/admin/overview") return Promise.resolve({ data: {} });
+      if (url === "/admin/orders") {
+        return Promise.reject({
+          response: { data: { detail: "Koneksi gateway terputus (504)" } },
+        });
+      }
+      return Promise.resolve({ data: [] });
+    });
+
+    mockSearchParams = new URLSearchParams("status=selesai");
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    // CRITICAL: Stale order from previous filter MUST be cleared, not retained!
+    expect(container.textContent).not.toContain("SGF-OLD-001");
+    expect(container.textContent).not.toContain("Customer Lama");
+
+    // Error alert and retry button are visible
+    const errorBox = container.querySelector('[data-testid="orders-error"]');
+    expect(errorBox).toBeTruthy();
+    expect(errorBox.textContent).toContain("Koneksi gateway terputus (504)");
+    expect(container.querySelector('[data-testid="orders-retry-btn"]')).toBeTruthy();
+  });
+
+  test("6. Clicking retry button triggers a new request and recovers display on success", async () => {
+    let callNum = 0;
+    api.get.mockImplementation((url) => {
+      if (url === "/admin/overview") return Promise.resolve({ data: {} });
+      if (url === "/admin/orders") {
+        callNum++;
+        if (callNum === 1) {
+          return Promise.reject({
+            response: { data: { detail: "Network hiccup" } },
+          });
+        }
+        return Promise.resolve({
+          data: [
+            {
+              _id: "ord_recovered",
+              order_number: "SGF-RECOVER-999",
+              customer_name: "Customer Pulih",
+              total_le: 1250,
+              order_status: "pesanan_masuk",
+              payment_status: "belum_dibayar",
+              created_at: new Date().toISOString(),
+              items: [{ product_name_snapshot: "Lemari 2 Pintu" }],
+            },
+          ],
+        });
+      }
+      return Promise.resolve({ data: [] });
+    });
+
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    // First attempt failed
+    expect(container.querySelector('[data-testid="orders-error"]')).toBeTruthy();
+
+    // Click retry
+    const retryBtn = container.querySelector('[data-testid="orders-retry-btn"]');
+    await act(async () => {
+      retryBtn.click();
+    });
+
+    // Successfully recovered
+    expect(container.querySelector('[data-testid="orders-error"]')).toBeNull();
+    expect(container.textContent).toContain("SGF-RECOVER-999");
+    expect(container.textContent).toContain("Customer Pulih");
+  });
+
+  test("7. Functional setParams prevents stale closure when filter buttons are clicked rapidly", async () => {
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    // Find filter buttons
+    const buttons = Array.from(container.querySelectorAll("button"));
+    const pesananMasukBtn = buttons.find((b) => b.textContent.includes("Pesanan Masuk"));
+    const selesaiBtn = buttons.find((b) => b.textContent.includes("Selesai"));
+
+    expect(pesananMasukBtn).toBeTruthy();
+    expect(selesaiBtn).toBeTruthy();
+
+    // Click filter buttons in rapid succession
+    await act(async () => {
+      pesananMasukBtn.click();
+      selesaiBtn.click();
+    });
+
+    // mockSetParams must have been called with updater functions
+    expect(mockSetParams).toHaveBeenCalled();
+    const lastCallArg = mockSetParams.mock.calls[mockSetParams.mock.calls.length - 1][0];
+    expect(typeof lastCallArg).toBe("function");
+
+    // The resulting search params after both updates must equal the final click (status=selesai)
+    expect(mockSearchParams.get("status")).toBe("selesai");
+    expect(mockSearchParams.get("payment_status")).toBeNull();
+  });
+
+  test("8. Out-of-order responses across 3 rapid filter clicks display only the final selection", async () => {
+    let res1, res2, res3;
+    const p1 = new Promise((r) => { res1 = r; });
+    const p2 = new Promise((r) => { res2 = r; });
+    const p3 = new Promise((r) => { res3 = r; });
+
+    let reqIdx = 0;
+    api.get.mockImplementation((url) => {
+      if (url === "/admin/overview") return Promise.resolve({ data: {} });
+      if (url === "/admin/orders") {
+        reqIdx++;
+        if (reqIdx === 1) return p1;
+        if (reqIdx === 2) return p2;
+        if (reqIdx === 3) return p3;
+      }
+      return Promise.resolve({ data: [] });
+    });
+
+    // 1. Initial mount (Total Pesanan - Req 1)
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    // 2. Click Pesanan Masuk (Req 2)
+    mockSearchParams = new URLSearchParams("status=pesanan_masuk");
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    // 3. Click Siap (Req 3)
+    mockSearchParams = new URLSearchParams("status=siap");
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    // Resolve in reverse order: Req 3 FIRST, Req 2 SECOND, Req 1 LAST
+    await act(async () => {
+      res3({
+        data: [{
+          _id: "ord_3",
+          order_number: "SGF-SIAP-333",
+          customer_name: "Customer Siap",
+          total_le: 800,
+          order_status: "siap",
+          payment_status: "lunas",
+          created_at: new Date().toISOString(),
+          items: [{ product_name_snapshot: "Kursi Makan" }],
+        }],
+      });
+    });
+
+    await act(async () => {
+      res2({
+        data: [{
+          _id: "ord_2",
+          order_number: "SGF-MASUK-222",
+          customer_name: "Customer Masuk",
+          total_le: 400,
+          order_status: "pesanan_masuk",
+          payment_status: "belum_dibayar",
+          created_at: new Date().toISOString(),
+          items: [{ product_name_snapshot: "Meja Tamu" }],
+        }],
+      });
+    });
+
+    await act(async () => {
+      res1({
+        data: [{
+          _id: "ord_1",
+          order_number: "SGF-TOTAL-111",
+          customer_name: "Customer Total",
+          total_le: 2000,
+          order_status: "dikonfirmasi",
+          payment_status: "dp",
+          created_at: new Date().toISOString(),
+          items: [{ product_name_snapshot: "Tempat Tidur" }],
+        }],
+      });
+    });
+
+    // Must ONLY display Order 3 (Siap)
+    expect(container.textContent).toContain("SGF-SIAP-333");
+    expect(container.textContent).toContain("Customer Siap");
+    expect(container.textContent).not.toContain("SGF-MASUK-222");
+    expect(container.textContent).not.toContain("SGF-TOTAL-111");
+  });
+
+  test("9. Unmounting component aborts in-flight request cleanly", async () => {
+    let capturedSignal = null;
+    api.get.mockImplementation((url, config) => {
+      if (url === "/admin/overview") return Promise.resolve({ data: {} });
+      if (url === "/admin/orders") {
+        capturedSignal = config?.signal;
+        return new Promise(() => {}); // never resolves
+      }
+      return Promise.resolve({ data: [] });
+    });
+
+    await act(async () => {
+      root.render(<AdminOrders />);
+    });
+
+    expect(capturedSignal).toBeTruthy();
+    expect(capturedSignal.aborted).toBe(false);
+
+    // Unmount
+    await act(async () => {
+      root.unmount();
+    });
+
+    // AbortController signal must be aborted
+    expect(capturedSignal.aborted).toBe(true);
   });
 });

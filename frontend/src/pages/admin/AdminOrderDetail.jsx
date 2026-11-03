@@ -586,7 +586,13 @@ export default function AdminOrderDetail() {
                 </Button>
               </a>
             )}
-            {order.customer_maps_url && <a href={order.customer_maps_url} target="_blank" rel="noopener noreferrer"><Button variant="outline" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><MapPin size={16} className="mr-1" /> Maps</Button></a>}
+            {order.customer_maps_url && (
+              <a href={order.customer_maps_url} target="_blank" rel="noopener noreferrer">
+                <Button variant="outline" data-testid="admin-maps-button" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]">
+                  <MapPin size={16} className="mr-1" /> Maps
+                </Button>
+              </a>
+            )}
             <Button variant="outline" onClick={copySummary} data-testid="admin-copy-summary" className="rounded-xl border-[#E5DCC5] text-[#5C4A3D]"><Copy size={16} className="mr-1" /> Salin Ringkasan</Button>
             {canModifyProducts && (
               <Button
@@ -652,12 +658,10 @@ export default function AdminOrderDetail() {
                   target="_blank"
                   rel="noopener noreferrer"
                   data-testid="customer-maps-link"
-                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#8B5A2B] hover:text-[#6B4423] hover:underline focus:outline-none focus:ring-2 focus:ring-[#8B5A2B]/40 rounded-sm px-1 py-0.5"
-                  aria-label="Buka Link Google Maps Lokasi Pengiriman (Buka di tab baru)"
+                  className="text-xs text-[#8B5A2B] hover:text-[#6B4423] hover:underline focus:outline-none focus:ring-2 focus:ring-[#8B5A2B]/40 rounded-sm px-1 py-0.5 break-all inline-block"
+                  aria-label="Link Google Maps Lokasi Pengiriman (Buka di tab baru)"
                 >
-                  <MapPin size={13} className="shrink-0 text-[#8B5A2B]" aria-hidden="true" />
-                  <span>Buka Google Maps</span>
-                  <ExternalLink size={12} className="shrink-0 opacity-70" aria-hidden="true" />
+                  {order.customer_maps_url}
                 </a>
               }
             />
