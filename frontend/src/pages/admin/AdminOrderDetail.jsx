@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import api, { imgUrl } from "../../lib/api";
 import { fmtLE, fmtIDR, copyToClipboard, formatApiError } from "../../lib/format";
 import { config_summary_client } from "../../lib/summary";
@@ -39,6 +39,8 @@ const INITIAL_PAYMENT_FORM = {
 export default function AdminOrderDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const backTarget = location?.state?.from || "/admin/orders";
   const { user } = useAuth();
   const isOwner = user?.role === "owner";
   const canDelete = isOwner || user?.permissions?.delete_data;
@@ -514,7 +516,7 @@ export default function AdminOrderDetail() {
           {loadError}
         </p>
         <Button
-          onClick={() => navigate("/admin/orders")}
+          onClick={() => navigate(backTarget)}
           className="mt-6 rounded-xl bg-[#8B5A2B] hover:bg-[#6B4423] text-white text-xs font-semibold"
         >
           <ChevronLeft size={16} className="mr-1" /> Kembali ke Daftar Pesanan
@@ -538,7 +540,7 @@ export default function AdminOrderDetail() {
       });
       toast.success("Pesanan berhasil dihapus secara permanen");
       setDeleteModalOpen(false);
-      navigate("/admin/orders");
+      navigate(backTarget);
     } catch (e) {
       toast.error(e.response?.data?.detail || "Gagal menghapus pesanan");
     } finally {
@@ -548,7 +550,7 @@ export default function AdminOrderDetail() {
 
   return (
     <div className="max-w-4xl">
-      <button onClick={() => navigate("/admin/orders")} className="mb-4 inline-flex items-center gap-1 text-sm text-[#8B5A2B]" data-testid="admin-back-orders"><ChevronLeft size={16} /> Kembali</button>
+      <button onClick={() => navigate(backTarget)} className="mb-4 inline-flex items-center gap-1 text-sm text-[#8B5A2B]" data-testid="admin-back-orders"><ChevronLeft size={16} /> Kembali</button>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div><h1 className="font-heading text-2xl font-bold text-[#8B5A2B]">{order.order_number}</h1><p className="text-sm text-[#8B7355]">{new Date(order.created_at).toLocaleString("id-ID")}{order.updated_by_name ? ` · diperbarui oleh ${order.updated_by_name}` : ""}</p></div>
         {order.requires_admin_confirmation && <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800">Perlu Konfirmasi Admin</span>}

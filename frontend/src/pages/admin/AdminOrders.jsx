@@ -54,13 +54,21 @@ export default function AdminOrders() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [retryCount, setRetryCount] = useState(0);
-  const [search, setSearch] = useState("");
-  const [appliedQ, setAppliedQ] = useState("");
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const status = params.get("status");
   const payment = params.get("payment_status");
+  const urlQ = params.get("q") || "";
+  const [search, setSearch] = useState(urlQ);
+  const [appliedQ, setAppliedQ] = useState(urlQ);
   const latestRequestIdRef = useRef(0);
+
+  const currentQuery = new URLSearchParams(params);
+  if (appliedQ && !currentQuery.has("q")) {
+    currentQuery.set("q", appliedQ);
+  }
+  const queryString = currentQuery.toString();
+  const backUrl = queryString ? `/admin/orders?${queryString}` : "/admin/orders";
 
   const loadStats = () => {
     api.get("/admin/overview")
@@ -114,6 +122,30 @@ export default function AdminOrders() {
       controller.abort();
     };
   }, [status, payment, appliedQ, retryCount]);
+
+  const handleSearchSubmit = () => {
+    const trimmed = search.trim();
+    setAppliedQ(trimmed);
+    setParams((prevParams) => {
+      const next = new URLSearchParams(prevParams);
+      if (trimmed) {
+        next.set("q", trimmed);
+      } else {
+        next.delete("q");
+      }
+      return next;
+    });
+  };
+
+  const handleSearchClear = () => {
+    setSearch("");
+    setAppliedQ("");
+    setParams((prevParams) => {
+      const next = new URLSearchParams(prevParams);
+      next.delete("q");
+      return next;
+    });
+  };
 
   const handleFilterSelect = (filterType, filterValue) => {
     setParams((prevParams) => {
@@ -238,14 +270,14 @@ export default function AdminOrders() {
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && setAppliedQ(search.trim())}
+              onKeyDown={(e) => e.key === "Enter" && handleSearchSubmit()}
               placeholder="Cari no. pesanan, customer..."
               data-testid="order-search"
               className="bg-white pl-8 text-xs sm:text-sm h-9"
             />
           </div>
           <Button
-            onClick={() => setAppliedQ(search.trim())}
+            onClick={handleSearchSubmit}
             data-testid="order-search-btn"
             className="rounded-xl bg-[#8B5A2B] text-xs h-9 px-3 hover:bg-[#6B4423]"
           >
@@ -254,10 +286,7 @@ export default function AdminOrders() {
           {appliedQ && (
             <Button
               variant="outline"
-              onClick={() => {
-                setSearch("");
-                setAppliedQ("");
-              }}
+              onClick={handleSearchClear}
               data-testid="order-search-clear"
               className="rounded-xl border-[#E5DCC5] text-xs h-9 px-2.5 text-[#5C4A3D]"
             >
@@ -316,7 +345,7 @@ export default function AdminOrders() {
               return (
                 <div
                   key={orderId}
-                  onClick={() => navigate(`/admin/orders/${orderId}`)}
+                  onClick={() => navigate(`/admin/orders/${orderId}`, { state: { from: backUrl } })}
                   data-testid={`order-card-${o.order_number}`}
                   className="cursor-pointer rounded-2xl border border-[#E5DCC5] bg-white p-4 shadow-xs transition-shadow hover:shadow-sm"
                 >
@@ -396,7 +425,7 @@ export default function AdminOrders() {
                     return (
                       <tr
                         key={orderId}
-                        onClick={() => navigate(`/admin/orders/${orderId}`)}
+                        onClick={() => navigate(`/admin/orders/${orderId}`, { state: { from: backUrl } })}
                         data-testid={`order-row-${o.order_number}`}
                         className="cursor-pointer hover:bg-[#FBF9F4] transition-colors"
                       >

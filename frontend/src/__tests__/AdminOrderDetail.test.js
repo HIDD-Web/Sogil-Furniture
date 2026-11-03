@@ -14,6 +14,7 @@ jest.mock(
   () => ({
     useParams: () => ({ id: "order-test-123" }),
     useNavigate: () => jest.fn(),
+    useLocation: () => ({ state: null, search: "" }),
     Link: ({ children, to }) => <a href={to}>{children}</a>,
   }),
   { virtual: true }
