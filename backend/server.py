@@ -2204,6 +2204,22 @@ async def get_order_public(order_id: str, request: Request):
 # --------------------------------------------------------------------------
 # Admin: orders
 # --------------------------------------------------------------------------
+ORDER_LIST_PROJECTION = {
+    "_id": 1,
+    "order_number": 1,
+    "created_at": 1,
+    "customer_name": 1,
+    "customer_phone": 1,
+    "order_status": 1,
+    "payment_status": 1,
+    "total_le": 1,
+    "delivery_method": 1,
+    "delivery_zone_name": 1,
+    "has_unrecorded_legacy_dp": 1,
+    "items.product_name_snapshot": 1,
+    "item.product_name_snapshot": 1,
+}
+
 @api_router.get("/admin/orders")
 async def admin_list_orders(status: Optional[str] = None, payment_status: Optional[str] = None,
                             q: Optional[str] = None, admin: dict = Depends(require_perm("manage_orders"))):
@@ -2216,7 +2232,7 @@ async def admin_list_orders(status: Optional[str] = None, payment_status: Option
         rx = {"$regex": re.escape(q.strip()), "$options": "i"}
         query["$or"] = [{"order_number": rx}, {"customer_name": rx}, {"customer_phone": rx},
                         {"customer_username": rx}, {"items.product_name_snapshot": rx}, {"referral.code": rx}]
-    orders = await db.orders.find(query).sort("created_at", -1).to_list(2000)
+    orders = await db.orders.find(query, ORDER_LIST_PROJECTION).sort("created_at", -1).to_list(2000)
     if not orders:
         return []
 
